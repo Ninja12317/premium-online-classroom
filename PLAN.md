@@ -14,6 +14,7 @@ Done:
 - [x] Host controls: waiting room admit/reject, mute, mute all, remove, lock, co-host, student permissions, end for everyone
 - [x] Chat (everyone/private/announcements), reactions, raise hand, notifications
 - [x] Whiteboard: tools, colours, sizes, undo/redo, zoom/pan, pages, PNG/PDF export, teacher-controlled drawing, sync over data channel
+- [x] Whiteboard import: paste / drop / pick images (anyone who can draw) and PDFs (teacher; each page becomes a locked board page). Large messages are chunked over the data channel in `mesh-room.ts`
 - [x] Recording (tab capture to WebM, host only), keyboard shortcuts
 
 Remaining / ideas:
