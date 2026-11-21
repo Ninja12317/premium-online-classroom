@@ -8,8 +8,8 @@ import type {
   Role,
   SyncResult,
   WaitingParticipant,
-} from '@/lib/meeting-types'
-import { decode, encode, type RealtimeMessage } from '@/lib/realtime'
+} from "@/lib/meeting-types";
+import { decode, encode, type RealtimeMessage } from "@/lib/realtime";
 
 /**
  * Peer-to-peer meeting engine. Every participant keeps one RTCPeerConnection
@@ -26,238 +26,278 @@ import { decode, encode, type RealtimeMessage } from '@/lib/realtime'
  */
 
 export interface LocalTracks {
-  mic: MediaStreamTrack | null
-  cam: MediaStreamTrack | null
-  screen: MediaStreamTrack | null
-  screenAudio: MediaStreamTrack | null
+  mic: MediaStreamTrack | null;
+  cam: MediaStreamTrack | null;
+  screen: MediaStreamTrack | null;
+  screenAudio: MediaStreamTrack | null;
 }
 
 export interface PeerState {
-  micOn: boolean
-  camOn: boolean
-  sharing: boolean
-  handRaised: boolean
-  speaking: boolean
+  micOn: boolean;
+  camOn: boolean;
+  sharing: boolean;
+  handRaised: boolean;
+  speaking: boolean;
 }
 
-export type PeerLink = 'connecting' | 'connected' | 'failed'
+export type PeerLink = "connecting" | "connected" | "failed";
 
 export interface MeshPeer {
-  identity: string
-  session: string
-  name: string
-  role: Role
-  link: PeerLink
-  quality: Connection
-  state: PeerState
-  lastSpokeAt: number
+  identity: string;
+  session: string;
+  name: string;
+  role: Role;
+  link: PeerLink;
+  quality: Connection;
+  state: PeerState;
+  lastSpokeAt: number;
   /** Camera video only; stable object so <video> elements can hold on to it. */
-  camStream: MediaStream
+  camStream: MediaStream;
   /** Microphone audio only. */
-  micStream: MediaStream
+  micStream: MediaStream;
   /** Screen video plus screen audio. */
-  screenStream: MediaStream
-  hasCamTrack: boolean
-  hasScreenTrack: boolean
+  screenStream: MediaStream;
+  hasCamTrack: boolean;
+  hasScreenTrack: boolean;
 }
 
 export type MeshStatus =
-  'connecting' | 'connected' | 'reconnecting' | 'disconnected'
-export type MeshDisconnectCause = 'removed' | 'ended' | 'lost' | 'left' | null
+  "connecting" | "connected" | "reconnecting" | "disconnected";
+export type MeshDisconnectCause = "removed" | "ended" | "lost" | "left" | null;
 
 export interface MeshRoomOptions {
-  identity: string
-  name: string
-  role: Role
-  iceServers: IceServer[]
-  initialSettings: MeetingSettings
+  identity: string;
+  name: string;
+  role: Role;
+  iceServers: IceServer[];
+  initialSettings: MeetingSettings;
   sync: (input: {
-    sessionId: string
-    outbox: OutgoingSignal[]
-  }) => Promise<SyncResult>
-  leave: () => Promise<unknown>
-  onChange: () => void
+    sessionId: string;
+    outbox: OutgoingSignal[];
+  }) => Promise<SyncResult>;
+  leave: () => Promise<unknown>;
+  onChange: () => void;
   onMessage: (
     from: { id: string; name: string; role: Role },
     message: RealtimeMessage,
-  ) => void
+  ) => void;
 }
 
 type Wire =
-  { k: 'state'; s: Partial<PeerState> } | { k: 'app'; m: string } | { k: 'bye' }
+  | { k: "state"; s: Partial<PeerState> }
+  | { k: "app"; m: string }
+  | { k: "bye" }
+  | { k: "part"; id: string; i: number; n: number; d: string };
+
+/** Data channel messages above this size are split (whiteboard images). */
+const CHUNK = 14000;
+const BUFFER_HIGH = 1_000_000;
+
+function sendRaw(dc: RTCDataChannel, raw: string) {
+  if (raw.length <= CHUNK) {
+    dc.send(raw);
+    return;
+  }
+  const id = Math.random().toString(36).slice(2);
+  const n = Math.ceil(raw.length / CHUNK);
+  let i = 0;
+  const pump = () => {
+    try {
+      while (i < n && dc.readyState === "open") {
+        if (dc.bufferedAmount > BUFFER_HIGH) {
+          setTimeout(pump, 30);
+          return;
+        }
+        dc.send(
+          JSON.stringify({
+            k: "part",
+            id,
+            i,
+            n,
+            d: raw.slice(i * CHUNK, (i + 1) * CHUNK),
+          } satisfies Wire),
+        );
+        i++;
+      }
+    } catch {
+      // Peer is going away; presence will clean up.
+    }
+  };
+  pump();
+}
 
 interface Link {
-  pc: RTCPeerConnection
-  dc: RTCDataChannel
-  initiator: boolean
-  session: string
-  descriptionSent: boolean
-  pendingIce: RTCIceCandidateInit[]
-  openedAt: number
-  createdAt: number
-  statsTimer: number
-  lastStats: { lost: number; received: number } | null
+  pc: RTCPeerConnection;
+  dc: RTCDataChannel;
+  initiator: boolean;
+  session: string;
+  descriptionSent: boolean;
+  pendingIce: RTCIceCandidateInit[];
+  openedAt: number;
+  createdAt: number;
+  statsTimer: number;
+  lastStats: { lost: number; received: number } | null;
 }
 
-const SLOTS = ['mic', 'cam', 'screen', 'screenAudio'] as const
-type Slot = (typeof SLOTS)[number]
-const SLOT_KIND: Record<Slot, 'audio' | 'video'> = {
-  mic: 'audio',
-  cam: 'video',
-  screen: 'video',
-  screenAudio: 'audio',
-}
+const SLOTS = ["mic", "cam", "screen", "screenAudio"] as const;
+type Slot = (typeof SLOTS)[number];
+const SLOT_KIND: Record<Slot, "audio" | "video"> = {
+  mic: "audio",
+  cam: "video",
+  screen: "video",
+  screenAudio: "audio",
+};
 
-const IMMEDIATE_MS = 50
-const FAST_POLL_MS = 1000
-const SLOW_POLL_MS = 4000
-const CONNECT_TIMEOUT_MS = 20_000
-const RETRY_AFTER_FAIL_MS = 8000
-const GATHER_WAIT_MS = 1500
-const PRESENCE_GRACE_MS = 30_000
-const SYNC_FAILS_BEFORE_RECONNECTING = 2
-const SYNC_GIVE_UP_MS = 60_000
+const IMMEDIATE_MS = 50;
+const FAST_POLL_MS = 1000;
+const SLOW_POLL_MS = 4000;
+const CONNECT_TIMEOUT_MS = 20_000;
+const RETRY_AFTER_FAIL_MS = 8000;
+const GATHER_WAIT_MS = 1500;
+const PRESENCE_GRACE_MS = 30_000;
+const SYNC_FAILS_BEFORE_RECONNECTING = 2;
+const SYNC_GIVE_UP_MS = 60_000;
 
 export function newSessionId() {
-  return typeof crypto !== 'undefined' && 'randomUUID' in crypto
-    ? crypto.randomUUID().replace(/-/g, '').slice(0, 20)
-    : Math.random().toString(36).slice(2, 14) + Date.now().toString(36)
+  return typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID().replace(/-/g, "").slice(0, 20)
+    : Math.random().toString(36).slice(2, 14) + Date.now().toString(36);
 }
 
 function waitForGathering(pc: RTCPeerConnection, ms: number) {
-  if (pc.iceGatheringState === 'complete') return Promise.resolve()
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
   return new Promise<void>((resolve) => {
     const done = () => {
-      pc.removeEventListener('icegatheringstatechange', check)
-      window.clearTimeout(timer)
-      resolve()
-    }
+      pc.removeEventListener("icegatheringstatechange", check);
+      window.clearTimeout(timer);
+      resolve();
+    };
     const check = () => {
-      if (pc.iceGatheringState === 'complete') done()
-    }
-    const timer = window.setTimeout(done, ms)
-    pc.addEventListener('icegatheringstatechange', check)
-  })
+      if (pc.iceGatheringState === "complete") done();
+    };
+    const timer = window.setTimeout(done, ms);
+    pc.addEventListener("icegatheringstatechange", check);
+  });
 }
 
 export class MeshRoom {
-  readonly sessionId = newSessionId()
-  status: MeshStatus = 'connecting'
-  cause: MeshDisconnectCause = null
-  role: Role
-  settings: MeetingSettings
-  waiting: WaitingParticipant[] | null = null
-  peers = new Map<string, MeshPeer>()
+  readonly sessionId = newSessionId();
+  status: MeshStatus = "connecting";
+  cause: MeshDisconnectCause = null;
+  role: Role;
+  settings: MeetingSettings;
+  waiting: WaitingParticipant[] | null = null;
+  peers = new Map<string, MeshPeer>();
   localState: PeerState = {
     micOn: false,
     camOn: false,
     sharing: false,
     handRaised: false,
     speaking: false,
-  }
+  };
   localTracks: LocalTracks = {
     mic: null,
     cam: null,
     screen: null,
     screenAudio: null,
-  }
+  };
 
-  private links = new Map<string, Link>()
-  private outbox: OutgoingSignal[] = []
-  private lastSeen = new Map<string, number>()
-  private failedAt = new Map<string, number>()
+  private links = new Map<string, Link>();
+  private outbox: OutgoingSignal[] = [];
+  private lastSeen = new Map<string, number>();
+  private failedAt = new Map<string, number>();
   /** Sessions that said goodbye; ignored until presence shows a new one. */
-  private gone = new Map<string, string>()
-  private running = false
-  private syncing = false
-  private timer = 0
-  private syncFailures = 0
-  private firstFailureAt = 0
-  private changeFrame = 0
+  private gone = new Map<string, string>();
+  private running = false;
+  private syncing = false;
+  private timer = 0;
+  private syncFailures = 0;
+  private firstFailureAt = 0;
+  private changeFrame = 0;
 
   constructor(private opts: MeshRoomOptions) {
-    this.role = opts.role
-    this.settings = opts.initialSettings
+    this.role = opts.role;
+    this.settings = opts.initialSettings;
   }
 
   // ---- lifecycle ------------------------------------------------------------
 
   start() {
-    if (this.running) return
-    this.running = true
-    void this.sync()
+    if (this.running) return;
+    this.running = true;
+    void this.sync();
   }
 
   /** Leaves the room: tells peers, closes connections, clears presence. */
-  async stop(cause: MeshDisconnectCause = 'left') {
-    if (!this.running) return
-    this.running = false
-    window.clearTimeout(this.timer)
+  async stop(cause: MeshDisconnectCause = "left") {
+    if (!this.running) return;
+    this.running = false;
+    window.clearTimeout(this.timer);
     for (const link of this.links.values()) {
       try {
-        if (link.dc.readyState === 'open')
-          link.dc.send(JSON.stringify({ k: 'bye' } satisfies Wire))
+        if (link.dc.readyState === "open")
+          link.dc.send(JSON.stringify({ k: "bye" } satisfies Wire));
       } catch {
         // Closing anyway.
       }
-      this.closeLink(link)
+      this.closeLink(link);
     }
-    this.links.clear()
-    this.peers.clear()
-    this.status = 'disconnected'
-    this.cause = cause
-    this.emit()
-    if (cause === 'left') await this.opts.leave().catch(() => {})
+    this.links.clear();
+    this.peers.clear();
+    this.status = "disconnected";
+    this.cause = cause;
+    this.emit();
+    if (cause === "left") await this.opts.leave().catch(() => {});
   }
 
   private emit() {
-    if (this.changeFrame) return
+    if (this.changeFrame) return;
     this.changeFrame = window.requestAnimationFrame(() => {
-      this.changeFrame = 0
-      this.opts.onChange()
-    })
+      this.changeFrame = 0;
+      this.opts.onChange();
+    });
   }
 
   // ---- local media and state -------------------------------------------------
 
   setLocalTracks(next: LocalTracks) {
-    const changed = SLOTS.filter((s) => this.localTracks[s] !== next[s])
-    this.localTracks = next
-    if (changed.length === 0) return
+    const changed = SLOTS.filter((s) => this.localTracks[s] !== next[s]);
+    this.localTracks = next;
+    if (changed.length === 0) return;
     for (const link of this.links.values()) {
-      for (const slot of changed) this.attachSlot(link, slot)
+      for (const slot of changed) this.attachSlot(link, slot);
     }
   }
 
   setLocalState(patch: Partial<PeerState>) {
     const keys = (Object.keys(patch) as (keyof PeerState)[]).filter(
       (k) => this.localState[k] !== patch[k],
-    )
-    if (keys.length === 0) return
-    this.localState = { ...this.localState, ...patch }
-    const diff: Partial<PeerState> = {}
-    for (const k of keys) diff[k] = this.localState[k]
-    this.broadcast({ k: 'state', s: diff })
-    this.emit()
+    );
+    if (keys.length === 0) return;
+    this.localState = { ...this.localState, ...patch };
+    const diff: Partial<PeerState> = {};
+    for (const k of keys) diff[k] = this.localState[k];
+    this.broadcast({ k: "state", s: diff });
+    this.emit();
   }
 
   // ---- messaging -------------------------------------------------------------
 
   send(message: RealtimeMessage, to?: string[]) {
-    const wire: Wire = { k: 'app', m: encode(message) }
+    const wire: Wire = { k: "app", m: encode(message) };
     if (to) {
-      for (const id of to) this.sendTo(id, wire)
+      for (const id of to) this.sendTo(id, wire);
     } else {
-      this.broadcast(wire)
+      this.broadcast(wire);
     }
   }
 
   private broadcast(wire: Wire) {
-    const raw = JSON.stringify(wire)
+    const raw = JSON.stringify(wire);
     for (const link of this.links.values()) {
-      if (link.dc.readyState === 'open') {
+      if (link.dc.readyState === "open") {
         try {
-          link.dc.send(raw)
+          sendRaw(link.dc, raw);
         } catch {
           // Peer is going away; presence will clean up.
         }
@@ -266,10 +306,10 @@ export class MeshRoom {
   }
 
   private sendTo(id: string, wire: Wire) {
-    const link = this.links.get(id)
-    if (!link || link.dc.readyState !== 'open') return
+    const link = this.links.get(id);
+    if (!link || link.dc.readyState !== "open") return;
     try {
-      link.dc.send(JSON.stringify(wire))
+      sendRaw(link.dc, JSON.stringify(wire));
     } catch {
       // ignore
     }
@@ -277,134 +317,138 @@ export class MeshRoom {
 
   get connectingNames() {
     return Array.from(this.peers.values())
-      .filter((p) => p.link !== 'connected')
-      .map((p) => p.name)
+      .filter((p) => p.link !== "connected")
+      .map((p) => p.name);
   }
 
   // ---- sync loop -------------------------------------------------------------
 
   /** Runs a sync as soon as possible (used right after queueing a signal). */
   private requestSync() {
-    this.scheduleNext()
+    this.scheduleNext();
   }
 
   private scheduleNext() {
-    if (!this.running) return
-    window.clearTimeout(this.timer)
+    if (!this.running) return;
+    window.clearTimeout(this.timer);
     const busy = Array.from(this.peers.values()).some(
-      (p) => p.link === 'connecting',
-    )
+      (p) => p.link === "connecting",
+    );
     const delay =
-      this.outbox.length > 0 ? IMMEDIATE_MS : busy ? FAST_POLL_MS : SLOW_POLL_MS
-    this.timer = window.setTimeout(() => void this.sync(), delay)
+      this.outbox.length > 0
+        ? IMMEDIATE_MS
+        : busy
+          ? FAST_POLL_MS
+          : SLOW_POLL_MS;
+    this.timer = window.setTimeout(() => void this.sync(), delay);
   }
 
   private async sync() {
-    if (!this.running || this.syncing) return
-    this.syncing = true
-    const outbox = this.outbox
-    this.outbox = []
-    let result: SyncResult
+    if (!this.running || this.syncing) return;
+    this.syncing = true;
+    const outbox = this.outbox;
+    this.outbox = [];
+    let result: SyncResult;
     try {
-      result = await this.opts.sync({ sessionId: this.sessionId, outbox })
+      result = await this.opts.sync({ sessionId: this.sessionId, outbox });
     } catch {
       // Network hiccup: keep the signals for the next attempt.
-      this.outbox = outbox.concat(this.outbox)
-      this.syncing = false
-      this.syncFailures += 1
-      if (this.syncFailures === 1) this.firstFailureAt = Date.now()
+      this.outbox = outbox.concat(this.outbox);
+      this.syncing = false;
+      this.syncFailures += 1;
+      if (this.syncFailures === 1) this.firstFailureAt = Date.now();
       if (
         this.syncFailures >= SYNC_FAILS_BEFORE_RECONNECTING &&
-        this.status === 'connected'
+        this.status === "connected"
       ) {
-        this.status = 'reconnecting'
-        this.emit()
+        this.status = "reconnecting";
+        this.emit();
       }
       if (Date.now() - this.firstFailureAt > SYNC_GIVE_UP_MS) {
-        void this.stop('lost')
-        return
+        void this.stop("lost");
+        return;
       }
-      this.scheduleNext()
-      return
+      this.scheduleNext();
+      return;
     }
-    this.syncing = false
-    if (!this.running) return
-    this.syncFailures = 0
+    this.syncing = false;
+    if (!this.running) return;
+    this.syncFailures = 0;
 
-    if (result.status !== 'ok') {
+    if (result.status !== "ok") {
       const cause: MeshDisconnectCause =
-        result.status === 'removed' || result.status === 'rejected'
-          ? 'removed'
-          : result.status === 'ended'
-            ? 'ended'
-            : 'lost'
-      void this.stop(cause)
-      return
+        result.status === "removed" || result.status === "rejected"
+          ? "removed"
+          : result.status === "ended"
+            ? "ended"
+            : "lost";
+      void this.stop(cause);
+      return;
     }
 
-    if (this.status !== 'connected') this.status = 'connected'
-    this.role = result.role
+    if (this.status !== "connected") this.status = "connected";
+    this.role = result.role;
     if (JSON.stringify(result.settings) !== JSON.stringify(this.settings)) {
-      this.settings = result.settings
+      this.settings = result.settings;
     }
     if (JSON.stringify(result.waiting) !== JSON.stringify(this.waiting)) {
-      this.waiting = result.waiting
+      this.waiting = result.waiting;
     }
-    this.reconcilePeers(result.peers)
-    for (const signal of result.inbox) await this.handleSignal(signal)
-    this.emit()
-    this.scheduleNext()
+    this.reconcilePeers(result.peers);
+    for (const signal of result.inbox) await this.handleSignal(signal);
+    this.emit();
+    this.scheduleNext();
   }
 
   // ---- peers -----------------------------------------------------------------
 
   private reconcilePeers(online: PeerInfo[]) {
-    const now = Date.now()
-    const seen = new Set<string>()
+    const now = Date.now();
+    const seen = new Set<string>();
     for (const info of online) {
-      if (this.gone.get(info.identity) === info.session) continue
-      this.gone.delete(info.identity)
-      seen.add(info.identity)
-      this.lastSeen.set(info.identity, now)
-      const existing = this.peers.get(info.identity)
+      if (this.gone.get(info.identity) === info.session) continue;
+      this.gone.delete(info.identity);
+      seen.add(info.identity);
+      this.lastSeen.set(info.identity, now);
+      const existing = this.peers.get(info.identity);
       if (existing && existing.session !== info.session) {
         // They reloaded: drop the stale connection and start over.
-        this.dropLink(info.identity)
-        existing.session = info.session
-        existing.link = 'connecting'
+        this.dropLink(info.identity);
+        existing.session = info.session;
+        existing.link = "connecting";
       }
-      const peer = existing ?? this.addPeer(info)
-      peer.name = info.name
-      peer.role = info.role
-      peer.session = info.session
+      const peer = existing ?? this.addPeer(info);
+      peer.name = info.name;
+      peer.role = info.role;
+      peer.session = info.session;
 
-      const link = this.links.get(info.identity)
+      const link = this.links.get(info.identity);
       if (!link) {
-        const failed = this.failedAt.get(info.identity) ?? 0
-        if (now - failed < RETRY_AFTER_FAIL_MS) continue
+        const failed = this.failedAt.get(info.identity) ?? 0;
+        if (now - failed < RETRY_AFTER_FAIL_MS) continue;
         if (this.isInitiator(info.identity)) {
-          void this.openLink(peer, true)
+          void this.openLink(peer, true);
         }
         // Otherwise wait for their offer.
       } else if (
-        link.pc.connectionState !== 'connected' &&
+        link.pc.connectionState !== "connected" &&
         now - link.createdAt > CONNECT_TIMEOUT_MS
       ) {
-        this.markFailed(info.identity)
+        this.markFailed(info.identity);
       }
     }
     for (const [id, peer] of this.peers) {
-      if (seen.has(id)) continue
-      const last = this.lastSeen.get(id) ?? 0
+      if (seen.has(id)) continue;
+      const last = this.lastSeen.get(id) ?? 0;
       // Keep a connected peer briefly: their sync may be lagging while the
       // direct link is fine. Drop anyone else immediately.
-      if (peer.link === 'connected' && now - last < PRESENCE_GRACE_MS) continue
-      this.removePeer(id)
+      if (peer.link === "connected" && now - last < PRESENCE_GRACE_MS) continue;
+      this.removePeer(id);
     }
   }
 
   private isInitiator(peerId: string) {
-    return this.opts.identity < peerId
+    return this.opts.identity < peerId;
   }
 
   private addPeer(info: PeerInfo): MeshPeer {
@@ -413,8 +457,8 @@ export class MeshRoom {
       session: info.session,
       name: info.name,
       role: info.role,
-      link: 'connecting',
-      quality: 'good',
+      link: "connecting",
+      quality: "good",
       state: {
         micOn: false,
         camOn: false,
@@ -428,28 +472,28 @@ export class MeshRoom {
       screenStream: new MediaStream(),
       hasCamTrack: false,
       hasScreenTrack: false,
-    }
-    this.peers.set(info.identity, peer)
-    return peer
+    };
+    this.peers.set(info.identity, peer);
+    return peer;
   }
 
   private removePeer(id: string) {
-    this.dropLink(id)
-    this.peers.delete(id)
-    this.lastSeen.delete(id)
-    this.failedAt.delete(id)
-    this.emit()
+    this.dropLink(id);
+    this.peers.delete(id);
+    this.lastSeen.delete(id);
+    this.failedAt.delete(id);
+    this.emit();
   }
 
   private markFailed(id: string) {
-    this.dropLink(id)
-    this.failedAt.set(id, Date.now())
-    const peer = this.peers.get(id)
+    this.dropLink(id);
+    this.failedAt.set(id, Date.now());
+    const peer = this.peers.get(id);
     if (peer) {
-      peer.link = 'failed'
-      peer.quality = 'lost'
+      peer.link = "failed";
+      peer.quality = "lost";
     }
-    this.emit()
+    this.emit();
   }
 
   // ---- connections -----------------------------------------------------------
@@ -457,9 +501,9 @@ export class MeshRoom {
   private createLink(peer: MeshPeer, initiator: boolean): Link {
     const pc = new RTCPeerConnection({
       iceServers: this.opts.iceServers,
-      bundlePolicy: 'max-bundle',
-    })
-    const dc = pc.createDataChannel('lectern', { negotiated: true, id: 0 })
+      bundlePolicy: "max-bundle",
+    });
+    const dc = pc.createDataChannel("lectern", { negotiated: true, id: 0 });
     const link: Link = {
       pc,
       dc,
@@ -471,315 +515,332 @@ export class MeshRoom {
       createdAt: Date.now(),
       statsTimer: 0,
       lastStats: null,
-    }
-    const id = peer.identity
+    };
+    const id = peer.identity;
 
     dc.onopen = () => {
-      if (this.links.get(id) !== link) return
-      link.openedAt = Date.now()
-      peer.link = 'connected'
-      peer.quality = 'good'
-      this.failedAt.delete(id)
+      if (this.links.get(id) !== link) return;
+      link.openedAt = Date.now();
+      peer.link = "connected";
+      peer.quality = "good";
+      this.failedAt.delete(id);
       // Tell them how we look right now.
       try {
         dc.send(
-          JSON.stringify({ k: 'state', s: this.localState } satisfies Wire),
-        )
+          JSON.stringify({ k: "state", s: this.localState } satisfies Wire),
+        );
       } catch {
         // ignore
       }
-      this.emit()
-    }
+      this.emit();
+    };
     dc.onmessage = (ev) => {
-      if (this.links.get(id) !== link) return
-      this.handleWire(peer, String(ev.data))
-    }
+      if (this.links.get(id) !== link) return;
+      this.handleWire(peer, String(ev.data));
+    };
     dc.onclose = () => {
-      if (this.links.get(id) !== link) return
+      if (this.links.get(id) !== link) return;
       // A clean close means they left; presence confirms shortly.
-      this.markFailed(id)
-    }
+      this.markFailed(id);
+    };
 
     pc.onicecandidate = (ev) => {
-      if (this.links.get(id) !== link) return
-      if (!ev.candidate || !link.descriptionSent) return
+      if (this.links.get(id) !== link) return;
+      if (!ev.candidate || !link.descriptionSent) return;
       this.outbox.push({
-        kind: 'ice',
+        kind: "ice",
         to: id,
         toSession: link.session,
         payload: JSON.stringify(ev.candidate.toJSON()),
-      })
-      this.requestSync()
-    }
+      });
+      this.requestSync();
+    };
     pc.onconnectionstatechange = () => {
-      if (this.links.get(id) !== link) return
-      const s = pc.connectionState
-      if (s === 'failed' || s === 'closed') {
-        this.markFailed(id)
-      } else if (s === 'disconnected') {
-        peer.quality = 'lost'
-        this.emit()
-      } else if (s === 'connected') {
-        if (peer.quality === 'lost') peer.quality = 'good'
-        this.emit()
+      if (this.links.get(id) !== link) return;
+      const s = pc.connectionState;
+      if (s === "failed" || s === "closed") {
+        this.markFailed(id);
+      } else if (s === "disconnected") {
+        peer.quality = "lost";
+        this.emit();
+      } else if (s === "connected") {
+        if (peer.quality === "lost") peer.quality = "good";
+        this.emit();
       }
-    }
+    };
     pc.ontrack = (ev) => {
-      if (this.links.get(id) !== link) return
-      const index = pc.getTransceivers().indexOf(ev.transceiver)
-      const slot = SLOTS[index]
-      if (!slot) return
-      const track = ev.track
+      if (this.links.get(id) !== link) return;
+      const index = pc.getTransceivers().indexOf(ev.transceiver);
+      const slot = SLOTS[index];
+      if (!slot) return;
+      const track = ev.track;
       const target =
-        slot === 'mic'
+        slot === "mic"
           ? peer.micStream
-          : slot === 'cam'
+          : slot === "cam"
             ? peer.camStream
-            : peer.screenStream
+            : peer.screenStream;
       for (const old of target.getTracks()) {
-        if (old.kind === track.kind) target.removeTrack(old)
+        if (old.kind === track.kind) target.removeTrack(old);
       }
-      target.addTrack(track)
-      if (slot === 'cam') peer.hasCamTrack = true
-      if (slot === 'screen') peer.hasScreenTrack = true
-      this.emit()
-    }
+      target.addTrack(track);
+      if (slot === "cam") peer.hasCamTrack = true;
+      if (slot === "screen") peer.hasScreenTrack = true;
+      this.emit();
+    };
 
     link.statsTimer = window.setInterval(
       () => void this.sampleStats(peer, link),
       3000,
-    )
-    return link
+    );
+    return link;
   }
 
   private attachSlot(link: Link, slot: Slot) {
-    const transceivers = link.pc.getTransceivers()
-    const index = SLOTS.indexOf(slot)
-    const t = transceivers[index]
-    if (!t) return
-    const track = this.localTracks[slot]
-    if (track && track.kind !== SLOT_KIND[slot]) return
-    t.sender.replaceTrack(track ?? null).catch(() => {})
+    const transceivers = link.pc.getTransceivers();
+    const index = SLOTS.indexOf(slot);
+    const t = transceivers[index];
+    if (!t) return;
+    const track = this.localTracks[slot];
+    if (track && track.kind !== SLOT_KIND[slot]) return;
+    t.sender.replaceTrack(track ?? null).catch(() => {});
   }
 
   private closeLink(link: Link) {
-    window.clearInterval(link.statsTimer)
-    link.dc.onopen = null
-    link.dc.onmessage = null
-    link.dc.onclose = null
-    link.pc.onicecandidate = null
-    link.pc.onconnectionstatechange = null
-    link.pc.ontrack = null
+    window.clearInterval(link.statsTimer);
+    link.dc.onopen = null;
+    link.dc.onmessage = null;
+    link.dc.onclose = null;
+    link.pc.onicecandidate = null;
+    link.pc.onconnectionstatechange = null;
+    link.pc.ontrack = null;
     try {
-      link.dc.close()
+      link.dc.close();
     } catch {
       // ignore
     }
     try {
-      link.pc.close()
+      link.pc.close();
     } catch {
       // ignore
     }
   }
 
   private dropLink(id: string) {
-    const link = this.links.get(id)
-    if (!link) return
-    this.links.delete(id)
-    this.closeLink(link)
-    const peer = this.peers.get(id)
+    const link = this.links.get(id);
+    if (!link) return;
+    this.links.delete(id);
+    this.closeLink(link);
+    const peer = this.peers.get(id);
     if (peer) {
       for (const s of [peer.camStream, peer.micStream, peer.screenStream]) {
-        for (const t of s.getTracks()) s.removeTrack(t)
+        for (const t of s.getTracks()) s.removeTrack(t);
       }
-      peer.hasCamTrack = false
-      peer.hasScreenTrack = false
-      peer.state = { ...peer.state, speaking: false }
+      peer.hasCamTrack = false;
+      peer.hasScreenTrack = false;
+      peer.state = { ...peer.state, speaking: false };
     }
   }
 
   /** Initiator side: build the offer with all four transceivers. */
   private async openLink(peer: MeshPeer, initiator: boolean) {
-    this.dropLink(peer.identity)
-    peer.link = 'connecting'
-    const link = this.createLink(peer, initiator)
-    this.links.set(peer.identity, link)
-    this.emit()
+    this.dropLink(peer.identity);
+    peer.link = "connecting";
+    const link = this.createLink(peer, initiator);
+    this.links.set(peer.identity, link);
+    this.emit();
     try {
       for (const slot of SLOTS) {
         const t = link.pc.addTransceiver(SLOT_KIND[slot], {
-          direction: 'sendrecv',
-        })
-        const track = this.localTracks[slot]
-        if (track) t.sender.replaceTrack(track).catch(() => {})
+          direction: "sendrecv",
+        });
+        const track = this.localTracks[slot];
+        if (track) t.sender.replaceTrack(track).catch(() => {});
       }
-      const offer = await link.pc.createOffer()
-      await link.pc.setLocalDescription(offer)
-      await waitForGathering(link.pc, GATHER_WAIT_MS)
-      if (this.links.get(peer.identity) !== link) return
+      const offer = await link.pc.createOffer();
+      await link.pc.setLocalDescription(offer);
+      await waitForGathering(link.pc, GATHER_WAIT_MS);
+      if (this.links.get(peer.identity) !== link) return;
       this.outbox.push({
-        kind: 'offer',
+        kind: "offer",
         to: peer.identity,
         toSession: peer.session,
         payload: JSON.stringify(link.pc.localDescription),
-      })
-      link.descriptionSent = true
-      this.requestSync()
+      });
+      link.descriptionSent = true;
+      this.requestSync();
     } catch {
-      if (this.links.get(peer.identity) === link) this.markFailed(peer.identity)
+      if (this.links.get(peer.identity) === link)
+        this.markFailed(peer.identity);
     }
   }
 
   private async handleSignal(signal: IncomingSignal) {
-    const peer = this.peers.get(signal.from)
-    if (!peer) return
-    if (signal.kind === 'offer') {
-      if (this.isInitiator(signal.from)) return // Glare guard: we lead.
-      await this.answer(peer, signal)
-      return
+    const peer = this.peers.get(signal.from);
+    if (!peer) return;
+    if (signal.kind === "offer") {
+      if (this.isInitiator(signal.from)) return; // Glare guard: we lead.
+      await this.answer(peer, signal);
+      return;
     }
-    const link = this.links.get(signal.from)
-    if (!link || link.session !== signal.fromSession) return
-    if (signal.kind === 'answer') {
-      if (!link.initiator || link.pc.signalingState !== 'have-local-offer')
-        return
+    const link = this.links.get(signal.from);
+    if (!link || link.session !== signal.fromSession) return;
+    if (signal.kind === "answer") {
+      if (!link.initiator || link.pc.signalingState !== "have-local-offer")
+        return;
       try {
         await link.pc.setRemoteDescription(
           JSON.parse(signal.payload) as RTCSessionDescriptionInit,
-        )
-        await this.flushIce(link)
+        );
+        await this.flushIce(link);
       } catch {
-        this.markFailed(signal.from)
+        this.markFailed(signal.from);
       }
-      return
+      return;
     }
     // ICE candidate.
-    const candidate = JSON.parse(signal.payload) as RTCIceCandidateInit
+    const candidate = JSON.parse(signal.payload) as RTCIceCandidateInit;
     if (link.pc.remoteDescription) {
-      link.pc.addIceCandidate(candidate).catch(() => {})
+      link.pc.addIceCandidate(candidate).catch(() => {});
     } else {
-      link.pendingIce.push(candidate)
+      link.pendingIce.push(candidate);
     }
   }
 
   private async flushIce(link: Link) {
-    const pending = link.pendingIce
-    link.pendingIce = []
-    for (const c of pending) await link.pc.addIceCandidate(c).catch(() => {})
+    const pending = link.pendingIce;
+    link.pendingIce = [];
+    for (const c of pending) await link.pc.addIceCandidate(c).catch(() => {});
   }
 
   /** Answerer side: adopt the offer's transceivers and attach local tracks. */
   private async answer(peer: MeshPeer, signal: IncomingSignal) {
     if (peer.session !== signal.fromSession) {
-      peer.session = signal.fromSession
+      peer.session = signal.fromSession;
     }
-    this.dropLink(peer.identity)
-    peer.link = 'connecting'
-    const link = this.createLink(peer, false)
-    this.links.set(peer.identity, link)
-    this.emit()
+    this.dropLink(peer.identity);
+    peer.link = "connecting";
+    const link = this.createLink(peer, false);
+    this.links.set(peer.identity, link);
+    this.emit();
     try {
       await link.pc.setRemoteDescription(
         JSON.parse(signal.payload) as RTCSessionDescriptionInit,
-      )
-      const transceivers = link.pc.getTransceivers()
+      );
+      const transceivers = link.pc.getTransceivers();
       SLOTS.forEach((slot, i) => {
-        const t = transceivers[i]
-        if (!t) return
-        t.direction = 'sendrecv'
-        const track = this.localTracks[slot]
-        if (track) t.sender.replaceTrack(track).catch(() => {})
-      })
-      const desc = await link.pc.createAnswer()
-      await link.pc.setLocalDescription(desc)
-      await waitForGathering(link.pc, GATHER_WAIT_MS)
-      if (this.links.get(peer.identity) !== link) return
+        const t = transceivers[i];
+        if (!t) return;
+        t.direction = "sendrecv";
+        const track = this.localTracks[slot];
+        if (track) t.sender.replaceTrack(track).catch(() => {});
+      });
+      const desc = await link.pc.createAnswer();
+      await link.pc.setLocalDescription(desc);
+      await waitForGathering(link.pc, GATHER_WAIT_MS);
+      if (this.links.get(peer.identity) !== link) return;
       this.outbox.push({
-        kind: 'answer',
+        kind: "answer",
         to: peer.identity,
         toSession: peer.session,
         payload: JSON.stringify(link.pc.localDescription),
-      })
-      link.descriptionSent = true
-      await this.flushIce(link)
-      this.requestSync()
+      });
+      link.descriptionSent = true;
+      await this.flushIce(link);
+      this.requestSync();
     } catch {
-      if (this.links.get(peer.identity) === link) this.markFailed(peer.identity)
+      if (this.links.get(peer.identity) === link)
+        this.markFailed(peer.identity);
     }
   }
 
   // ---- incoming data -----------------------------------------------------------
 
+  private parts = new Map<string, string[]>();
+
   private handleWire(peer: MeshPeer, raw: string) {
-    let wire: Wire
+    let wire: Wire;
     try {
-      wire = JSON.parse(raw) as Wire
+      wire = JSON.parse(raw) as Wire;
     } catch {
-      return
+      return;
     }
     switch (wire.k) {
-      case 'state': {
-        const next = { ...peer.state, ...wire.s }
-        if (next.speaking && !peer.state.speaking) peer.lastSpokeAt = Date.now()
-        peer.state = next
-        this.emit()
-        return
+      case "part": {
+        const key = `${peer.identity}:${wire.id}`;
+        const parts = this.parts.get(key) ?? [];
+        parts[wire.i] = wire.d;
+        if (wire.i === wire.n - 1) {
+          this.parts.delete(key);
+          this.handleWire(peer, parts.join(""));
+        } else {
+          this.parts.set(key, parts);
+        }
+        return;
       }
-      case 'app': {
-        const message = decode(wire.m)
-        if (!message) return
+      case "state": {
+        const next = { ...peer.state, ...wire.s };
+        if (next.speaking && !peer.state.speaking)
+          peer.lastSpokeAt = Date.now();
+        peer.state = next;
+        this.emit();
+        return;
+      }
+      case "app": {
+        const message = decode(wire.m);
+        if (!message) return;
         this.opts.onMessage(
           { id: peer.identity, name: peer.name, role: peer.role },
           message,
-        )
-        return
+        );
+        return;
       }
-      case 'bye':
-        this.gone.set(peer.identity, peer.session)
-        this.removePeer(peer.identity)
-        return
+      case "bye":
+        this.gone.set(peer.identity, peer.session);
+        this.removePeer(peer.identity);
+        return;
     }
   }
 
   // ---- quality ------------------------------------------------------------------
 
   private async sampleStats(peer: MeshPeer, link: Link) {
-    if (link.pc.connectionState !== 'connected') return
+    if (link.pc.connectionState !== "connected") return;
     try {
-      const report = await link.pc.getStats()
-      let rtt = 0
-      let lost = 0
-      let received = 0
+      const report = await link.pc.getStats();
+      let rtt = 0;
+      let lost = 0;
+      let received = 0;
       report.forEach((s) => {
         if (
-          s.type === 'candidate-pair' &&
-          (s as RTCIceCandidatePairStats).state === 'succeeded' &&
+          s.type === "candidate-pair" &&
+          (s as RTCIceCandidatePairStats).state === "succeeded" &&
           (s as RTCIceCandidatePairStats).nominated
         ) {
-          rtt = (s as RTCIceCandidatePairStats).currentRoundTripTime ?? rtt
+          rtt = (s as RTCIceCandidatePairStats).currentRoundTripTime ?? rtt;
         }
-        if (s.type === 'inbound-rtp') {
-          const r = s as RTCInboundRtpStreamStats
-          lost += r.packetsLost ?? 0
-          received += r.packetsReceived ?? 0
+        if (s.type === "inbound-rtp") {
+          const r = s as RTCInboundRtpStreamStats;
+          lost += r.packetsLost ?? 0;
+          received += r.packetsReceived ?? 0;
         }
-      })
-      let loss = 0
+      });
+      let loss = 0;
       if (link.lastStats) {
-        const dl = lost - link.lastStats.lost
-        const dr = received - link.lastStats.received
-        loss = dr + dl > 0 ? dl / (dr + dl) : 0
+        const dl = lost - link.lastStats.lost;
+        const dr = received - link.lastStats.received;
+        loss = dr + dl > 0 ? dl / (dr + dl) : 0;
       }
-      link.lastStats = { lost, received }
+      link.lastStats = { lost, received };
       const quality: Connection =
         rtt > 0.45 || loss > 0.1
-          ? 'poor'
+          ? "poor"
           : rtt > 0.2 || loss > 0.03
-            ? 'fair'
-            : 'good'
+            ? "fair"
+            : "good";
       if (quality !== peer.quality) {
-        peer.quality = quality
-        this.emit()
+        peer.quality = quality;
+        this.emit();
       }
     } catch {
       // Stats are best effort.
