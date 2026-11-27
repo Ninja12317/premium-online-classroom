@@ -1,5 +1,3 @@
-import { AuthError, MissingIdentityError } from '@netlify/identity'
-
 export type AuthErrorKind =
   | 'unavailable'
   | 'unconfirmed'
@@ -15,55 +13,71 @@ export interface AuthErrorInfo {
 }
 
 /**
- * Turns an error from `@netlify/identity` into a message a teacher can act on.
- * GoTrue reports an unconfirmed email as a 400 "Email not confirmed", which
- * used to fall through to a generic "couldn't sign you in" message.
+ * Turns a Firebase Auth error into a clear, actionable message for teachers.
  */
 export function describeAuthError(
   err: unknown,
   fallback: string,
 ): AuthErrorInfo {
-  if (err instanceof MissingIdentityError) {
+  const code =
+    err && typeof err === 'object' && 'code' in err
+      ? String((err as { code?: unknown }).code ?? '').toLowerCase()
+      : ''
+  const text =
+    err && typeof err === 'object' && 'message' in err
+      ? String((err as { message?: unknown }).message ?? '').toLowerCase()
+      : ''
+
+  if (
+    code === 'auth/operation-not-allowed' ||
+    code === 'auth/configuration-not-found'
+  ) {
     return {
       kind: 'unavailable',
       message:
-        'Accounts are not available in this environment yet. Deploy to Netlify to enable them.',
+        'Email/Password sign-in is not enabled yet in Firebase Console (Authentication → Sign-in method). You can still start or join classes without an account.',
     }
   }
-  if (err instanceof AuthError) {
-    const text = (err.message ?? '').toLowerCase()
-    if (text.includes('not confirmed') || text.includes('unconfirmed')) {
-      return {
-        kind: 'unconfirmed',
-        message:
-          'Your email isn’t confirmed yet. Open the confirmation link we emailed you, then sign in.',
-      }
+  if (text.includes('not confirmed') || text.includes('unconfirmed')) {
+    return {
+      kind: 'unconfirmed',
+      message:
+        'Your email isn’t confirmed yet. Open the confirmation link we emailed you, then sign in.',
     }
-    if (
-      err.status === 401 ||
-      text.includes('invalid_grant') ||
-      text.includes('invalid login') ||
-      text.includes('no user found')
-    ) {
-      return { kind: 'credentials', message: 'Wrong email or password.' }
+  }
+  if (
+    code === 'auth/invalid-credential' ||
+    code === 'auth/wrong-password' ||
+    code === 'auth/user-not-found' ||
+    text.includes('invalid-credential')
+  ) {
+    return { kind: 'credentials', message: 'Wrong email or password.' }
+  }
+  if (code === 'auth/too-many-requests' || text.includes('too-many-requests')) {
+    return {
+      kind: 'rate-limited',
+      message: 'Too many attempts. Wait a minute and try again.',
     }
-    if (err.status === 429 || text.includes('too many')) {
-      return {
-        kind: 'rate-limited',
-        message: 'Too many attempts. Wait a minute and try again.',
-      }
+  }
+  if (
+    code === 'auth/email-already-in-use' ||
+    text.includes('email-already-in-use')
+  ) {
+    return {
+      kind: 'exists',
+      message: 'That email is already registered. Try signing in instead.',
     }
-    if (err.status === 422 && text.includes('already')) {
-      return {
-        kind: 'exists',
-        message: 'That email is already registered. Try signing in instead.',
-      }
+  }
+  if (code === 'auth/weak-password') {
+    return {
+      kind: 'invalid',
+      message: 'Use at least 8 characters for your password.',
     }
-    if (err.status === 422 || err.status === 400) {
-      return {
-        kind: 'invalid',
-        message: err.message || 'Check your email and password and try again.',
-      }
+  }
+  if (code === 'auth/invalid-email') {
+    return {
+      kind: 'invalid',
+      message: 'Please enter a valid email address.',
     }
   }
   return { kind: 'unknown', message: fallback }

@@ -5,8 +5,7 @@ import {
   useNavigate,
   useRouter,
 } from '@tanstack/react-router'
-import { signup } from '@netlify/identity'
-import { MailCheck } from 'lucide-react'
+import { createUserWithEmailAndPassword, updateProfile } from 'firebase/auth'
 
 import { AuthShell } from '@/components/auth-shell'
 import { useIdentity } from '@/components/identity-provider'
@@ -14,13 +13,12 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { describeAuthError } from '@/lib/auth-errors'
+import { auth } from '@/services/firebase'
 
 export const Route = createFileRoute('/signup')({ component: SignupPage })
 
 function SignupPage() {
-  const [state, setState] = useState<
-    'idle' | 'pending' | 'error' | 'check-email'
-  >('idle')
+  const [state, setState] = useState<'idle' | 'pending' | 'error'>('idle')
   const [error, setError] = useState('')
   const router = useRouter()
   const navigate = useNavigate()
@@ -31,6 +29,8 @@ function SignupPage() {
     if (state === 'pending') return
     const fields = new FormData(event.currentTarget)
     const password = String(fields.get('password'))
+    const name = String(fields.get('name')).trim()
+    const email = String(fields.get('email')).trim()
     if (password.length < 8) {
       setError('Use at least 8 characters for your password.')
       setState('error')
@@ -38,12 +38,9 @@ function SignupPage() {
     }
     setState('pending')
     try {
-      const user = await signup(String(fields.get('email')), password, {
-        full_name: String(fields.get('name')).trim(),
-      })
-      if (!user.confirmedAt) {
-        setState('check-email')
-        return
+      const cred = await createUserWithEmailAndPassword(auth, email, password)
+      if (name) {
+        await updateProfile(cred.user, { displayName: name })
       }
       await refresh()
       await router.invalidate()
@@ -57,29 +54,6 @@ function SignupPage() {
       )
       setState('error')
     }
-  }
-
-  if (state === 'check-email') {
-    return (
-      <AuthShell
-        title="Check your inbox"
-        subtitle="We sent you a confirmation link."
-      >
-        <div className="flex flex-col items-center gap-3 text-center">
-          <span className="grid size-12 place-items-center rounded-full bg-primary/10 text-primary">
-            <MailCheck className="size-6" />
-          </span>
-          <p className="text-sm text-muted-foreground">
-            Open the email and tap the link to confirm your account. The link
-            signs you in automatically, so stay in this browser if you can.
-            Check your spam folder if it hasn’t arrived in a minute.
-          </p>
-          <Button asChild variant="outline" className="mt-2">
-            <Link to="/login">Go to sign in</Link>
-          </Button>
-        </div>
-      </AuthShell>
-    )
   }
 
   return (

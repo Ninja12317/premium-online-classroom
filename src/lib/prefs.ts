@@ -3,6 +3,7 @@ export interface JoinPrefs {
   name: string
   micOn: boolean
   camOn: boolean
+  blurOn?: boolean
   cameraId?: string
   micId?: string
   speakerId?: string
@@ -10,7 +11,12 @@ export interface JoinPrefs {
 
 const KEY = 'lectern-join-prefs'
 
-export const defaultPrefs: JoinPrefs = { name: '', micOn: true, camOn: true }
+export const defaultPrefs: JoinPrefs = {
+  name: '',
+  micOn: true,
+  camOn: true,
+  blurOn: false,
+}
 
 export function loadPrefs(): JoinPrefs {
   if (typeof window === 'undefined') return defaultPrefs

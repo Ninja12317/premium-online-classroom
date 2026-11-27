@@ -1,10 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import {
-  Link,
-  createFileRoute,
-  notFound,
-  useNavigate,
-} from '@tanstack/react-router'
+import { Link, createFileRoute, useNavigate } from '@tanstack/react-router'
 import {
   Clock,
   DoorClosed,
@@ -40,13 +35,18 @@ import {
   saveParticipant,
 } from '@/lib/host-keys'
 import { loadPrefsCached, type JoinPrefs } from '@/lib/prefs'
-import { useClientValue } from '@/lib/use-client-value'
+import {
+  subscribeMeetingDoc,
+  subscribeParticipantDoc,
+} from '@/services/firestore-meetings'
 
 export const Route = createFileRoute('/meet/$meetingId')({
   loader: async ({ params }) => {
-    const meeting = await getMeeting({ data: { meetingId: params.meetingId } })
-    if (!meeting) throw notFound()
-    return meeting
+    try {
+      return await getMeeting({ data: { meetingId: params.meetingId } })
+    } catch {
+      return null
+    }
   },
   head: ({ loaderData }) => ({
     meta: loaderData ? [{ title: `${loaderData.title} · Lectern` }] : [],
@@ -62,13 +62,16 @@ type Phase =
 function MeetPage() {
   const { meetingId } = Route.useParams()
   const navigate = useNavigate()
-  const prefs = useClientValue<JoinPrefs | null>(loadPrefsCached, null)
+  const [prefs, setPrefs] = useState<JoinPrefs | null>(null)
   const [phase, setPhase] = useState<Phase>({ kind: 'joining' })
   const [passcode, setPasscode] = useState('')
   const [hostPasscode, setHostPasscode] = useState<string | null>(null)
+  const [joinedConfirmed, setJoinedConfirmed] = useState(false)
   const hostKeyRef = useRef<string | null>(null)
+  const joinedIdentityRef = useRef<string | null>(null)
+  const prefsRef = useRef<JoinPrefs | null>(null)
 
-  const join = useCallback(
+  const executeJoin = useCallback(
     async (p: JoinPrefs, code?: string) => {
       const stored = loadParticipant(meetingId)
       const hostKey = hostKeyRef.current
@@ -83,11 +86,28 @@ function MeetPage() {
             participantKey: stored?.participantKey,
           },
         })
-        if (result.status === 'joined' || result.status === 'waiting') {
+        if (result.status === 'joined') {
+          joinedIdentityRef.current = result.identity
           saveParticipant(meetingId, {
+            activeMeetingId: meetingId,
             identity: result.identity,
             participantKey: result.participantKey,
+            role: result.role,
+            status: 'admitted',
+            name: p.name,
           })
+          setJoinedConfirmed(true)
+        } else if (result.status === 'waiting') {
+          joinedIdentityRef.current = result.identity
+          saveParticipant(meetingId, {
+            activeMeetingId: meetingId,
+            identity: result.identity,
+            participantKey: result.participantKey,
+            role: 'student',
+            status: 'waiting',
+            name: p.name,
+          })
+          setJoinedConfirmed(true)
         } else if (
           result.status === 'rejected' ||
           result.status === 'removed'
@@ -96,16 +116,23 @@ function MeetPage() {
         }
         setPhase({ kind: 'result', result })
       } catch {
-        setPhase({ kind: 'result', result: { status: 'not-found' } })
+        // Never silently kick on a transient error if we already joined.
+        setPhase((prev) =>
+          prev.kind === 'result' && prev.result.status === 'joined'
+            ? prev
+            : { kind: 'result', result: { status: 'not-found' } },
+        )
       }
     },
     [meetingId],
   )
 
-  // Boot: once lobby preferences are readable, attempt to join (or send them to the lobby).
+  // Stable one-time boot keyed ONLY on [meetingId].
   useEffect(() => {
-    if (!prefs) return
-    if (!prefs.name.trim()) {
+    const loadedPrefs = loadPrefsCached()
+    const stored = loadParticipant(meetingId)
+    const resolvedName = loadedPrefs.name.trim() || stored?.name?.trim() || ''
+    if (!resolvedName) {
       void navigate({
         to: '/join/$meetingId',
         params: { meetingId },
@@ -113,6 +140,8 @@ function MeetPage() {
       })
       return
     }
+    const effectivePrefs: JoinPrefs = { ...loadedPrefs, name: resolvedName }
+    prefsRef.current = effectivePrefs
     hostKeyRef.current = loadHostKey(meetingId)
     let code: string | undefined
     try {
@@ -121,30 +150,115 @@ function MeetPage() {
     } catch {
       // ignore
     }
-    void join(prefs, code)
-  }, [prefs, meetingId, navigate, join])
+    void Promise.resolve().then(() => {
+      setPrefs(effectivePrefs)
+      return executeJoin(effectivePrefs, code)
+    })
+  }, [meetingId, navigate, executeJoin])
 
-  // Waiting room: poll until admitted or turned away.
+  // Waiting room: listen via Firestore onSnapshot (plus gentle fallback poll)
+  // keyed ONLY on [meetingId, waitingIdentity].
+  const waitingIdentity =
+    phase.kind === 'result' && phase.result.status === 'waiting'
+      ? phase.result.identity
+      : null
+
   useEffect(() => {
-    if (phase.kind !== 'result' || phase.result.status !== 'waiting' || !prefs)
-      return
-    const t = window.setInterval(() => void join(prefs), 2500)
-    return () => window.clearInterval(t)
-  }, [phase, prefs, join])
+    if (!waitingIdentity || !joinedConfirmed) return
+    let active = true
+    const unsub = subscribeParticipantDoc(
+      meetingId,
+      waitingIdentity,
+      (docData) => {
+        if (!active || !prefsRef.current) return
+        if (docData.status === 'admitted') {
+          void executeJoin(prefsRef.current)
+        } else if (
+          docData.status === 'rejected' ||
+          docData.status === 'removed'
+        ) {
+          clearParticipant(meetingId)
+          setPhase((prev) =>
+            prev.kind === 'result' && prev.result.status === 'waiting'
+              ? {
+                  kind: 'result',
+                  result: {
+                    status: docData.status as 'rejected' | 'removed',
+                    meeting: prev.result.meeting,
+                  },
+                }
+              : prev,
+          )
+        }
+      },
+    )
+    const fallbackTimer = window.setInterval(() => {
+      if (prefsRef.current) void executeJoin(prefsRef.current)
+    }, 4000)
+    return () => {
+      active = false
+      unsub()
+      window.clearInterval(fallbackTimer)
+    }
+  }, [meetingId, waitingIdentity, joinedConfirmed, executeJoin])
+
+  // Active meeting: once participant doc is confirmed, watch meeting ended/removal cleanly.
+  const activeParticipantId =
+    phase.kind === 'result' && phase.result.status === 'joined'
+      ? phase.result.identity
+      : null
+
+  useEffect(() => {
+    if (!activeParticipantId || !joinedConfirmed) return
+    let active = true
+    const unsubMeeting = subscribeMeetingDoc(meetingId, (summary) => {
+      if (!active) return
+      if (summary.endedAt || summary.status === 'ended') {
+        clearParticipant(meetingId)
+        setPhase({ kind: 'left', reason: 'ended', meeting: summary })
+      }
+    })
+    const unsubMe = subscribeParticipantDoc(
+      meetingId,
+      activeParticipantId,
+      (docData) => {
+        if (!active) return
+        if (docData.status === 'removed' || docData.status === 'rejected') {
+          clearParticipant(meetingId)
+          setPhase((prev) => {
+            if (prev.kind === 'result' && prev.result.status === 'joined') {
+              return {
+                kind: 'left',
+                reason: 'removed',
+                meeting: prev.result.meeting,
+              }
+            }
+            return prev
+          })
+        }
+      },
+    )
+    return () => {
+      active = false
+      unsubMeeting()
+      unsubMe()
+    }
+  }, [meetingId, activeParticipantId, joinedConfirmed])
 
   // Hosts see the passcode in the details panel.
+  const hostRoleKey =
+    phase.kind === 'result' &&
+    phase.result.status === 'joined' &&
+    phase.result.role === 'host'
+      ? phase.result.participantKey
+      : null
+
   useEffect(() => {
-    if (
-      phase.kind !== 'result' ||
-      phase.result.status !== 'joined' ||
-      phase.result.role !== 'host'
-    )
-      return
-    const key = phase.result.participantKey
-    getHostDetails({ data: { meetingId, hostKey: key } })
+    if (!hostRoleKey) return
+    getHostDetails({ data: { meetingId, hostKey: hostRoleKey } })
       .then((d) => setHostPasscode(d.passcode))
       .catch(() => {})
-  }, [phase, meetingId])
+  }, [meetingId, hostRoleKey])
 
   const onLeft = useCallback(
     (reason: LeaveReason) => {
@@ -156,8 +270,9 @@ function MeetPage() {
               ? current.meeting
               : null
         if (!meeting) return current
-        if (reason === 'removed' || reason === 'ended')
+        if (reason === 'removed' || reason === 'ended' || reason === 'left') {
           clearParticipant(meetingId)
+        }
         return { kind: 'left', reason, meeting }
       })
     },
@@ -218,7 +333,7 @@ function MeetPage() {
           title="The class is locked"
           subtitle="The teacher has locked the meeting. Ask them to unlock it, then try again."
         >
-          <Button onClick={() => void join(prefs)}>Try again</Button>
+          <Button onClick={() => void executeJoin(prefs)}>Try again</Button>
         </Screen>
       )
     case 'rejected':
@@ -258,7 +373,7 @@ function MeetPage() {
                 // ignore
               }
               setPhase({ kind: 'joining' })
-              void join(prefs, passcode.trim())
+              void executeJoin(prefs, passcode.trim())
             }}
           >
             <Label htmlFor="pc" className="sr-only">
@@ -350,6 +465,19 @@ function LiveMeeting({
     iceServers,
     initialSettings: meeting,
   })
+
+  // Apply blur preference picked in lobby once on mount.
+  useEffect(() => {
+    try {
+      if (sessionStorage.getItem(`lectern-blur:${meeting.meetingId}`) === '1') {
+        adapter.setBlurOn?.(true)
+      }
+    } catch {
+      // ignore
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [meeting.meetingId])
+
   return (
     <MeetingRoom
       adapter={adapter}

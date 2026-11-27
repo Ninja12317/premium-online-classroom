@@ -1,5 +1,5 @@
-import { useRef, useState } from 'react'
-import { createFileRoute, notFound, useNavigate } from '@tanstack/react-router'
+import { useEffect, useRef, useState } from 'react'
+import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import {
   Mic,
   MicOff,
@@ -8,6 +8,8 @@ import {
   VideoOff,
   KeyRound,
   Clock,
+  Sparkles,
+  DoorClosed,
 } from 'lucide-react'
 
 import { SiteHeader } from '@/components/site-header'
@@ -28,6 +30,7 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog'
 import { getMeeting } from '@/lib/meetings.functions'
+import type { MeetingSummary } from '@/lib/meeting-types'
 import { useAttachStream, useLocalMedia } from '@/lib/use-local-media'
 import { useSpeaking } from '@/lib/use-speaking'
 import {
@@ -41,11 +44,15 @@ import { loadHostKey } from '@/lib/host-keys'
 import { useMounted } from '@/lib/use-mounted'
 import { cn } from '@/lib/utils'
 
+type LobbyMeeting = MeetingSummary & { youAreHost: boolean }
+
 export const Route = createFileRoute('/join/$meetingId')({
   loader: async ({ params }) => {
-    const meeting = await getMeeting({ data: { meetingId: params.meetingId } })
-    if (!meeting) throw notFound()
-    return meeting
+    try {
+      return await getMeeting({ data: { meetingId: params.meetingId } })
+    } catch {
+      return null
+    }
   },
   head: ({ loaderData }) => ({
     meta: loaderData ? [{ title: `Join ${loaderData.title} · Lectern` }] : [],
@@ -54,17 +61,37 @@ export const Route = createFileRoute('/join/$meetingId')({
 })
 
 function Lobby() {
-  const meeting = Route.useLoaderData()
+  const initialMeeting = Route.useLoaderData()
   const { meetingId } = Route.useParams()
   const navigate = useNavigate()
   const mounted = useMounted()
   const { user, ready } = useIdentity()
 
+  const [meeting, setMeeting] = useState<LobbyMeeting | null>(initialMeeting)
+  const [loadingMeeting, setLoadingMeeting] = useState(!initialMeeting)
+
+  // Client-side fetch ensures meetings created in this browser or Firestore load reliably after hydration.
+  useEffect(() => {
+    if (initialMeeting) return
+    let active = true
+    getMeeting({ data: { meetingId } })
+      .then((res) => {
+        if (active) setMeeting(res)
+      })
+      .finally(() => {
+        if (active) setLoadingMeeting(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [meetingId, initialMeeting])
+
   const stored = useClientValue(loadPrefsCached, defaultPrefs)
   const hostKey = useClientValue(() => loadHostKey(meetingId), null)
   const [edits, setEdits] = useState<Partial<JoinPrefs>>({})
   const [passcode, setPasscode] = useState('')
-  // Saved preferences, overlaid with this visit's edits; teachers get their account name prefilled.
+  const [blurPreview, setBlurPreview] = useState(false)
+
   const prefs: JoinPrefs = {
     ...stored,
     ...edits,
@@ -76,7 +103,7 @@ function Lobby() {
     setEdits((e) => ({ ...e, ...next }))
   }
 
-  const isHost = !!hostKey || meeting.youAreHost
+  const isHost = !!hostKey || !!meeting?.youAreHost
   const media = useLocalMedia({
     micOn: prefs.micOn,
     camOn: prefs.camOn,
@@ -86,6 +113,39 @@ function Lobby() {
   const { level } = useSpeaking(media.stream, prefs.micOn)
   const videoRef = useRef<HTMLVideoElement>(null)
   useAttachStream(videoRef, media.hasVideo ? media.stream : null)
+
+  if (loadingMeeting) {
+    return (
+      <div className="min-h-svh bg-background">
+        <SiteHeader />
+        <main className="mx-auto grid max-w-content place-items-center px-4 py-24 text-center">
+          <p className="text-sm text-muted-foreground">Loading class lobby…</p>
+        </main>
+      </div>
+    )
+  }
+
+  if (!meeting) {
+    return (
+      <div className="min-h-svh bg-background">
+        <SiteHeader />
+        <main className="mx-auto flex max-w-md flex-col items-center gap-4 px-4 py-24 text-center">
+          <span className="grid size-14 place-items-center rounded-2xl bg-primary/10 text-primary">
+            <DoorClosed className="size-7" />
+          </span>
+          <h1 className="font-display text-2xl font-semibold">
+            This class doesn’t exist
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            Double-check the invite link or meeting ID with your teacher.
+          </p>
+          <Button asChild>
+            <Link to="/">Go home</Link>
+          </Button>
+        </main>
+      </div>
+    )
+  }
 
   const name = prefs.name.trim()
   const canJoin =
@@ -98,6 +158,11 @@ function Lobby() {
     try {
       if (passcode.trim())
         sessionStorage.setItem(`lectern-passcode:${meetingId}`, passcode.trim())
+      if (blurPreview) {
+        sessionStorage.setItem(`lectern-blur:${meetingId}`, '1')
+      } else {
+        sessionStorage.removeItem(`lectern-blur:${meetingId}`)
+      }
     } catch {
       // ignore
     }
@@ -124,6 +189,7 @@ function Lobby() {
               className={cn(
                 'h-full w-full -scale-x-100 object-cover transition-opacity duration-300',
                 media.hasVideo && prefs.camOn ? 'opacity-100' : 'opacity-0',
+                blurPreview && 'blur-[6px] scale-[1.04]',
               )}
             />
             {(!media.hasVideo || !prefs.camOn) && (
@@ -160,6 +226,22 @@ function Lobby() {
                 label={prefs.camOn ? 'Turn camera off' : 'Turn camera on'}
                 onClick={() => setPrefs((p) => ({ ...p, camOn: !p.camOn }))}
               />
+              <Button
+                type="button"
+                variant="secondary"
+                size="icon"
+                aria-label={blurPreview ? 'Disable video blur' : 'Enable video blur'}
+                aria-pressed={blurPreview}
+                onClick={() => setBlurPreview((b) => !b)}
+                className={cn(
+                  'size-11 rounded-full transition-colors',
+                  blurPreview
+                    ? 'bg-primary text-primary-foreground hover:bg-primary/90'
+                    : 'bg-white/15 text-white hover:bg-white/25',
+                )}
+              >
+                <Sparkles className="size-5" />
+              </Button>
               <Dialog>
                 <DialogTrigger asChild>
                   <Button

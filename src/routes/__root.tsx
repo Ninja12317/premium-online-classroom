@@ -10,6 +10,7 @@ import { TooltipProvider } from '@/components/ui/tooltip'
 import { NotFoundPage } from '@/components/error-pages'
 import { IdentityProvider } from '@/components/identity-provider'
 import { AuthCallbackHandler } from '@/components/auth-callback'
+import { FirestoreNoticeBanner } from '@/components/firestore-banner'
 
 import '../styles.css'
 
@@ -55,11 +56,12 @@ export const Route = createRootRoute({
   notFoundComponent: NotFoundPage,
 })
 
-// Handles emailed sign-in links (confirmation, password reset) on every page.
+// Handles auth callbacks and non-blocking Firestore permission notices.
 function RootLayout() {
   return (
     <>
       <AuthCallbackHandler />
+      <FirestoreNoticeBanner />
       <Outlet />
     </>
   )

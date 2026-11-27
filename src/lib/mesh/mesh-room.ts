@@ -147,6 +147,8 @@ export class MeshRoom {
   role: Role
   settings: MeetingSettings
   waiting: WaitingParticipant[] | null = null
+  spotlightId: string | null = null
+  breakout: import('@/lib/meeting-types').BreakoutState | null = null
   peers = new Map<string, MeshPeer>()
   localState: PeerState = {
     micOn: false,
@@ -174,6 +176,8 @@ export class MeshRoom {
   private syncFailures = 0
   private firstFailureAt = 0
   private changeFrame = 0
+  private hasSyncedOnce = false
+  private initialMisses = 0
 
   constructor(private opts: MeshRoomOptions) {
     this.role = opts.role
@@ -185,12 +189,35 @@ export class MeshRoom {
   start() {
     if (this.running) return
     this.running = true
+    if (this.status === 'disconnected') {
+      this.status = 'connecting'
+      this.cause = null
+    }
     void this.sync()
+  }
+
+  /**
+   * Pauses local timers and peer connections on React unmount (including
+   * StrictMode double-mount) WITHOUT marking the participant as left or
+   * emitting a disconnect cause.
+   */
+  pause() {
+    if (!this.running) return
+    this.running = false
+    window.clearTimeout(this.timer)
+    if (this.changeFrame) {
+      window.cancelAnimationFrame(this.changeFrame)
+      this.changeFrame = 0
+    }
+    for (const link of this.links.values()) {
+      this.closeLink(link)
+    }
+    this.links.clear()
   }
 
   /** Leaves the room: tells peers, closes connections, clears presence. */
   async stop(cause: MeshDisconnectCause = 'left') {
-    if (!this.running) return
+    if (!this.running && this.status === 'disconnected') return
     this.running = false
     window.clearTimeout(this.timer)
     for (const link of this.links.values()) {
@@ -332,6 +359,12 @@ export class MeshRoom {
     this.syncFailures = 0
 
     if (result.status !== 'ok') {
+      // Ignore transient initial not-found while Firestore write propagates.
+      if (result.status === 'not-found' && !this.hasSyncedOnce && this.initialMisses < 3) {
+        this.initialMisses += 1
+        this.scheduleNext()
+        return
+      }
       const cause: MeshDisconnectCause =
         result.status === 'removed' || result.status === 'rejected'
           ? 'removed'
@@ -342,6 +375,8 @@ export class MeshRoom {
       return
     }
 
+    this.hasSyncedOnce = true
+    this.initialMisses = 0
     if (this.status !== 'connected') this.status = 'connected'
     this.role = result.role
     if (JSON.stringify(result.settings) !== JSON.stringify(this.settings)) {
@@ -349,6 +384,12 @@ export class MeshRoom {
     }
     if (JSON.stringify(result.waiting) !== JSON.stringify(this.waiting)) {
       this.waiting = result.waiting
+    }
+    if (result.spotlightId !== undefined) {
+      this.spotlightId = result.spotlightId
+    }
+    if (result.breakout !== undefined) {
+      this.breakout = result.breakout
     }
     this.reconcilePeers(result.peers)
     for (const signal of result.inbox) await this.handleSignal(signal)
@@ -377,6 +418,11 @@ export class MeshRoom {
       peer.name = info.name
       peer.role = info.role
       peer.session = info.session
+      if (peer.link !== 'connected') {
+        if (info.micOn !== undefined) peer.state.micOn = info.micOn
+        if (info.camOn !== undefined) peer.state.camOn = info.camOn
+        if (info.handRaised !== undefined) peer.state.handRaised = info.handRaised
+      }
 
       const link = this.links.get(info.identity)
       if (!link) {
@@ -416,10 +462,10 @@ export class MeshRoom {
       link: 'connecting',
       quality: 'good',
       state: {
-        micOn: false,
-        camOn: false,
+        micOn: Boolean(info.micOn),
+        camOn: Boolean(info.camOn),
         sharing: false,
-        handRaised: false,
+        handRaised: Boolean(info.handRaised),
         speaking: false,
       },
       lastSpokeAt: 0,

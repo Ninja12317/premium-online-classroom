@@ -1,66 +1,130 @@
-import { useEffect, useState, type FormEvent } from 'react'
-import {
-  Link,
-  createFileRoute,
-  useNavigate,
-  useRouter,
-} from '@tanstack/react-router'
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react'
+import { Link, createFileRoute, useNavigate } from '@tanstack/react-router'
 import {
   ArrowRight,
+  CalendarDays,
   CalendarPlus,
+  Clock,
   Copy,
   KeyRound,
   Link2,
   MonitorUp,
+  Pencil,
   PenTool,
+  PlusSquare,
   ShieldCheck,
   Trash2,
   Video,
-  Users,
-  CalendarDays,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
-import { SiteHeader } from '@/components/site-header'
-import { ScheduleDialog } from '@/components/schedule-dialog'
-import { displayName, useIdentity } from '@/components/identity-provider'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Badge } from '@/components/ui/badge'
-import { Skeleton } from '@/components/ui/skeleton'
 import {
-  createMeeting,
-  deleteMeeting,
-  listMyMeetings,
-} from '@/lib/meetings.functions'
+  ChatTab,
+  MeetingsTab,
+  RecordingsTab,
+  SettingsTab,
+  WhiteboardsTab,
+  type DashboardMeeting,
+} from '@/components/dashboard-tabs'
+import { displayName, useIdentity } from '@/components/identity-provider'
+import { ScheduleDialog } from '@/components/schedule-dialog'
+import {
+  MobileBottomNav,
+  SiteHeader,
+  type DashboardTab,
+} from '@/components/site-header'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { Skeleton } from '@/components/ui/skeleton'
+import { saveHostKey } from '@/lib/host-keys'
 import {
   buildIcs,
   downloadTextFile,
   meetingUrl,
   parseMeetingInput,
 } from '@/lib/meeting'
-import { saveHostKey } from '@/lib/host-keys'
+import {
+  createMeeting,
+  deleteMeeting,
+  listMyMeetings,
+} from '@/lib/meetings.functions'
 import { useMounted } from '@/lib/use-mounted'
 
 export const Route = createFileRoute('/')({
-  loader: () => listMyMeetings(),
-  component: Home,
+  component: HomeDashboard,
 })
 
-function Home() {
-  const myMeetings = Route.useLoaderData()
-  const { user } = useIdentity()
+function HomeDashboard() {
+  const { user, ready } = useIdentity()
   const navigate = useNavigate()
+  const mounted = useMounted()
+
+  const [activeTab, setActiveTab] = useState<DashboardTab>('home')
+  const [meetings, setMeetings] = useState<DashboardMeeting[]>([])
+  const [loadingMeetings, setLoadingMeetings] = useState(true)
   const [starting, setStarting] = useState(false)
+  const [sharingStart, setSharingStart] = useState(false)
+  const [joinOpen, setJoinOpen] = useState(false)
   const [joinValue, setJoinValue] = useState('')
   const [joinError, setJoinError] = useState<string | null>(null)
+  const [scheduleOpen, setScheduleOpen] = useState(false)
+  const [editingMeeting, setEditingMeeting] = useState<DashboardMeeting | null>(
+    null,
+  )
+  const [whiteboardFullscreen, setWhiteboardFullscreen] = useState(false)
+  const [clock, setClock] = useState(() => new Date())
 
-  async function startNow() {
-    if (starting) return
-    setStarting(true)
+  useEffect(() => {
+    const t = window.setInterval(() => setClock(new Date()), 1000)
+    return () => window.clearInterval(t)
+  }, [])
+
+  const refreshMeetings = useCallback(async () => {
+    try {
+      const list = await listMyMeetings()
+      setMeetings(list ?? [])
+    } catch {
+      // Non-blocking banner already shown on Firestore error
+    } finally {
+      setLoadingMeetings(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!ready) return
+    let active = true
+    void listMyMeetings()
+      .then((list) => {
+        if (active) setMeetings(list ?? [])
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (active) setLoadingMeetings(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [ready, user?.id])
+
+  async function startNewMeeting(mode: 'instant' | 'share' = 'instant') {
+    if (starting || sharingStart) return
+    if (mode === 'share') setSharingStart(true)
+    else setStarting(true)
     try {
       const result = await createMeeting({
-        data: { hostName: displayName(user) || undefined, waitingRoom: true },
+        data: {
+          title: mode === 'share' ? 'Screen share session' : 'Live class',
+          hostName: displayName(user) || undefined,
+          waitingRoom: mode === 'instant',
+        },
       })
       saveHostKey(result.meetingId, result.hostKey)
       await navigate({
@@ -70,10 +134,11 @@ function Home() {
     } catch {
       toast.error('Could not start a class right now. Please try again.')
       setStarting(false)
+      setSharingStart(false)
     }
   }
 
-  function join(event: FormEvent) {
+  function handleJoinSubmit(event: FormEvent) {
     event.preventDefault()
     const id = parseMeetingInput(joinValue)
     if (!id) {
@@ -81,141 +146,622 @@ function Home() {
       return
     }
     setJoinError(null)
+    setJoinOpen(false)
     void navigate({ to: '/join/$meetingId', params: { meetingId: id } })
   }
 
+  async function handleDeleteMeeting(meetingId: string) {
+    setMeetings((prev) => prev.filter((m) => m.meetingId !== meetingId))
+    try {
+      await deleteMeeting({ data: { meetingId } })
+      toast.success('Class deleted')
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : 'Could not delete that class.',
+      )
+      void refreshMeetings()
+    }
+  }
+
+  const upcoming = useMemo(
+    () =>
+      meetings
+        .filter((m) => !m.endedAt)
+        .sort((a, b) => {
+          const ta = a.scheduledAt ? Date.parse(a.scheduledAt) : Infinity
+          const tb = b.scheduledAt ? Date.parse(b.scheduledAt) : Infinity
+          return ta - tb
+        }),
+    [meetings],
+  )
+
+  const nextScheduled = useMemo(
+    () =>
+      upcoming.find(
+        (m) => m.scheduledAt && Date.parse(m.scheduledAt) >= clock.getTime() - 30 * 60_000,
+      ) ?? upcoming[0] ?? null,
+    [upcoming, clock],
+  )
+
   return (
-    <div className="min-h-svh bg-background">
-      <SiteHeader />
-      <main>
-        <section className="relative overflow-hidden">
-          <div
-            className="paper-grid pointer-events-none absolute inset-0 -z-10"
-            aria-hidden
-          />
-          <div className="mx-auto grid max-w-content gap-12 px-4 py-14 sm:px-6 lg:grid-cols-[1.1fr_0.9fr] lg:items-center lg:py-24">
-            <div className="animate-fade-up motion-reduce:animate-none">
-              <Badge
-                variant="secondary"
-                className="mb-5 gap-1.5 rounded-full px-3 py-1"
-              >
-                <span className="size-1.5 rounded-full bg-live animate-pulse-dot" />
-                Live classes, zero setup for students
-              </Badge>
-              <h1 className="font-display text-4xl font-semibold leading-[1.05] tracking-tight sm:text-5xl lg:text-6xl">
-                Your classroom,
-                <br />
-                <span className="text-primary">one link away.</span>
-              </h1>
-              <p className="mt-5 max-w-reading text-lg text-muted-foreground">
-                Lectern is a live video classroom built for teachers. Start a
-                class in one click, share the link, and teach with video, screen
-                share, a synced whiteboard and chat. Students join from any
-                browser, no account needed.
-              </p>
+    <div
+      className={
+        whiteboardFullscreen
+          ? 'min-h-svh bg-background'
+          : 'min-h-svh bg-background pb-24 md:pb-0'
+      }
+    >
+      <SiteHeader activeTab={activeTab} onTabChange={setActiveTab} />
 
-              <div className="mt-8 flex flex-col gap-3 sm:flex-row sm:items-center">
-                <Button
-                  size="lg"
-                  className="h-12 gap-2 px-6 text-base shadow-md shadow-primary/20"
-                  onClick={() => void startNow()}
-                  disabled={starting}
-                >
-                  <Video className="size-5" />
-                  {starting ? 'Preparing your room…' : 'Start a class now'}
-                </Button>
-                <ScheduleDialog
-                  trigger={
-                    <Button
-                      size="lg"
-                      variant="outline"
-                      className="h-12 gap-2 px-6 text-base"
+      <main className="relative">
+        {activeTab === 'home' && (
+          <>
+            <section className="relative overflow-hidden">
+              <div
+                className="paper-grid pointer-events-none absolute inset-0 -z-10"
+                aria-hidden
+              />
+              <div className="mx-auto max-w-content px-4 py-10 sm:px-6 lg:py-14">
+                {/* Headline preserving Lectern identity */}
+                <div className="mb-8 flex flex-wrap items-end justify-between gap-4">
+                  <div className="animate-fade-up motion-reduce:animate-none">
+                    <Badge
+                      variant="secondary"
+                      className="mb-3 gap-1.5 rounded-full px-3 py-1"
                     >
-                      <CalendarPlus className="size-5" />
-                      Schedule a class
-                    </Button>
-                  }
-                />
-              </div>
-
-              <form onSubmit={join} className="mt-6 max-w-lg" noValidate>
-                <label
-                  htmlFor="join-code"
-                  className="mb-1.5 block text-sm font-medium"
-                >
-                  Joining as a student?
-                </label>
-                <div className="flex gap-2">
-                  <div className="relative flex-1">
-                    <Link2 className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-                    <Input
-                      id="join-code"
-                      value={joinValue}
-                      onChange={(e) => {
-                        setJoinValue(e.target.value)
-                        if (joinError) setJoinError(null)
-                      }}
-                      placeholder="Paste the class link or meeting ID"
-                      className="h-11 pl-9"
-                      autoComplete="off"
-                      aria-invalid={!!joinError}
-                      aria-describedby={joinError ? 'join-error' : undefined}
-                    />
+                      <span className="size-1.5 rounded-full bg-live animate-pulse-dot" />
+                      Live classes, zero setup for students
+                    </Badge>
+                    <h1 className="font-display text-3xl font-semibold leading-[1.08] tracking-tight sm:text-4xl lg:text-5xl">
+                      Your classroom,{' '}
+                      <span className="text-primary">one link away.</span>
+                    </h1>
                   </div>
-                  <Button
-                    type="submit"
-                    variant="secondary"
-                    className="h-11 gap-1.5 px-4"
-                  >
-                    Join <ArrowRight className="size-4" />
-                  </Button>
-                </div>
-                {joinError && (
-                  <p
-                    id="join-error"
-                    role="alert"
-                    className="mt-1.5 text-sm text-destructive"
-                  >
-                    {joinError}
+                  <p className="max-w-md text-sm text-muted-foreground">
+                    Start a class in one click, teach with video, screen share,
+                    an infinite synced whiteboard, live polls, breakout rooms
+                    and chat.
                   </p>
-                )}
-              </form>
-            </div>
+                </div>
 
-            <HeroPreview />
+                {/* Zoom-ergonomics Dashboard Grid styled 100% with Lectern tokens */}
+                <div className="grid gap-6 lg:grid-cols-[1.05fr_0.95fr] lg:items-start">
+                  {/* Left: 4 Quick-Action Tiles + Inline Student Join */}
+                  <div className="space-y-6">
+                    <div className="grid grid-cols-2 gap-3.5 sm:gap-4">
+                      <QuickActionCard
+                        icon={Video}
+                        title={starting ? 'Preparing room…' : 'New Meeting'}
+                        description="Start an instant live class right now"
+                        primary
+                        disabled={starting}
+                        onClick={() => void startNewMeeting('instant')}
+                      />
+                      <QuickActionCard
+                        icon={PlusSquare}
+                        title="Join"
+                        description="Enter a meeting ID or invite link"
+                        onClick={() => {
+                          setJoinError(null)
+                          setJoinOpen(true)
+                        }}
+                      />
+                      <QuickActionCard
+                        icon={CalendarPlus}
+                        title="Schedule"
+                        description="Plan a class with permanent link & passcode"
+                        onClick={() => {
+                          setEditingMeeting(null)
+                          setScheduleOpen(true)
+                        }}
+                      />
+                      <QuickActionCard
+                        icon={MonitorUp}
+                        title={sharingStart ? 'Starting…' : 'Share Screen'}
+                        description="Open a room ready to present immediately"
+                        disabled={sharingStart}
+                        onClick={() => void startNewMeeting('share')}
+                      />
+                    </div>
+
+                    {/* Preserved direct Student Join bar */}
+                    <form
+                      onSubmit={handleJoinSubmit}
+                      className="rounded-2xl border bg-card p-4 shadow-sm"
+                      noValidate
+                    >
+                      <label
+                        htmlFor="join-code"
+                        className="mb-1.5 block text-sm font-medium"
+                      >
+                        Joining as a student?
+                      </label>
+                      <div className="flex gap-2">
+                        <div className="relative flex-1">
+                          <Link2 className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                          <Input
+                            id="join-code"
+                            value={joinValue}
+                            onChange={(e) => {
+                              setJoinValue(e.target.value)
+                              if (joinError) setJoinError(null)
+                            }}
+                            placeholder="Paste the class link or meeting ID"
+                            className="h-10 pl-9"
+                            autoComplete="off"
+                            aria-invalid={!!joinError}
+                            aria-describedby={
+                              joinError ? 'join-error' : undefined
+                            }
+                          />
+                        </div>
+                        <Button
+                          type="submit"
+                          variant="secondary"
+                          className="h-10 gap-1.5 px-4"
+                        >
+                          Join <ArrowRight className="size-4" />
+                        </Button>
+                      </div>
+                      {joinError && (
+                        <p
+                          id="join-error"
+                          role="alert"
+                          className="mt-1.5 text-sm text-destructive"
+                        >
+                          {joinError}
+                        </p>
+                      )}
+                    </form>
+                  </div>
+
+                  {/* Right: Live Clock Card + Upcoming Scheduled Meetings */}
+                  <div className="space-y-4">
+                    {/* Live Clock Card */}
+                    <div className="relative overflow-hidden rounded-2xl border bg-stage p-5 text-stage-tile-foreground shadow-sm">
+                      <div
+                        className="pointer-events-none absolute inset-0 opacity-35"
+                        style={{
+                          background:
+                            'radial-gradient(circle at 85% 20%, var(--primary), transparent 65%)',
+                        }}
+                      />
+                      <div className="relative flex items-start justify-between gap-4">
+                        <div>
+                          <p className="font-display text-4xl font-semibold tabular-nums tracking-tight sm:text-5xl">
+                            {mounted
+                              ? clock.toLocaleTimeString(undefined, {
+                                  hour: 'numeric',
+                                  minute: '2-digit',
+                                })
+                              : '--:--'}
+                            <span className="ml-1.5 text-lg font-normal opacity-70">
+                              {mounted
+                                ? clock.toLocaleTimeString(undefined, {
+                                    second: '2-digit',
+                                  })
+                                : ''}
+                            </span>
+                          </p>
+                          <p className="mt-1 text-sm opacity-80">
+                            {mounted
+                              ? clock.toLocaleDateString(undefined, {
+                                  weekday: 'long',
+                                  month: 'long',
+                                  day: 'numeric',
+                                  year: 'numeric',
+                                })
+                              : 'Loading date…'}
+                          </p>
+                        </div>
+                        <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-white/10">
+                          <Clock className="size-5" />
+                        </span>
+                      </div>
+                      {nextScheduled && (
+                        <div className="relative mt-4 flex flex-wrap items-center justify-between gap-2 rounded-xl bg-white/10 px-3.5 py-2.5 text-xs backdrop-blur-sm">
+                          <div className="min-w-0">
+                            <span className="opacity-75">Up next: </span>
+                            <span className="font-semibold">
+                              {nextScheduled.title}
+                            </span>
+                            {mounted && nextScheduled.scheduledAt && (
+                              <span className="ml-1.5 opacity-80">
+                                ·{' '}
+                                {new Date(
+                                  nextScheduled.scheduledAt,
+                                ).toLocaleTimeString(undefined, {
+                                  hour: 'numeric',
+                                  minute: '2-digit',
+                                })}
+                              </span>
+                            )}
+                          </div>
+                          <Button
+                            asChild
+                            size="xs"
+                            className="bg-primary text-primary-foreground hover:bg-primary/90"
+                          >
+                            <Link
+                              to="/join/$meetingId"
+                              params={{ meetingId: nextScheduled.meetingId }}
+                            >
+                              Start
+                            </Link>
+                          </Button>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Upcoming Scheduled Meetings List */}
+                    <div className="rounded-2xl border bg-card p-4 shadow-sm">
+                      <div className="mb-3 flex items-center justify-between gap-2">
+                        <div>
+                          <h2 className="font-display text-lg font-semibold">
+                            Upcoming meetings
+                          </h2>
+                          <p className="text-xs text-muted-foreground">
+                            Start, copy invite, edit, or delete anytime.
+                          </p>
+                        </div>
+                        <Button
+                          size="xs"
+                          variant="outline"
+                          className="gap-1"
+                          onClick={() => {
+                            setEditingMeeting(null)
+                            setScheduleOpen(true)
+                          }}
+                        >
+                          <CalendarPlus className="size-3.5" /> Schedule
+                        </Button>
+                      </div>
+
+                      {loadingMeetings ? (
+                        <div className="space-y-2">
+                          <Skeleton className="h-20 rounded-xl" />
+                          <Skeleton className="h-20 rounded-xl" />
+                        </div>
+                      ) : upcoming.length === 0 ? (
+                        <div className="rounded-xl border border-dashed p-6 text-center text-sm text-muted-foreground">
+                          No upcoming classes scheduled yet. Click{' '}
+                          <button
+                            type="button"
+                            className="font-medium text-primary underline underline-offset-4"
+                            onClick={() => {
+                              setEditingMeeting(null)
+                              setScheduleOpen(true)
+                            }}
+                          >
+                            Schedule
+                          </button>{' '}
+                          to create one.
+                        </div>
+                      ) : (
+                        <ul className="space-y-2.5">
+                          {upcoming.slice(0, 5).map((m) => (
+                            <li
+                              key={m.meetingId}
+                              className="rounded-xl border bg-background/60 p-3 transition-colors hover:bg-muted/40"
+                            >
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="min-w-0">
+                                  <p className="truncate font-semibold text-sm">
+                                    {m.title}
+                                  </p>
+                                  <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
+                                    <span className="inline-flex items-center gap-1">
+                                      <CalendarDays className="size-3" />
+                                      {mounted && m.scheduledAt
+                                        ? new Date(m.scheduledAt).toLocaleString(
+                                            undefined,
+                                            {
+                                              weekday: 'short',
+                                              month: 'short',
+                                              day: 'numeric',
+                                              hour: 'numeric',
+                                              minute: '2-digit',
+                                            },
+                                          )
+                                        : 'Open class'}
+                                    </span>
+                                    <span>· {m.durationMin} min</span>
+                                    <span className="font-mono">
+                                      {m.meetingId}
+                                    </span>
+                                    {m.passcode && (
+                                      <span className="inline-flex items-center gap-0.5 font-mono">
+                                        <KeyRound className="size-3" />{' '}
+                                        {m.passcode}
+                                      </span>
+                                    )}
+                                  </p>
+                                </div>
+                                {m.startedAt && !m.endedAt && (
+                                  <Badge className="shrink-0 gap-1 bg-live text-white hover:bg-live">
+                                    <span className="size-1.5 rounded-full bg-white animate-pulse-dot" />{' '}
+                                    Live
+                                  </Badge>
+                                )}
+                              </div>
+                              <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
+                                <Button asChild size="xs" className="gap-1">
+                                  <Link
+                                    to="/join/$meetingId"
+                                    params={{ meetingId: m.meetingId }}
+                                  >
+                                    <Video className="size-3.5" /> Start
+                                  </Link>
+                                </Button>
+                                <Button
+                                  size="xs"
+                                  variant="outline"
+                                  className="gap-1"
+                                  onClick={() => {
+                                    const invite = [
+                                      `Join "${m.title}" on Lectern: ${meetingUrl(m.meetingId)}`,
+                                      `Meeting ID: ${m.meetingId}`,
+                                      m.passcode
+                                        ? `Passcode: ${m.passcode}`
+                                        : '',
+                                    ]
+                                      .filter(Boolean)
+                                      .join('\n')
+                                    void navigator.clipboard
+                                      .writeText(invite)
+                                      .then(() =>
+                                        toast.success('Invite copied'),
+                                      )
+                                  }}
+                                >
+                                  <Copy className="size-3" /> Copy Invite
+                                </Button>
+                                <Button
+                                  size="xs"
+                                  variant="ghost"
+                                  className="gap-1"
+                                  onClick={() => {
+                                    setEditingMeeting(m)
+                                    setScheduleOpen(true)
+                                  }}
+                                >
+                                  <Pencil className="size-3" /> Edit
+                                </Button>
+                                {m.scheduledAt && (
+                                  <Button
+                                    size="icon"
+                                    variant="ghost"
+                                    className="size-7"
+                                    aria-label={`Download calendar invite for ${m.title}`}
+                                    onClick={() =>
+                                      downloadTextFile(
+                                        `${m.title.replace(/[^\w-]+/g, '_')}.ics`,
+                                        buildIcs({
+                                          title: m.title,
+                                          startsAt: new Date(m.scheduledAt!),
+                                          durationMin: m.durationMin,
+                                          meetingId: m.meetingId,
+                                          passcode: m.passcode ?? undefined,
+                                        }),
+                                        'text/calendar',
+                                      )
+                                    }
+                                  >
+                                    <CalendarDays className="size-3.5" />
+                                  </Button>
+                                )}
+                                <Button
+                                  size="icon"
+                                  variant="ghost"
+                                  className="ml-auto size-7 text-muted-foreground hover:text-destructive"
+                                  aria-label={`Delete ${m.title}`}
+                                  onClick={() =>
+                                    void handleDeleteMeeting(m.meetingId)
+                                  }
+                                >
+                                  <Trash2 className="size-3.5" />
+                                </Button>
+                              </div>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+
+                      {upcoming.length > 5 && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="mt-2 w-full"
+                          onClick={() => setActiveTab('meetings')}
+                        >
+                          View all {upcoming.length} meetings
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section className="border-t bg-muted/40">
+              <div className="mx-auto grid max-w-content gap-8 px-4 py-12 sm:grid-cols-2 sm:px-6 lg:grid-cols-4">
+                <Feature icon={Video} title="Real video and audio">
+                  Multi-participant video with speaker, gallery & side-by-side
+                  views, pinning, spotlight, blur and device pickers.
+                </Feature>
+                <Feature icon={MonitorUp} title="Screen share & annotate">
+                  Share your screen, window or tab and draw live annotations
+                  right over your presentation.
+                </Feature>
+                <Feature icon={PenTool} title="Infinite whiteboard">
+                  Infinite pan & zoom canvas with shapes, sticky notes,
+                  templates, laser pointer, minimap and PNG/SVG/PDF export.
+                </Feature>
+                <Feature icon={ShieldCheck} title="Full classroom controls">
+                  Waiting room, passcodes, security lock, live polls, breakout
+                  rooms, live captions, notes and local recordings.
+                </Feature>
+              </div>
+            </section>
+          </>
+        )}
+
+        {activeTab === 'meetings' && (
+          <div className="mx-auto max-w-content px-4 py-8 sm:px-6">
+            <MeetingsTab
+              meetings={meetings}
+              onEdit={(m) => {
+                setEditingMeeting(m)
+                setScheduleOpen(true)
+              }}
+              onDelete={(id) => void handleDeleteMeeting(id)}
+              onRefresh={() => void refreshMeetings()}
+            />
           </div>
-        </section>
+        )}
 
-        <section className="mx-auto max-w-content px-4 pb-16 sm:px-6">
-          <MyClasses meetings={myMeetings} signedIn={!!user} />
-        </section>
-
-        <section className="border-t bg-muted/40">
-          <div className="mx-auto grid max-w-content gap-8 px-4 py-14 sm:grid-cols-2 sm:px-6 lg:grid-cols-4">
-            <Feature icon={Video} title="Real video and audio">
-              Multi-participant video with active-speaker view, pinning,
-              full-screen and device pickers.
-            </Feature>
-            <Feature icon={MonitorUp} title="Share your screen">
-              Share your whole screen, a window or a tab. Students see it large
-              and clear.
-            </Feature>
-            <Feature icon={PenTool} title="Synced whiteboard">
-              Pen, shapes, text, pages, undo and export. Students follow along
-              live; you decide who can draw.
-            </Feature>
-            <Feature icon={ShieldCheck} title="You stay in control">
-              Waiting room, passcodes, lock, mute, remove, co-hosts and
-              permissions, all one tap away.
-            </Feature>
+        {activeTab === 'chat' && (
+          <div className="mx-auto max-w-content px-4 py-8 sm:px-6">
+            <ChatTab meetings={meetings} />
           </div>
-        </section>
+        )}
+
+        {activeTab === 'whiteboards' && (
+          <div className="mx-auto max-w-content px-4 py-6 sm:px-6">
+            <WhiteboardsTab
+              meetings={meetings}
+              onFullscreenChange={setWhiteboardFullscreen}
+            />
+          </div>
+        )}
+
+        {activeTab === 'recordings' && (
+          <div className="mx-auto max-w-content px-4 py-8 sm:px-6">
+            <RecordingsTab />
+          </div>
+        )}
+
+        {activeTab === 'settings' && (
+          <div className="mx-auto max-w-content px-4 py-8 sm:px-6">
+            <SettingsTab />
+          </div>
+        )}
       </main>
-      <footer className="mx-auto flex max-w-content flex-wrap items-center justify-between gap-2 px-4 py-8 text-sm text-muted-foreground sm:px-6">
-        <span>Lectern, a live classroom for teachers.</span>
-        <span>Works best in Chrome, Edge, Safari and Firefox.</span>
-      </footer>
+
+      {!whiteboardFullscreen && (
+        <footer className="mx-auto flex max-w-content flex-wrap items-center justify-between gap-2 border-t px-4 py-6 text-sm text-muted-foreground sm:px-6">
+          <span>Lectern, a live classroom for teachers.</span>
+          <span className="text-xs">Built by Nihal Pawar</span>
+        </footer>
+      )}
+
+      {/* Mobile-only fixed bottom navigation (auto-hidden during full-screen whiteboard; never mounted in meetings/lobbies) */}
+      {!whiteboardFullscreen && (
+        <MobileBottomNav activeTab={activeTab} onTabChange={setActiveTab} />
+      )}
+
+      {/* Controlled Schedule / Edit Meeting Dialog */}
+      <ScheduleDialog
+        open={scheduleOpen}
+        onOpenChange={setScheduleOpen}
+        editing={editingMeeting}
+        onSaved={() => void refreshMeetings()}
+      />
+
+      {/* Join Meeting Dialog */}
+      <Dialog open={joinOpen} onOpenChange={setJoinOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Join a class</DialogTitle>
+            <DialogDescription>
+              Paste the invite link or enter the 10-letter meeting ID shared by
+              your teacher.
+            </DialogDescription>
+          </DialogHeader>
+          <form onSubmit={handleJoinSubmit} className="space-y-4">
+            <Input
+              autoFocus
+              value={joinValue}
+              onChange={(e) => {
+                setJoinValue(e.target.value)
+                if (joinError) setJoinError(null)
+              }}
+              placeholder="e.g. abc-defg-hij or full invite URL"
+            />
+            {joinError && (
+              <p role="alert" className="text-sm text-destructive">
+                {joinError}
+              </p>
+            )}
+            <div className="flex justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setJoinOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button type="submit" className="gap-1.5">
+                Continue to lobby <ArrowRight className="size-4" />
+              </Button>
+            </div>
+          </form>
+        </DialogContent>
+      </Dialog>
     </div>
+  )
+}
+
+function QuickActionCard({
+  icon: Icon,
+  title,
+  description,
+  primary,
+  disabled,
+  onClick,
+}: {
+  icon: typeof Video
+  title: string
+  description: string
+  primary?: boolean
+  disabled?: boolean
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={
+        primary
+          ? 'group flex flex-col items-start justify-between rounded-2xl border border-primary/20 bg-primary p-5 text-left text-primary-foreground shadow-md shadow-primary/15 transition-all hover:bg-primary/95 disabled:opacity-60'
+          : 'group flex flex-col items-start justify-between rounded-2xl border bg-card p-5 text-left text-card-foreground shadow-sm transition-all hover:border-primary/40 hover:bg-muted/40 disabled:opacity-60'
+      }
+    >
+      <span
+        className={
+          primary
+            ? 'mb-4 grid size-11 place-items-center rounded-xl bg-primary-foreground/15 text-primary-foreground'
+            : 'mb-4 grid size-11 place-items-center rounded-xl bg-primary/10 text-primary'
+        }
+      >
+        <Icon className="size-5" />
+      </span>
+      <div>
+        <span className="block font-display text-lg font-semibold leading-tight">
+          {title}
+        </span>
+        <span
+          className={
+            primary
+              ? 'mt-1 block text-xs text-primary-foreground/80'
+              : 'mt-1 block text-xs text-muted-foreground'
+          }
+        >
+          {description}
+        </span>
+      </div>
+    </button>
   )
 }
 
@@ -235,300 +781,6 @@ function Feature({
       </span>
       <h2 className="text-base font-semibold">{title}</h2>
       <p className="mt-1 text-sm text-muted-foreground">{children}</p>
-    </div>
-  )
-}
-
-/** Decorative stage illustration; nothing here is live data. */
-function HeroPreview() {
-  const tiles = [
-    { label: 'You', hue: 160, big: true },
-    { label: 'AO', hue: 300 },
-    { label: 'PR', hue: 22 },
-    { label: 'MR', hue: 205 },
-    { label: 'LH', hue: 260 },
-  ]
-  return (
-    <div
-      aria-hidden
-      className="animate-fade-up stagger-2 motion-reduce:animate-none relative mx-auto w-full max-w-xl rounded-2xl border bg-stage p-3 shadow-xl shadow-foreground/5"
-    >
-      <div className="mb-3 flex items-center justify-between px-1 text-xs text-muted-foreground">
-        <span className="flex items-center gap-1.5 font-medium">
-          <span className="size-2 rounded-full bg-live animate-pulse-dot" />{' '}
-          Grade 10 Algebra
-        </span>
-        <span>24 in class · 00:12:41</span>
-      </div>
-      <div className="grid grid-cols-3 gap-2">
-        {tiles.map((t) => (
-          <div
-            key={t.label}
-            className={`relative aspect-video overflow-hidden rounded-xl bg-stage-tile ${t.big ? 'col-span-2 row-span-2 aspect-auto' : ''}`}
-          >
-            <div
-              className="absolute inset-0 opacity-70"
-              style={{
-                background: `radial-gradient(circle at 30% 20%, oklch(0.6 0.12 ${t.hue} / .6), transparent 60%)`,
-              }}
-            />
-            <span
-              className="absolute left-1/2 top-1/2 grid size-10 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full text-sm font-semibold text-stage-tile-foreground"
-              style={{ background: `oklch(0.5 0.12 ${t.hue})` }}
-            >
-              {t.label}
-            </span>
-            <span className="absolute bottom-1.5 left-1.5 rounded-md bg-black/40 px-1.5 py-0.5 text-[10px] text-white">
-              {t.label}
-            </span>
-          </div>
-        ))}
-        <div className="relative aspect-video overflow-hidden rounded-xl border border-dashed border-border bg-background/60 p-2">
-          <div className="absolute inset-x-2 top-2 h-1.5 w-2/3 rounded bg-primary/60" />
-          <div className="absolute inset-x-2 top-5 h-1.5 w-1/2 rounded bg-amber/80" />
-          <div className="absolute bottom-2 left-2 h-6 w-6 rounded-full border-2 border-primary/70" />
-        </div>
-      </div>
-      <div className="mt-3 flex items-center justify-center gap-2">
-        {['Mic', 'Cam', 'Share', 'Board', 'Chat'].map((label) => (
-          <span
-            key={label}
-            className="rounded-lg bg-background/80 px-2.5 py-1.5 text-[11px] font-medium shadow-sm"
-          >
-            {label}
-          </span>
-        ))}
-        <span className="rounded-lg bg-destructive px-2.5 py-1.5 text-[11px] font-medium text-destructive-foreground">
-          Leave
-        </span>
-      </div>
-    </div>
-  )
-}
-
-type MyMeeting = NonNullable<Awaited<ReturnType<typeof listMyMeetings>>>[number]
-
-function MyClasses({
-  meetings,
-  signedIn,
-}: {
-  meetings: MyMeeting[] | null
-  signedIn: boolean
-}) {
-  const router = useRouter()
-  const mounted = useMounted()
-  const { ready } = useIdentity()
-  const [now] = useState(() => Date.now())
-
-  // Refresh once the browser session is known: the SSR pass may have had no cookie.
-  useEffect(() => {
-    if (ready && signedIn && meetings === null) void router.invalidate()
-  }, [ready, signedIn, meetings, router])
-
-  if (!ready) {
-    return (
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-        {[0, 1, 2].map((i) => (
-          <Skeleton key={i} className="h-36 rounded-2xl" />
-        ))}
-      </div>
-    )
-  }
-
-  if (!signedIn) {
-    return (
-      <div className="flex flex-col items-start justify-between gap-4 rounded-2xl border bg-card p-6 sm:flex-row sm:items-center">
-        <div>
-          <h2 className="font-display text-xl font-semibold">
-            Keep your classes in one place
-          </h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Sign in to see scheduled classes here, reuse links, and start them
-            from any device.
-          </p>
-        </div>
-        <div className="flex gap-2">
-          <Button asChild variant="outline">
-            <Link to="/login">Sign in</Link>
-          </Button>
-          <Button asChild>
-            <Link to="/signup">Create a teacher account</Link>
-          </Button>
-        </div>
-      </div>
-    )
-  }
-
-  const list = meetings ?? []
-  const upcoming = list
-    .filter((m) => !m.endedAt)
-    .sort((a, b) => {
-      const ta = a.scheduledAt ? Date.parse(a.scheduledAt) : 0
-      const tb = b.scheduledAt ? Date.parse(b.scheduledAt) : 0
-      return ta - tb
-    })
-  const past = list.filter((m) => m.endedAt).slice(0, 6)
-
-  async function remove(meetingId: string) {
-    try {
-      await deleteMeeting({ data: { meetingId } })
-      toast.success('Class deleted')
-      await router.invalidate()
-    } catch (err) {
-      toast.error(
-        err instanceof Error ? err.message : 'Could not delete that class.',
-      )
-    }
-  }
-
-  return (
-    <div className="space-y-8">
-      <div>
-        <div className="mb-4 flex items-end justify-between gap-4">
-          <div>
-            <h2 className="font-display text-2xl font-semibold">
-              Your classes
-            </h2>
-            <p className="text-sm text-muted-foreground">
-              Scheduled and open classes you can start any time.
-            </p>
-          </div>
-          <ScheduleDialog
-            trigger={
-              <Button variant="outline" size="sm" className="gap-1.5">
-                <CalendarPlus className="size-4" /> Schedule
-              </Button>
-            }
-          />
-        </div>
-        {upcoming.length === 0 ? (
-          <div className="rounded-2xl border border-dashed p-8 text-center text-sm text-muted-foreground">
-            No upcoming classes yet. Start one now or schedule it for later.
-          </div>
-        ) : (
-          <ul className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {upcoming.map((m) => (
-              <li
-                key={m.meetingId}
-                className="flex flex-col rounded-2xl border bg-card p-4 shadow-sm"
-              >
-                <div className="flex items-start justify-between gap-2">
-                  <h3 className="font-semibold leading-snug">{m.title}</h3>
-                  {m.startedAt && !m.endedAt ? (
-                    <Badge className="shrink-0 gap-1 bg-live text-white hover:bg-live">
-                      <span className="size-1.5 rounded-full bg-white animate-pulse-dot" />{' '}
-                      Live
-                    </Badge>
-                  ) : m.scheduledAt && Date.parse(m.scheduledAt) < now ? (
-                    <Badge variant="secondary" className="shrink-0">
-                      Ready
-                    </Badge>
-                  ) : null}
-                </div>
-                <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
-                  <CalendarDays className="size-3.5" />
-                  {mounted && m.scheduledAt
-                    ? new Date(m.scheduledAt).toLocaleString(undefined, {
-                        weekday: 'short',
-                        month: 'short',
-                        day: 'numeric',
-                        hour: 'numeric',
-                        minute: '2-digit',
-                      })
-                    : 'Open class, no fixed time'}
-                  <span aria-hidden>·</span> {m.durationMin} min
-                </p>
-                <p className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-xs text-muted-foreground">
-                  <span>{m.meetingId}</span>
-                  {m.passcode && (
-                    <span className="inline-flex items-center gap-1">
-                      <KeyRound className="size-3" /> {m.passcode}
-                    </span>
-                  )}
-                </p>
-                <div className="mt-4 flex flex-wrap items-center gap-1.5">
-                  <Button asChild size="sm" className="gap-1.5">
-                    <Link
-                      to="/join/$meetingId"
-                      params={{ meetingId: m.meetingId }}
-                    >
-                      <Video className="size-4" /> Start
-                    </Link>
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="gap-1.5"
-                    onClick={() => {
-                      void navigator.clipboard
-                        .writeText(meetingUrl(m.meetingId))
-                        .then(() => toast.success('Invite link copied'))
-                    }}
-                  >
-                    <Copy className="size-4" /> Link
-                  </Button>
-                  {m.scheduledAt && (
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="gap-1.5"
-                      onClick={() =>
-                        downloadTextFile(
-                          `${m.title.replace(/[^\w-]+/g, '_')}.ics`,
-                          buildIcs({
-                            title: m.title,
-                            startsAt: new Date(m.scheduledAt!),
-                            durationMin: m.durationMin,
-                            meetingId: m.meetingId,
-                            passcode: m.passcode ?? undefined,
-                          }),
-                          'text/calendar',
-                        )
-                      }
-                    >
-                      <CalendarDays className="size-4" /> Calendar
-                    </Button>
-                  )}
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    className="ml-auto size-8 text-muted-foreground hover:text-destructive"
-                    aria-label={`Delete ${m.title}`}
-                    onClick={() => void remove(m.meetingId)}
-                  >
-                    <Trash2 className="size-4" />
-                  </Button>
-                </div>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-      {past.length > 0 && (
-        <div>
-          <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-muted-foreground">
-            <Users className="size-4" /> Recent classes
-          </h2>
-          <ul className="divide-y rounded-2xl border bg-card">
-            {past.map((m) => (
-              <li
-                key={m.meetingId}
-                className="flex items-center justify-between gap-3 px-4 py-3 text-sm"
-              >
-                <span className="truncate">{m.title}</span>
-                <span className="shrink-0 text-muted-foreground">
-                  {mounted && m.endedAt
-                    ? new Date(m.endedAt).toLocaleDateString(undefined, {
-                        month: 'short',
-                        day: 'numeric',
-                      })
-                    : ''}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
     </div>
   )
 }

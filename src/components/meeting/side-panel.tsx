@@ -9,15 +9,19 @@ import {
 import {
   Check,
   Copy,
+  Download,
+  FileText,
   Hand,
   Megaphone,
   Mic,
   MicOff,
   MonitorOff,
   MoreVertical,
+  Pin,
   SendHorizonal,
   ShieldCheck,
   ShieldOff,
+  Sparkles,
   UserMinus,
   UserX,
   Video,
@@ -49,14 +53,16 @@ import {
 import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
-import { meetingUrl } from '@/lib/meeting'
+import { downloadTextFile, meetingUrl } from '@/lib/meeting'
 import type {
   Connection,
+  MeetingPoll,
   MeetingSettings,
   MeetingSummary,
   WaitingParticipant,
 } from '@/lib/meeting-types'
 import { cn } from '@/lib/utils'
+import { PollsPane } from './polls-pane'
 import type { ChatMessage, PanelTab, TileModel } from './types'
 
 export type ModerateAction =
@@ -66,12 +72,15 @@ export type ModerateAction =
   | 'make-cohost'
   | 'revoke-cohost'
   | 'lower-hand'
+  | 'spotlight'
+  | 'unspotlight'
 
 export interface SidePanelProps {
   tab: PanelTab
   onTab: (tab: PanelTab) => void
   onClose: () => void
   localId: string
+  localName?: string
   isModerator: boolean
   isHost: boolean
   // chat
@@ -82,12 +91,19 @@ export interface SidePanelProps {
   // people
   tiles: TileModel[]
   waiting: WaitingParticipant[]
+  pinnedId?: string | null
+  spotlightId?: string | null
+  onPin?: (id: string | null) => void
   onAdmit: (identity: string, admit: boolean) => void
   onAdmitAll: () => void
   onModerate: (identity: string, action: ModerateAction) => void
   onMuteAll: () => void
   settings: MeetingSettings
   onSettings: (patch: Partial<MeetingSettings>) => void
+  // polls & notes
+  polls?: MeetingPoll[]
+  notes?: string
+  onNotesChange?: (text: string) => void
   // info
   meeting: MeetingSummary
   passcode: string | null
@@ -102,27 +118,37 @@ export function SidePanel(p: SidePanelProps) {
       className="flex h-full w-full flex-col bg-card text-card-foreground"
       aria-label="Meeting panel"
     >
-      <div className="flex items-center gap-2 border-b px-3 py-2">
+      <div className="flex items-center gap-1.5 border-b px-2.5 py-2">
         <Tabs
           value={p.tab}
           onValueChange={(v) => p.onTab(v as PanelTab)}
-          className="flex-1"
+          className="min-w-0 flex-1"
         >
-          <TabsList className="grid w-full grid-cols-3">
-            <TabsTrigger value="chat">Chat</TabsTrigger>
-            <TabsTrigger value="people">
+          <TabsList className="grid w-full grid-cols-5 h-8">
+            <TabsTrigger value="chat" className="px-1 text-xs">
+              Chat
+            </TabsTrigger>
+            <TabsTrigger value="people" className="px-1 text-xs">
               People
-              <span className="ml-1 rounded-full bg-foreground/10 px-1.5 text-[10px] tabular-nums">
+              <span className="ml-0.5 hidden rounded-full bg-foreground/10 px-1 text-[10px] tabular-nums sm:inline">
                 {p.tiles.length}
               </span>
             </TabsTrigger>
-            <TabsTrigger value="info">Details</TabsTrigger>
+            <TabsTrigger value="polls" className="px-1 text-xs">
+              Polls
+            </TabsTrigger>
+            <TabsTrigger value="notes" className="px-1 text-xs">
+              Notes
+            </TabsTrigger>
+            <TabsTrigger value="info" className="px-1 text-xs">
+              Details
+            </TabsTrigger>
           </TabsList>
         </Tabs>
         <Button
           variant="ghost"
           size="icon"
-          className="size-8"
+          className="size-8 shrink-0"
           onClick={p.onClose}
           aria-label="Close panel"
         >
@@ -132,6 +158,20 @@ export function SidePanel(p: SidePanelProps) {
       <div className="min-h-0 flex-1">
         {p.tab === 'chat' && <ChatPane {...p} />}
         {p.tab === 'people' && <PeoplePane {...p} />}
+        {p.tab === 'polls' && (
+          <PollsPane
+            meetingId={p.meeting.meetingId}
+            localId={p.localId}
+            localName={
+              p.localName ??
+              p.tiles.find((t) => t.isLocal)?.name ??
+              'Participant'
+            }
+            isModerator={p.isModerator}
+            polls={p.polls ?? []}
+          />
+        )}
+        {p.tab === 'notes' && <NotesPane {...p} />}
         {p.tab === 'info' && <InfoPane {...p} />}
       </div>
     </aside>
@@ -161,7 +201,6 @@ function ChatPane(p: SidePanelProps) {
 
   const recipients = p.tiles.filter((t) => !t.isLocal)
   const allowPrivate = p.canPrivate || p.isModerator
-  // If the chosen recipient left, fall back to everyone.
   const effectiveTo =
     to !== 'everyone' && !recipients.some((r) => r.id === to) ? 'everyone' : to
 
@@ -178,8 +217,48 @@ function ChatPane(p: SidePanelProps) {
     stickToBottom.current = true
   }
 
+  function saveChatTranscript() {
+    if (p.messages.length === 0) {
+      toast('No chat messages to save yet.')
+      return
+    }
+    const lines = [
+      `Lectern Chat Transcript — ${p.meeting.title} (${p.meeting.meetingId})`,
+      `Exported ${new Date().toLocaleString()}`,
+      '',
+      ...p.messages.map((m) => {
+        const ts = formatTime(m.at)
+        const tag =
+          m.kind === 'announcement'
+            ? '[Announcement] '
+            : m.kind === 'private'
+              ? `[Private${m.toName ? ` -> ${m.toName}` : ''}] `
+              : ''
+        return `[${ts}] ${m.authorName}: ${tag}${m.text}`
+      }),
+    ]
+    downloadTextFile(
+      `${p.meeting.title.replace(/[^\w-]+/g, '_')}-chat.txt`,
+      lines.join('\n'),
+      'text/plain;charset=utf-8',
+    )
+    toast.success('Chat transcript saved')
+  }
+
   return (
     <div className="flex h-full flex-col">
+      <div className="flex items-center justify-between border-b px-3 py-1.5 text-xs text-muted-foreground">
+        <span>Synced with class history</span>
+        <Button
+          size="xs"
+          variant="ghost"
+          className="h-7 gap-1 text-xs"
+          onClick={saveChatTranscript}
+          disabled={p.messages.length === 0}
+        >
+          <Download className="size-3.5" /> Save chat
+        </Button>
+      </div>
       <div
         ref={listRef}
         onScroll={(e) => {
@@ -350,18 +429,64 @@ function ChatPane(p: SidePanelProps) {
 
 // ---------------------------------------------------------------------------
 
+function NotesPane(p: SidePanelProps) {
+  const value = p.notes ?? ''
+  return (
+    <div className="flex h-full flex-col p-3">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+          <FileText className="size-3.5" /> Shared class notes
+        </div>
+        <Button
+          size="xs"
+          variant="outline"
+          className="gap-1"
+          onClick={() => {
+            downloadTextFile(
+              `${p.meeting.title.replace(/[^\w-]+/g, '_')}-notes.md`,
+              `# ${p.meeting.title}\n\n${value}`,
+              'text/markdown;charset=utf-8',
+            )
+            toast.success('Notes exported')
+          }}
+        >
+          <Download className="size-3.5" /> Export .md
+        </Button>
+      </div>
+      <Textarea
+        value={value}
+        onChange={(e) => p.onNotesChange?.(e.target.value)}
+        placeholder="Jot down lesson outlines, key formulas, homework, or action items… Notes sync live for everyone in this class."
+        className="min-h-0 flex-1 resize-none font-sans text-sm leading-relaxed"
+        aria-label="Shared class notes"
+      />
+      <p className="mt-2 text-[11px] text-muted-foreground">
+        Synced in real time for everyone in this class.
+      </p>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+
 export function ParticipantMenu({
   tile,
   isHost,
+  spotlighted,
+  pinned,
+  onPin,
   onModerate,
   trigger,
 }: {
   tile: TileModel
   isHost: boolean
+  spotlighted?: boolean
+  pinned?: boolean
+  onPin?: (id: string | null) => void
   onModerate: (identity: string, action: ModerateAction) => void
   trigger?: ReactNode
 }) {
-  if (tile.isLocal || tile.role === 'host') return null
+  const canModerateTarget = !tile.isLocal && tile.role !== 'host'
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -377,42 +502,67 @@ export function ParticipantMenu({
         )}
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-52">
-        {tile.micOn && (
-          <DropdownMenuItem onSelect={() => onModerate(tile.id, 'mute')}>
-            <MicOff /> Mute
+        {onPin && (
+          <DropdownMenuItem
+            onSelect={() => onPin(pinned ? null : tile.id)}
+          >
+            <Pin /> {pinned ? 'Unpin for me' : 'Pin for me'}
           </DropdownMenuItem>
         )}
-        {tile.sharing && (
-          <DropdownMenuItem onSelect={() => onModerate(tile.id, 'stop-share')}>
-            <MonitorOff /> Stop their screen share
-          </DropdownMenuItem>
-        )}
-        {tile.handRaised && (
-          <DropdownMenuItem onSelect={() => onModerate(tile.id, 'lower-hand')}>
-            <Hand /> Lower hand
-          </DropdownMenuItem>
-        )}
-        {isHost &&
-          (tile.role === 'cohost' ? (
-            <DropdownMenuItem
-              onSelect={() => onModerate(tile.id, 'revoke-cohost')}
-            >
-              <ShieldOff /> Remove co-host
-            </DropdownMenuItem>
-          ) : (
-            <DropdownMenuItem
-              onSelect={() => onModerate(tile.id, 'make-cohost')}
-            >
-              <ShieldCheck /> Make co-host
-            </DropdownMenuItem>
-          ))}
-        <DropdownMenuSeparator />
         <DropdownMenuItem
-          variant="destructive"
-          onSelect={() => onModerate(tile.id, 'remove')}
+          onSelect={() =>
+            onModerate(tile.id, spotlighted ? 'unspotlight' : 'spotlight')
+          }
         >
-          <UserMinus /> Remove from class
+          <Sparkles />{' '}
+          {spotlighted ? 'Remove spotlight' : 'Spotlight for everyone'}
         </DropdownMenuItem>
+
+        {canModerateTarget && (
+          <>
+            <DropdownMenuSeparator />
+            {tile.micOn && (
+              <DropdownMenuItem onSelect={() => onModerate(tile.id, 'mute')}>
+                <MicOff /> Mute
+              </DropdownMenuItem>
+            )}
+            {tile.sharing && (
+              <DropdownMenuItem
+                onSelect={() => onModerate(tile.id, 'stop-share')}
+              >
+                <MonitorOff /> Stop their screen share
+              </DropdownMenuItem>
+            )}
+            {tile.handRaised && (
+              <DropdownMenuItem
+                onSelect={() => onModerate(tile.id, 'lower-hand')}
+              >
+                <Hand /> Lower hand
+              </DropdownMenuItem>
+            )}
+            {isHost &&
+              (tile.role === 'cohost' ? (
+                <DropdownMenuItem
+                  onSelect={() => onModerate(tile.id, 'revoke-cohost')}
+                >
+                  <ShieldOff /> Remove co-host
+                </DropdownMenuItem>
+              ) : (
+                <DropdownMenuItem
+                  onSelect={() => onModerate(tile.id, 'make-cohost')}
+                >
+                  <ShieldCheck /> Make co-host
+                </DropdownMenuItem>
+              ))}
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              variant="destructive"
+              onSelect={() => onModerate(tile.id, 'remove')}
+            >
+              <UserMinus /> Remove from class
+            </DropdownMenuItem>
+          </>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -507,11 +657,14 @@ function PeoplePane(p: SidePanelProps) {
                     <span className="text-muted-foreground"> (you)</span>
                   )}
                 </p>
-                {t.role !== 'student' && (
-                  <p className="text-[11px] text-muted-foreground">
-                    {t.role === 'host' ? 'Teacher' : 'Co-host'}
-                  </p>
-                )}
+                <p className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                  {t.role !== 'student' && (
+                    <span>{t.role === 'host' ? 'Teacher' : 'Co-host'}</span>
+                  )}
+                  {p.spotlightId === t.id && (
+                    <span className="text-amber font-medium">Spotlight</span>
+                  )}
+                </p>
               </div>
               {t.handRaised && (
                 <Hand className="size-4 text-amber" aria-label="Hand raised" />
@@ -539,6 +692,9 @@ function PeoplePane(p: SidePanelProps) {
                 <ParticipantMenu
                   tile={t}
                   isHost={p.isHost}
+                  pinned={p.pinnedId === t.id}
+                  spotlighted={p.spotlightId === t.id}
+                  onPin={p.onPin}
                   onModerate={p.onModerate}
                 />
               ) : (

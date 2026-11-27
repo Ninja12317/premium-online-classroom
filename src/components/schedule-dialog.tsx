@@ -23,8 +23,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { createMeeting } from '@/lib/meetings.functions'
-import { buildIcs, downloadTextFile, meetingUrl } from '@/lib/meeting'
+import { createMeeting, updateMeeting } from '@/lib/meetings.functions'
+import type { MeetingSummary } from '@/lib/meeting-types'
+import {
+  buildIcs,
+  downloadTextFile,
+  generatePasscode,
+  meetingUrl,
+} from '@/lib/meeting'
 import { saveHostKey } from '@/lib/host-keys'
 
 interface Created {
@@ -35,9 +41,9 @@ interface Created {
   durationMin: number
 }
 
-function defaultDate() {
-  const d = new Date(Date.now() + 60 * 60_000)
-  d.setMinutes(0, 0, 0)
+function formatDateInputs(iso?: string | null) {
+  const d = iso ? new Date(iso) : new Date(Date.now() + 60 * 60_000)
+  if (!iso) d.setMinutes(0, 0, 0)
   const pad = (n: number) => String(n).padStart(2, '0')
   return {
     date: `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`,
@@ -45,28 +51,59 @@ function defaultDate() {
   }
 }
 
-export function ScheduleDialog({ trigger }: { trigger: ReactNode }) {
+export function ScheduleDialog({
+  trigger,
+  editing,
+  open: controlledOpen,
+  onOpenChange: controlledOnOpenChange,
+  onSaved,
+}: {
+  trigger?: ReactNode
+  editing?: (MeetingSummary & { passcode?: string | null }) | null
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
+  onSaved?: () => void
+}) {
   const { user } = useIdentity()
   const router = useRouter()
   const navigate = useNavigate()
-  const [open, setOpen] = useState(false)
+  const [internalOpen, setInternalOpen] = useState(false)
+  const open = controlledOpen !== undefined ? controlledOpen : internalOpen
+  const setOpen = (next: boolean) => {
+    if (controlledOnOpenChange) controlledOnOpenChange(next)
+    else setInternalOpen(next)
+  }
+
   const [pending, setPending] = useState(false)
   const [created, setCreated] = useState<Created | null>(null)
   const [title, setTitle] = useState('')
-  const [{ date, time }, setWhen] = useState(defaultDate)
+  const [{ date, time }, setWhen] = useState(() => formatDateInputs())
   const [duration, setDuration] = useState('60')
   const [passcode, setPasscode] = useState(true)
   const [waitingRoom, setWaitingRoom] = useState(true)
   const [copied, setCopied] = useState(false)
 
-  function reset() {
-    setCreated(null)
-    setTitle('')
-    setWhen(defaultDate())
-    setDuration('60')
-    setPasscode(true)
-    setWaitingRoom(true)
-    setCopied(false)
+  const formKey = `${open ? 'open' : 'closed'}:${editing?.meetingId ?? 'new'}`
+  const [seenKey, setSeenKey] = useState(formKey)
+  if (formKey !== seenKey) {
+    setSeenKey(formKey)
+    if (open) {
+      setCreated(null)
+      setCopied(false)
+      if (editing) {
+        setTitle(editing.title)
+        setWhen(formatDateInputs(editing.scheduledAt))
+        setDuration(String(editing.durationMin || 60))
+        setPasscode(Boolean(editing.passcode || editing.hasPasscode))
+        setWaitingRoom(editing.waitingRoom)
+      } else {
+        setTitle('')
+        setWhen(formatDateInputs())
+        setDuration('60')
+        setPasscode(true)
+        setWaitingRoom(true)
+      }
+    }
   }
 
   async function submit(e: React.FormEvent) {
@@ -79,27 +116,48 @@ export function ScheduleDialog({ trigger }: { trigger: ReactNode }) {
     }
     setPending(true)
     try {
-      const result = await createMeeting({
-        data: {
+      if (editing) {
+        const nextPasscode = passcode
+          ? editing.passcode || generatePasscode()
+          : null
+        await updateMeeting({
+          data: {
+            meetingId: editing.meetingId,
+            title: title.trim() || 'Live class',
+            scheduledAt: startsAt.toISOString(),
+            durationMin: Number(duration),
+            waitingRoom,
+            passcode: nextPasscode,
+          },
+        })
+        toast.success('Class updated')
+        await router.invalidate()
+        onSaved?.()
+        setOpen(false)
+      } else {
+        const result = await createMeeting({
+          data: {
+            title: title.trim() || 'Live class',
+            hostName: displayName(user) || undefined,
+            passcode,
+            waitingRoom,
+            scheduledAt: startsAt.toISOString(),
+            durationMin: Number(duration),
+          },
+        })
+        saveHostKey(result.meetingId, result.hostKey)
+        setCreated({
+          meetingId: result.meetingId,
+          passcode: result.passcode,
           title: title.trim() || 'Live class',
-          hostName: displayName(user) || undefined,
-          passcode,
-          waitingRoom,
-          scheduledAt: startsAt.toISOString(),
+          startsAt,
           durationMin: Number(duration),
-        },
-      })
-      saveHostKey(result.meetingId, result.hostKey)
-      setCreated({
-        meetingId: result.meetingId,
-        passcode: result.passcode,
-        title: title.trim() || 'Live class',
-        startsAt,
-        durationMin: Number(duration),
-      })
-      await router.invalidate()
+        })
+        await router.invalidate()
+        onSaved?.()
+      }
     } catch {
-      toast.error('Could not schedule the class. Please try again.')
+      toast.error('Could not save the class. Please try again.')
     } finally {
       setPending(false)
     }
@@ -119,14 +177,8 @@ export function ScheduleDialog({ trigger }: { trigger: ReactNode }) {
   }
 
   return (
-    <Dialog
-      open={open}
-      onOpenChange={(next) => {
-        setOpen(next)
-        if (!next) setTimeout(reset, 200)
-      }}
-    >
-      <DialogTrigger asChild>{trigger}</DialogTrigger>
+    <Dialog open={open} onOpenChange={setOpen}>
+      {trigger && <DialogTrigger asChild>{trigger}</DialogTrigger>}
       <DialogContent className="sm:max-w-md">
         {created ? (
           <>
@@ -218,9 +270,13 @@ export function ScheduleDialog({ trigger }: { trigger: ReactNode }) {
         ) : (
           <form onSubmit={submit} className="space-y-4">
             <DialogHeader>
-              <DialogTitle>Schedule a class</DialogTitle>
+              <DialogTitle>
+                {editing ? 'Edit scheduled class' : 'Schedule a class'}
+              </DialogTitle>
               <DialogDescription>
-                You get a permanent link and ID you can send ahead of time.
+                {editing
+                  ? 'Update the title, schedule, or room security settings.'
+                  : 'You get a permanent link and ID you can send ahead of time.'}
               </DialogDescription>
             </DialogHeader>
             <div className="space-y-1.5">
@@ -301,7 +357,11 @@ export function ScheduleDialog({ trigger }: { trigger: ReactNode }) {
               />
             </div>
             <Button type="submit" className="w-full" disabled={pending}>
-              {pending ? 'Scheduling…' : 'Schedule class'}
+              {pending
+                ? 'Saving…'
+                : editing
+                  ? 'Save changes'
+                  : 'Schedule class'}
             </Button>
           </form>
         )}

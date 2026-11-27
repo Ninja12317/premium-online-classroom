@@ -1,7 +1,12 @@
 import { memo, type ReactNode } from 'react'
 import {
+  BarChart3,
+  Captions,
+  Check,
   Circle,
+  Columns2,
   Copy,
+  FileText,
   Hand,
   Info,
   Keyboard,
@@ -18,7 +23,11 @@ import {
   PenTool,
   PhoneOff,
   Settings2,
+  Shield,
+  ShieldAlert,
   SmilePlus,
+  Sparkles,
+  Split,
   Square,
   Users,
   Video,
@@ -47,6 +56,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { REACTIONS } from '@/lib/fixtures'
+import type { MeetingSettings } from '@/lib/meeting-types'
 import { cn } from '@/lib/utils'
 import type { PanelTab, ViewMode } from './types'
 
@@ -56,6 +66,7 @@ export interface ControlBarProps {
   participantCount: number
   micOn: boolean
   camOn: boolean
+  blurOn?: boolean
   sharing: boolean
   shareSupported: boolean
   canShare: boolean
@@ -64,26 +75,36 @@ export interface ControlBarProps {
   handRaised: boolean
   recording: boolean
   recordingSupported: boolean
+  captionsOn?: boolean
+  captionsSupported?: boolean
   locked: boolean
+  settings?: MeetingSettings
   panel: PanelTab | null
   unread: number
   peopleBadge: number
+  pollsBadge?: number
   view: ViewMode
   isModerator: boolean
   isHost: boolean
   onToggleMic: () => void
   onToggleCam: () => void
+  onToggleBlur?: () => void
   onToggleShare: () => void
   onToggleWhiteboard: () => void
   onToggleHand: () => void
+  onToggleCaptions?: () => void
   onPanel: (tab: PanelTab) => void
+  onOpenBreakout?: () => void
   onReaction: (emoji: string) => void
   onToggleView: () => void
+  onSetView?: (view: ViewMode) => void
   onFullscreen: () => void
   onSettings: () => void
   onShortcuts: () => void
   onToggleRecording: () => void
   onToggleLock: () => void
+  onPatchSettings?: (patch: Partial<MeetingSettings>) => void
+  onSuspendActivities?: () => void
   onMuteAll: () => void
   onCopyLink: () => void
   onLeave: () => void
@@ -152,6 +173,11 @@ function Ctl({
 
 export const ControlBar = memo(function ControlBar(p: ControlBarProps) {
   const icon = 'size-5'
+  const setView = (v: ViewMode) => {
+    if (p.onSetView) p.onSetView(v)
+    else p.onToggleView()
+  }
+
   return (
     <div className="safe-bottom flex items-center gap-2 border-t bg-background/95 px-2 pt-2 backdrop-blur sm:gap-3 sm:px-4 sm:pt-3">
       {/* meeting info (desktop) */}
@@ -194,6 +220,130 @@ export const ControlBar = memo(function ControlBar(p: ControlBarProps) {
         >
           {p.camOn ? <Video className={icon} /> : <VideoOff className={icon} />}
         </Ctl>
+
+        {/* Security menu (Moderators) */}
+        {p.isModerator && (
+          <DropdownMenu>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="Security"
+                    className={cn(
+                      'hidden size-11 shrink-0 place-items-center rounded-xl transition-colors sm:grid sm:size-12',
+                      p.locked
+                        ? 'bg-primary text-primary-foreground'
+                        : 'bg-foreground/8 text-foreground hover:bg-foreground/14 dark:bg-white/10 dark:hover:bg-white/18',
+                    )}
+                  >
+                    <Shield className={icon} />
+                  </button>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent side="top">Security</TooltipContent>
+            </Tooltip>
+            <DropdownMenuContent side="top" align="center" className="w-64">
+              <DropdownMenuLabel>Security & Permissions</DropdownMenuLabel>
+              <DropdownMenuItem onSelect={p.onToggleLock}>
+                {p.locked ? <LockOpen /> : <Lock />}
+                {p.locked ? 'Unlock meeting' : 'Lock meeting'}
+              </DropdownMenuItem>
+              {p.settings && p.onPatchSettings && (
+                <>
+                  <DropdownMenuItem
+                    onSelect={() =>
+                      p.onPatchSettings!({
+                        waitingRoom: !p.settings!.waitingRoom,
+                      })
+                    }
+                  >
+                    <Check
+                      className={cn(
+                        'size-4',
+                        !p.settings.waitingRoom && 'opacity-0',
+                      )}
+                    />
+                    Enable waiting room
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuLabel>Allow students to</DropdownMenuLabel>
+                  <DropdownMenuItem
+                    onSelect={() =>
+                      p.onPatchSettings!({
+                        allowStudentScreenShare:
+                          !p.settings!.allowStudentScreenShare,
+                      })
+                    }
+                  >
+                    <Check
+                      className={cn(
+                        'size-4',
+                        !p.settings.allowStudentScreenShare && 'opacity-0',
+                      )}
+                    />
+                    Share screen
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() =>
+                      p.onPatchSettings!({
+                        allowStudentDraw: !p.settings!.allowStudentDraw,
+                      })
+                    }
+                  >
+                    <Check
+                      className={cn(
+                        'size-4',
+                        !p.settings.allowStudentDraw && 'opacity-0',
+                      )}
+                    />
+                    Draw on whiteboard
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() =>
+                      p.onPatchSettings!({
+                        allowChat: !p.settings!.allowChat,
+                      })
+                    }
+                  >
+                    <Check
+                      className={cn('size-4', !p.settings.allowChat && 'opacity-0')}
+                    />
+                    Chat
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() =>
+                      p.onPatchSettings!({
+                        allowPrivateChat: !p.settings!.allowPrivateChat,
+                      })
+                    }
+                  >
+                    <Check
+                      className={cn(
+                        'size-4',
+                        !p.settings.allowPrivateChat && 'opacity-0',
+                      )}
+                    />
+                    Private messages
+                  </DropdownMenuItem>
+                </>
+              )}
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onSelect={p.onMuteAll}>
+                <VolumeX /> Mute all students
+              </DropdownMenuItem>
+              {p.onSuspendActivities && (
+                <DropdownMenuItem
+                  variant="destructive"
+                  onSelect={p.onSuspendActivities}
+                >
+                  <ShieldAlert /> Suspend student activities
+                </DropdownMenuItem>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+
         <Ctl
           label={
             !p.shareSupported
@@ -269,6 +419,68 @@ export const ControlBar = memo(function ControlBar(p: ControlBarProps) {
           <Hand className={icon} />
         </Ctl>
 
+        {p.onToggleCaptions && (
+          <Ctl
+            label={
+              !p.captionsSupported
+                ? 'Live captions not supported in this browser'
+                : p.captionsOn
+                  ? 'Hide live captions'
+                  : 'Live captions (CC)'
+            }
+            shortcut="L"
+            onClick={p.onToggleCaptions}
+            active={p.captionsOn}
+            className="hidden lg:grid"
+          >
+            <Captions className={icon} />
+          </Ctl>
+        )}
+
+        {/* View switcher */}
+        <DropdownMenu>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  aria-label="Change view"
+                  className="hidden size-11 shrink-0 place-items-center rounded-xl bg-foreground/8 text-foreground transition-colors hover:bg-foreground/14 dark:bg-white/10 dark:hover:bg-white/18 lg:grid lg:size-12"
+                >
+                  {p.view === 'gallery' ? (
+                    <LayoutGrid className={icon} />
+                  ) : p.view === 'side-by-side' ? (
+                    <Columns2 className={icon} />
+                  ) : (
+                    <UserSquare2 className={icon} />
+                  )}
+                </button>
+              </DropdownMenuTrigger>
+            </TooltipTrigger>
+            <TooltipContent side="top">View</TooltipContent>
+          </Tooltip>
+          <DropdownMenuContent side="top" align="center" className="w-48">
+            <DropdownMenuLabel>Stage layout</DropdownMenuLabel>
+            <DropdownMenuItem onSelect={() => setView('gallery')}>
+              <LayoutGrid /> Gallery view
+              {p.view === 'gallery' && <Check className="ml-auto size-4" />}
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => setView('speaker')}>
+              <UserSquare2 /> Speaker view
+              {p.view === 'speaker' && <Check className="ml-auto size-4" />}
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => setView('side-by-side')}>
+              <Columns2 /> Side-by-side
+              {p.view === 'side-by-side' && <Check className="ml-auto size-4" />}
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={p.onFullscreen}>
+              <Maximize /> Full screen
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+
+        {/* More options */}
         <DropdownMenu>
           <Tooltip>
             <TooltipTrigger asChild>
@@ -289,7 +501,6 @@ export const ControlBar = memo(function ControlBar(p: ControlBarProps) {
               {p.title} · {p.duration}
             </DropdownMenuLabel>
             <DropdownMenuSeparator className="md:hidden" />
-            {/* items that are hidden from the bar on small screens */}
             <DropdownMenuItem
               className="sm:hidden"
               disabled={!p.shareSupported || !p.canShare}
@@ -319,12 +530,40 @@ export const ControlBar = memo(function ControlBar(p: ControlBarProps) {
               />
             </div>
             <DropdownMenuSeparator className="sm:hidden" />
+            <DropdownMenuItem onSelect={() => p.onPanel('polls')}>
+              <BarChart3 /> Live polls
+              {!!p.pollsBadge && p.pollsBadge > 0 && (
+                <span className="ml-auto rounded-full bg-primary/15 px-1.5 text-[10px] font-semibold text-primary">
+                  {p.pollsBadge}
+                </span>
+              )}
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => p.onPanel('notes')}>
+              <FileText /> Shared class notes
+            </DropdownMenuItem>
+            {p.onOpenBreakout && (
+              <DropdownMenuItem onSelect={p.onOpenBreakout}>
+                <Split /> Breakout rooms
+              </DropdownMenuItem>
+            )}
+            {p.onToggleCaptions && (
+              <DropdownMenuItem onSelect={p.onToggleCaptions}>
+                <Captions /> {p.captionsOn ? 'Hide captions' : 'Live captions (CC)'}
+              </DropdownMenuItem>
+            )}
+            <DropdownMenuSeparator />
             <DropdownMenuItem onSelect={() => p.onPanel('info')}>
               <Info /> Meeting details
             </DropdownMenuItem>
             <DropdownMenuItem onSelect={p.onCopyLink}>
               <Link2 /> Copy invite link
             </DropdownMenuItem>
+            {p.onToggleBlur && (
+              <DropdownMenuItem onSelect={p.onToggleBlur}>
+                <Sparkles />{' '}
+                {p.blurOn ? 'Disable background blur' : 'Enable background blur'}
+              </DropdownMenuItem>
+            )}
             <DropdownMenuItem onSelect={p.onToggleView}>
               {p.view === 'gallery' ? <UserSquare2 /> : <LayoutGrid />}
               {p.view === 'gallery' ? 'Speaker view' : 'Gallery view'}
@@ -338,6 +577,14 @@ export const ControlBar = memo(function ControlBar(p: ControlBarProps) {
             <DropdownMenuItem onSelect={p.onShortcuts}>
               <Keyboard /> Keyboard shortcuts
             </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              onSelect={p.onToggleRecording}
+              disabled={!p.recordingSupported}
+            >
+              {p.recording ? <Square /> : <Circle className="text-live" />}
+              {p.recording ? 'Stop recording' : 'Record locally'}
+            </DropdownMenuItem>
             {p.isModerator && (
               <>
                 <DropdownMenuSeparator />
@@ -349,19 +596,6 @@ export const ControlBar = memo(function ControlBar(p: ControlBarProps) {
                   {p.locked ? <LockOpen /> : <Lock />}
                   {p.locked ? 'Unlock meeting' : 'Lock meeting'}
                 </DropdownMenuItem>
-                {p.isHost && (
-                  <DropdownMenuItem
-                    onSelect={p.onToggleRecording}
-                    disabled={!p.recordingSupported}
-                  >
-                    {p.recording ? (
-                      <Square />
-                    ) : (
-                      <Circle className="text-live" />
-                    )}
-                    {p.recording ? 'Stop recording' : 'Record class'}
-                  </DropdownMenuItem>
-                )}
                 {p.isHost && (
                   <DropdownMenuItem variant="destructive" onSelect={p.onEnd}>
                     <PhoneOff /> End class for everyone

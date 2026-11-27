@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react'
 import type { DeviceSelection } from '@/components/device-settings'
 import type {
+  BreakoutState,
   Connection,
   MeetingSettings,
   Role,
@@ -23,7 +24,10 @@ export interface ScreenShare {
 }
 
 export type RoomState =
-  'connecting' | 'connected' | 'reconnecting' | 'disconnected'
+  | 'connecting'
+  | 'connected'
+  | 'reconnecting'
+  | 'disconnected'
 export type DisconnectCause = 'removed' | 'ended' | 'duplicate' | 'lost' | null
 
 /**
@@ -42,6 +46,8 @@ export interface RoomAdapter {
   audioNode: ReactNode
   micOn: boolean
   camOn: boolean
+  blurOn?: boolean
+  setBlurOn?: (on: boolean) => void
   setMicOn: (on: boolean) => Promise<void>
   setCamOn: (on: boolean) => Promise<void>
   sharing: boolean
@@ -60,6 +66,8 @@ export interface RoomAdapter {
   waiting?: WaitingParticipant[] | null
   /** People who are in the room but not yet connected to us. */
   connectingNames?: string[]
+  spotlightId?: string | null
+  breakout?: BreakoutState | null
   send: (message: RealtimeMessage, to?: string[]) => void
   subscribe: (
     cb: (from: RemoteSender, message: RealtimeMessage) => void,

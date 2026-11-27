@@ -12,6 +12,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Label } from '@/components/ui/label'
+import { Switch } from '@/components/ui/switch'
 import { SHORTCUTS } from '@/lib/use-hotkeys'
 import type { DeviceLists, MediaErrorKind } from '@/lib/use-local-media'
 
@@ -22,6 +24,8 @@ export function SettingsDialog({
   selection,
   onChange,
   error,
+  blurOn = false,
+  onBlurChange,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -29,6 +33,8 @@ export function SettingsDialog({
   selection: DeviceSelection
   onChange: (next: DeviceSelection) => void
   error: MediaErrorKind | null
+  blurOn?: boolean
+  onBlurChange?: (on: boolean) => void
 }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -46,6 +52,21 @@ export function SettingsDialog({
           onChange={onChange}
           idPrefix="meeting"
         />
+        {onBlurChange && (
+          <div className="flex items-center justify-between rounded-lg border p-3">
+            <div>
+              <Label htmlFor="meeting-blur">Background blur</Label>
+              <p className="text-xs text-muted-foreground">
+                Softly blur your camera preview behind you.
+              </p>
+            </div>
+            <Switch
+              id="meeting-blur"
+              checked={blurOn}
+              onCheckedChange={onBlurChange}
+            />
+          </div>
+        )}
       </DialogContent>
     </Dialog>
   )

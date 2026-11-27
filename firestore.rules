@@ -1,0 +1,43 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Require Firebase Authentication (Anonymous or Email/Password sign-in)
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Meetings & all classroom subcollections
+    match /meetings/{meetingId} {
+      allow read, write: if isSignedIn();
+
+      match /participants/{participantId} {
+        allow read, write: if isSignedIn();
+      }
+
+      match /messages/{messageId} {
+        allow read, write: if isSignedIn();
+      }
+
+      match /signals/{signalId} {
+        allow read, write: if isSignedIn();
+      }
+
+      match /whiteboard/{elementId} {
+        allow read, write: if isSignedIn();
+      }
+
+      match /polls/{pollId} {
+        allow read, write: if isSignedIn();
+      }
+    }
+
+    // Standalone infinite whiteboards & elements
+    match /whiteboards/{boardId} {
+      allow read, write: if isSignedIn();
+
+      match /elements/{elementId} {
+        allow read, write: if isSignedIn();
+      }
+    }
+  }
+}

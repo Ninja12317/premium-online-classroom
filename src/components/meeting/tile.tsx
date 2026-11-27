@@ -8,6 +8,7 @@ import {
   SignalLow,
   SignalMedium,
   SignalZero,
+  Sparkles,
 } from 'lucide-react'
 
 import { AvatarBubble } from '@/components/avatar-bubble'
@@ -52,6 +53,7 @@ export interface TileProps {
   tile: TileModel
   video: ReactNode | null
   pinned?: boolean
+  spotlighted?: boolean
   onPin?: (id: string | null) => void
   menu?: ReactNode
   large?: boolean
@@ -63,6 +65,7 @@ export const ParticipantTile = memo(function ParticipantTile({
   tile,
   video,
   pinned,
+  spotlighted,
   onPin,
   menu,
   large,
@@ -74,6 +77,7 @@ export const ParticipantTile = memo(function ParticipantTile({
       className={cn(
         'group relative aspect-video w-full overflow-hidden rounded-xl bg-stage-tile text-stage-tile-foreground transition-shadow duration-200 motion-reduce:transition-none',
         tile.speaking && 'ring-2 ring-primary ring-offset-2 ring-offset-stage',
+        spotlighted && 'ring-2 ring-amber ring-offset-2 ring-offset-stage',
         className,
       )}
       data-identity={tile.id}
@@ -104,6 +108,14 @@ export const ParticipantTile = memo(function ParticipantTile({
 
       {/* top-right badges */}
       <div className="absolute right-2 top-2 flex items-center gap-1.5">
+        {spotlighted && (
+          <span
+            className="flex h-7 items-center gap-1 rounded-full bg-amber px-2 text-[11px] font-semibold text-amber-foreground shadow"
+            aria-label="Spotlighted"
+          >
+            <Sparkles className="size-3.5" /> Spotlight
+          </span>
+        )}
         {tile.handRaised && (
           <span
             className="grid size-7 place-items-center rounded-full bg-amber text-amber-foreground shadow"

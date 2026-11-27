@@ -13,6 +13,7 @@ export interface TileModel {
   handRaised: boolean
   quality: Connection
   sharing: boolean
+  breakoutRoomId?: string | null
 }
 
 export interface ChatMessage {
@@ -26,8 +27,8 @@ export interface ChatMessage {
   toName?: string
 }
 
-export type ViewMode = 'gallery' | 'speaker'
-export type PanelTab = 'chat' | 'people' | 'info'
+export type ViewMode = 'gallery' | 'speaker' | 'side-by-side'
+export type PanelTab = 'chat' | 'people' | 'polls' | 'notes' | 'info'
 
 export interface Presentation {
   kind: 'screen' | 'whiteboard'

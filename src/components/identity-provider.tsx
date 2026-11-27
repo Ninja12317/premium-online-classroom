@@ -7,108 +7,115 @@ import {
   type ReactNode,
 } from 'react'
 import {
-  getUser,
-  handleAuthCallback,
-  onAuthChange,
-  AuthError,
-  type CallbackResult,
-  type User,
-} from '@netlify/identity'
+  onAuthStateChanged,
+  signOut as firebaseSignOut,
+  type User as FirebaseUser,
+} from 'firebase/auth'
+
+import {
+  analyticsPromise,
+  auth,
+  ensureAuth,
+  getCachedClientUid,
+  resetAuthInit,
+} from '@/services/firebase'
+
+export interface LecternUser {
+  id: string
+  name: string | null
+  email: string | null
+  isAnonymous: boolean
+}
 
 export interface IdentityState {
-  user: User | null
+  /** Signed-in teacher account (non-anonymous), or null for guest/anonymous users. */
+  user: LecternUser | null
+  /** Always-present stable UID (Firebase Auth UID or localStorage fallback). */
+  clientUid: string
   ready: boolean
-  /**
-   * Result of an email link (confirmation, password recovery, invite) that
-   * was processed on this page load. Consumed once by `AuthCallbackHandler`.
-   */
-  callback: CallbackResult | null
-  /** Set when the link in the URL was invalid or expired. */
-  callbackError: string | null
-  clearCallback: () => void
   refresh: () => Promise<void>
+  signOut: () => Promise<void>
 }
 
 const IdentityContext = createContext<IdentityState | null>(null)
 
+function mapUser(u: FirebaseUser | null): LecternUser | null {
+  if (!u || u.isAnonymous) return null
+  return {
+    id: u.uid,
+    name: u.displayName ?? u.email?.split('@')[0] ?? 'Teacher',
+    email: u.email,
+    isAnonymous: u.isAnonymous,
+  }
+}
+
 /**
- * Client-side auth state for the UI (never for authorization, which happens
- * in server functions). `user` is null and `ready` is false during SSR.
- *
- * On mount this first processes any `#confirmation_token`, `#recovery_token`
- * or `#invite_token` that Netlify Identity put in the URL from an emailed
- * link. Without this step a new account stays unconfirmed and signing in
- * fails with "Email not confirmed".
+ * Client-side Firebase Auth state for the UI. Waits for `ensureAuth()` on
+ * mount (restoring any existing session or signing in anonymously) before
+ * marking `ready` so Firestore queries never fire with `request.auth == null`.
  */
 export function IdentityProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(null)
+  const [user, setUser] = useState<LecternUser | null>(null)
+  const [clientUid, setClientUid] = useState<string>('guest')
   const [ready, setReady] = useState(false)
-  const [callback, setCallback] = useState<CallbackResult | null>(null)
-  const [callbackError, setCallbackError] = useState<string | null>(null)
 
   const refresh = useCallback(async () => {
-    try {
-      setUser(await getUser())
-    } catch {
-      setUser(null)
+    const current = auth.currentUser
+    setUser(mapUser(current))
+    if (current?.uid) {
+      setClientUid(current.uid)
+    } else {
+      setClientUid(getCachedClientUid())
     }
   }, [])
 
-  const clearCallback = useCallback(() => {
-    setCallback(null)
-    setCallbackError(null)
+  const signOut = useCallback(async () => {
+    resetAuthInit()
+    await firebaseSignOut(auth)
+    setUser(null)
+    try {
+      const anon = await ensureAuth()
+      setClientUid(anon.uid)
+    } catch {
+      setClientUid(getCachedClientUid())
+    }
   }, [])
 
   useEffect(() => {
     let active = true
-    let unsubscribe = () => {}
-    try {
-      unsubscribe = onAuthChange((_event, next) => {
-        if (active) setUser(next)
-      })
-    } catch {
-      // Identity is unavailable in plain Vite dev; the UI stays signed out.
-    }
+    void analyticsPromise
 
-    async function init() {
-      let result: CallbackResult | null = null
-      try {
-        result = await handleAuthCallback()
-      } catch (err) {
-        if (!active) return
-        setCallbackError(
-          err instanceof AuthError && err.message
-            ? err.message
-            : 'That link is invalid or has expired.',
-        )
-      }
+    const unsub = onAuthStateChanged(auth, (fbUser) => {
       if (!active) return
-      if (result) {
-        setCallback(result)
-        setUser(result.user)
-        return
+      setUser(mapUser(fbUser))
+      if (fbUser?.uid) {
+        setClientUid(fbUser.uid)
       }
-      try {
-        const current = await getUser()
-        if (active) setUser(current)
-      } catch {
-        if (active) setUser(null)
-      }
-    }
-
-    init().finally(() => {
-      if (active) setReady(true)
     })
+
+    ensureAuth()
+      .then((fbUser) => {
+        if (!active) return
+        setClientUid(fbUser.uid)
+        setUser(mapUser(fbUser))
+      })
+      .catch(() => {
+        if (!active) return
+        setClientUid(getCachedClientUid())
+      })
+      .finally(() => {
+        if (active) setReady(true)
+      })
 
     return () => {
       active = false
-      unsubscribe()
+      unsub()
     }
   }, [])
 
   return (
     <IdentityContext.Provider
-      value={{ user, ready, callback, callbackError, clearCallback, refresh }}
+      value={{ user, clientUid, ready, refresh, signOut }}
     >
       {children}
     </IdentityContext.Provider>
@@ -121,7 +128,7 @@ export function useIdentity() {
   return state
 }
 
-export function displayName(user: User | null) {
+export function displayName(user: LecternUser | null) {
   if (!user) return ''
   return user.name ?? user.email?.split('@')[0] ?? 'Teacher'
 }

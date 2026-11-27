@@ -1,16 +1,31 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { saveRecording } from '@/services/recordings-db'
+
+export interface RecorderMeta {
+  meetingId?: string
+  title?: string
+}
 
 /**
  * Records the class as the teacher sees and hears it by capturing this tab
  * (video + the audio the tab plays) mixed with the local microphone. Saves a
- * WebM file when stopped. Works in Chromium browsers; others get a clear error.
+ * WebM file into local IndexedDB (for the Recordings dashboard tab) and
+ * downloads it when stopped.
  */
-export function useTabRecorder(micTrack: MediaStreamTrack | null) {
+export function useTabRecorder(
+  micTrack: MediaStreamTrack | null,
+  meta?: RecorderMeta,
+) {
   const [recording, setRecording] = useState(false)
   const [startedAt, setStartedAt] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
   const recorderRef = useRef<MediaRecorder | null>(null)
   const chunksRef = useRef<Blob[]>([])
+  const startedAtRef = useRef<number>(0)
+  const metaRef = useRef(meta)
+  useEffect(() => {
+    metaRef.current = meta
+  }, [meta])
   const cleanupRef = useRef<() => void>(() => {})
 
   const supported =
@@ -32,7 +47,6 @@ export function useTabRecorder(micTrack: MediaStreamTrack | null) {
       const display = await navigator.mediaDevices.getDisplayMedia({
         video: { frameRate: { ideal: 24, max: 30 } },
         audio: true,
-        // Chromium hints: offer the current tab first.
         ...({
           preferCurrentTab: true,
           selfBrowserSurface: 'include',
@@ -70,17 +84,37 @@ export function useTabRecorder(micTrack: MediaStreamTrack | null) {
         if (e.data.size > 0) chunksRef.current.push(e.data)
       }
       rec.onstop = () => {
-        const blob = new Blob(chunksRef.current, {
-          type: rec.mimeType || 'video/webm',
-        })
+        const mimeType = rec.mimeType || 'video/webm'
+        const blob = new Blob(chunksRef.current, { type: mimeType })
+        const now = Date.now()
+        const durationSec = Math.max(
+          1,
+          Math.round((now - (startedAtRef.current || now)) / 1000),
+        )
+        const title = metaRef.current?.title || 'Lectern class recording'
+        const meetingId = metaRef.current?.meetingId || 'local'
+
+        // Save into IndexedDB so it appears in the Recordings dashboard tab
+        void saveRecording({
+          id: `rec-${now}-${Math.random().toString(36).slice(2, 6)}`,
+          meetingId,
+          title,
+          createdAt: now,
+          durationSec,
+          sizeBytes: blob.size,
+          mimeType,
+          blob,
+        }).catch(() => {})
+
+        // Also offer immediate browser download
         const href = URL.createObjectURL(blob)
         const a = document.createElement('a')
-        const stamp = new Date()
+        const stamp = new Date(now)
           .toISOString()
           .slice(0, 16)
           .replace(/[:T]/g, '-')
         a.href = href
-        a.download = `lectern-class-${stamp}.webm`
+        a.download = `lectern-${stamp}.webm`
         a.click()
         setTimeout(() => URL.revokeObjectURL(href), 2000)
         cleanupRef.current()
@@ -97,8 +131,10 @@ export function useTabRecorder(micTrack: MediaStreamTrack | null) {
         ?.addEventListener('ended', stop, { once: true })
       rec.start(1000)
       recorderRef.current = rec
+      const startNow = Date.now()
+      startedAtRef.current = startNow
       setRecording(true)
-      setStartedAt(Date.now())
+      setStartedAt(startNow)
       setError(null)
       return true
     } catch (err) {

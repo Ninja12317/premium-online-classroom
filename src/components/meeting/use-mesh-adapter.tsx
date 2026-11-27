@@ -5,6 +5,7 @@ import type { IceServer, MeetingSettings, Role } from '@/lib/meeting-types'
 import { MeshRoom, type MeshPeer } from '@/lib/mesh/mesh-room'
 import type { JoinPrefs } from '@/lib/prefs'
 import { leaveRoom, syncRoom } from '@/lib/signaling.functions'
+import { updateParticipantState } from '@/services/firestore-meetings'
 import { useAttachStream, useLocalMedia } from '@/lib/use-local-media'
 import { useNetwork } from '@/lib/use-network'
 import { useScreenShare } from '@/lib/use-screen-share'
@@ -16,10 +17,12 @@ function StreamVideo({
   stream,
   contain,
   mirror,
+  blur,
 }: {
   stream: MediaStream
   contain?: boolean
   mirror?: boolean
+  blur?: boolean
 }) {
   const ref = useRef<HTMLVideoElement>(null)
   useAttachStream(ref, stream)
@@ -32,6 +35,7 @@ function StreamVideo({
       className={[
         contain ? 'h-full w-full object-contain' : '',
         mirror ? '-scale-x-100' : '',
+        blur ? 'blur-[6px] scale-[1.04]' : '',
       ]
         .filter(Boolean)
         .join(' ')}
@@ -59,7 +63,8 @@ function StreamAudio({
   }, [stream])
   useEffect(() => {
     const el = ref.current as
-      (HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> }) | null
+      | (HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> })
+      | null
     if (!el || !sinkId || typeof el.setSinkId !== 'function') return
     el.setSinkId(sinkId).catch(() => {})
   }, [sinkId])
@@ -78,9 +83,10 @@ export interface MeshAdapterOptions {
 }
 
 /**
- * Multi-party room over direct WebRTC connections (full mesh). Local devices
- * come from the same hooks the lobby uses; the MeshRoom engine handles
- * discovery, signalling and the peer connections.
+ * Multi-party room over direct WebRTC connections (full mesh) backed by Cloud
+ * Firestore signaling. StrictMode-safe: bare useEffect cleanup calls `pause()`
+ * instead of `stop('left')` so React dev double-mounts never kick the user.
+ * Media errors never disconnect or exit the room.
  */
 export function useMeshAdapter(opts: MeshAdapterOptions): RoomAdapter & {
   localRole: Role
@@ -88,6 +94,7 @@ export function useMeshAdapter(opts: MeshAdapterOptions): RoomAdapter & {
   const { meetingId, identity, participantKey, name, role, prefs } = opts
   const [micOn, setMic] = useState(prefs.micOn)
   const [camOn, setCam] = useState(prefs.camOn)
+  const [blurOn, setBlurOn] = useState(false)
   const [selection, setSelection] = useState<DeviceSelection>({
     cameraId: prefs.cameraId,
     micId: prefs.micId,
@@ -135,13 +142,17 @@ export function useMeshAdapter(opts: MeshAdapterOptions): RoomAdapter & {
       }),
   )
 
+  // StrictMode-safe lifecycle: only depends on [room] (tied to meetingId+identity).
+  // Never calls leaveRoom() on unmount; only leaves on explicit Leave click or beforeunload.
   useEffect(() => {
     room.start()
-    const onUnload = () => void room.stop('left')
-    window.addEventListener('pagehide', onUnload)
-    return () => {
-      window.removeEventListener('pagehide', onUnload)
+    const onBeforeUnload = () => {
       void room.stop('left')
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => {
+      window.removeEventListener('beforeunload', onBeforeUnload)
+      room.pause()
     }
   }, [room])
 
@@ -171,6 +182,15 @@ export function useMeshAdapter(opts: MeshAdapterOptions): RoomAdapter & {
       speaking,
     })
   }, [room, micOn, camOn, media.hasVideo, sharing, handRaised, speaking])
+
+  // Mirror mic/cam/hand status to Firestore participant document.
+  useEffect(() => {
+    void updateParticipantState(meetingId, identity, {
+      micOn,
+      camOn: camOn && media.hasVideo,
+      handRaised,
+    })
+  }, [meetingId, identity, micOn, camOn, media.hasVideo, handRaised])
 
   // ---- view model -------------------------------------------------------------
 
@@ -237,7 +257,7 @@ export function useMeshAdapter(opts: MeshAdapterOptions): RoomAdapter & {
     (tile: TileModel) => {
       if (tile.isLocal) {
         return localStream && media.hasVideo ? (
-          <StreamVideo stream={localStream} mirror />
+          <StreamVideo stream={localStream} mirror blur={blurOn} />
         ) : null
       }
       const peer = room.peers.get(tile.id)
@@ -245,7 +265,7 @@ export function useMeshAdapter(opts: MeshAdapterOptions): RoomAdapter & {
         <StreamVideo stream={peer.camStream} />
       ) : null
     },
-    [room, localStream, media.hasVideo],
+    [room, localStream, media.hasVideo, blurOn],
   )
 
   const presenter: MeshPeer | undefined = connected.find(
@@ -320,6 +340,8 @@ export function useMeshAdapter(opts: MeshAdapterOptions): RoomAdapter & {
     audioNode,
     micOn,
     camOn: camOn && media.hasVideo,
+    blurOn,
+    setBlurOn,
     setMicOn: async (on) => setMic(on),
     setCamOn: async (on) => setCam(on),
     sharing,
@@ -335,6 +357,8 @@ export function useMeshAdapter(opts: MeshAdapterOptions): RoomAdapter & {
     roomSettings: room.settings,
     waiting: room.waiting,
     connectingNames: room.connectingNames,
+    spotlightId: room.spotlightId,
+    breakout: room.breakout,
     send,
     subscribe,
     handRaised,
