@@ -3,6 +3,7 @@ import { useNavigate, useRouter } from '@tanstack/react-router'
 import { CalendarDays, Check, Copy, Video } from 'lucide-react'
 import { toast } from 'sonner'
 
+import { BackButton } from '@/components/back-button'
 import { displayName, useIdentity } from '@/components/identity-provider'
 import { Button } from '@/components/ui/button'
 import {
@@ -32,6 +33,8 @@ import {
   meetingUrl,
 } from '@/lib/meeting'
 import { saveHostKey } from '@/lib/host-keys'
+import { useJoinPrefs } from '@/lib/prefs'
+import { useUserProfile } from '@/lib/profile'
 
 interface Created {
   meetingId: string
@@ -65,8 +68,15 @@ export function ScheduleDialog({
   onSaved?: () => void
 }) {
   const { user } = useIdentity()
+  const profile = useUserProfile()
+  const prefs = useJoinPrefs()
   const router = useRouter()
   const navigate = useNavigate()
+  const resolvedHostName =
+    profile.displayName.trim() ||
+    prefs.name.trim() ||
+    displayName(user) ||
+    undefined
   const [internalOpen, setInternalOpen] = useState(false)
   const open = controlledOpen !== undefined ? controlledOpen : internalOpen
   const setOpen = (next: boolean) => {
@@ -138,7 +148,7 @@ export function ScheduleDialog({
         const result = await createMeeting({
           data: {
             title: title.trim() || 'Live class',
-            hostName: displayName(user) || undefined,
+            hostName: resolvedHostName,
             passcode,
             waitingRoom,
             scheduledAt: startsAt.toISOString(),
@@ -183,11 +193,20 @@ export function ScheduleDialog({
         {created ? (
           <>
             <DialogHeader>
-              <DialogTitle>Class scheduled</DialogTitle>
-              <DialogDescription>
-                Share the invitation with your students. The link works from any
-                browser.
-              </DialogDescription>
+              <div className="flex items-center gap-2.5 pr-6">
+                <BackButton
+                  onClick={() => setOpen(false)}
+                  ariaLabel="Back to meetings"
+                  className="size-10"
+                />
+                <div>
+                  <DialogTitle>Class scheduled</DialogTitle>
+                  <DialogDescription>
+                    Share the invitation with your students. The link works from
+                    any browser.
+                  </DialogDescription>
+                </div>
+              </div>
             </DialogHeader>
             <div className="rounded-xl border bg-muted/50 p-4 text-sm">
               <p className="font-semibold">{created.title}</p>
@@ -270,14 +289,23 @@ export function ScheduleDialog({
         ) : (
           <form onSubmit={submit} className="space-y-4">
             <DialogHeader>
-              <DialogTitle>
-                {editing ? 'Edit scheduled class' : 'Schedule a class'}
-              </DialogTitle>
-              <DialogDescription>
-                {editing
-                  ? 'Update the title, schedule, or room security settings.'
-                  : 'You get a permanent link and ID you can send ahead of time.'}
-              </DialogDescription>
+              <div className="flex items-center gap-2.5 pr-6">
+                <BackButton
+                  onClick={() => setOpen(false)}
+                  ariaLabel="Back to meetings"
+                  className="size-10"
+                />
+                <div>
+                  <DialogTitle>
+                    {editing ? 'Edit scheduled class' : 'Schedule a class'}
+                  </DialogTitle>
+                  <DialogDescription>
+                    {editing
+                      ? 'Update the title, schedule, or room security settings.'
+                      : 'You get a permanent link and ID you can send ahead of time.'}
+                  </DialogDescription>
+                </div>
+              </div>
             </DialogHeader>
             <div className="space-y-1.5">
               <Label htmlFor="sched-title">Class title</Label>

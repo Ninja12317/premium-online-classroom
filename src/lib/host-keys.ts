@@ -1,12 +1,19 @@
 import type { ParticipantStatus, Role } from '@/lib/meeting-types'
+import { getActiveStorageUid } from '@/lib/storage-scope'
 
-/** Host secrets for meetings this browser created; proves teacher authority. */
-const PREFIX = 'lectern-host:'
+/** Host secrets scoped strictly to the active Firebase UID so accounts never share host keys. */
+function hostKeyPrefix(): string | null {
+  const uid = getActiveStorageUid()
+  if (!uid) return null
+  return `lectern_${uid}_host:`
+}
 
 export function saveHostKey(meetingId: string, key: string) {
   if (typeof window === 'undefined') return
+  const prefix = hostKeyPrefix()
+  if (!prefix) return
   try {
-    localStorage.setItem(PREFIX + meetingId, key)
+    localStorage.setItem(prefix + meetingId, key)
   } catch {
     // Storage unavailable; the host can still join via their account.
   }
@@ -14,8 +21,10 @@ export function saveHostKey(meetingId: string, key: string) {
 
 export function loadHostKey(meetingId: string): string | null {
   if (typeof window === 'undefined') return null
+  const prefix = hostKeyPrefix()
+  if (!prefix) return null
   try {
-    return localStorage.getItem(PREFIX + meetingId)
+    return localStorage.getItem(prefix + meetingId)
   } catch {
     return null
   }
@@ -23,17 +32,38 @@ export function loadHostKey(meetingId: string): string | null {
 
 export function listHostMeetingIds(): string[] {
   if (typeof window === 'undefined') return []
+  const prefix = hostKeyPrefix()
+  if (!prefix) return []
   try {
     const ids: string[] = []
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i)
-      if (k && k.startsWith(PREFIX)) {
-        ids.push(k.slice(PREFIX.length))
+      if (k && k.startsWith(prefix)) {
+        ids.push(k.slice(prefix.length))
       }
     }
     return ids
   } catch {
     return []
+  }
+}
+
+export function clearScopedHostKeys(uid?: string | null) {
+  if (typeof window === 'undefined') return
+  const targetUid = uid !== undefined ? uid : getActiveStorageUid()
+  const prefix = targetUid ? `lectern_${targetUid}_host:` : null
+  try {
+    const toRemove: string[] = []
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i)
+      if (!k) continue
+      if (k.startsWith('lectern-host:') || (prefix && k.startsWith(prefix))) {
+        toRemove.push(k)
+      }
+    }
+    for (const k of toRemove) localStorage.removeItem(k)
+  } catch {
+    // ignore
   }
 }
 
@@ -88,6 +118,20 @@ export function clearParticipant(meetingId: string) {
         sessionStorage.removeItem(ACTIVE_SESSION_KEY)
       }
     }
+  } catch {
+    // ignore
+  }
+}
+
+export function clearAllSessionParticipants() {
+  if (typeof window === 'undefined') return
+  try {
+    const toRemove: string[] = [ACTIVE_SESSION_KEY]
+    for (let i = 0; i < sessionStorage.length; i++) {
+      const k = sessionStorage.key(i)
+      if (k && k.startsWith(PKEY)) toRemove.push(k)
+    }
+    for (const k of toRemove) sessionStorage.removeItem(k)
   } catch {
     // ignore
   }

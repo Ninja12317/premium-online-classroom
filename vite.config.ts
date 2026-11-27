@@ -10,7 +10,18 @@ const config = defineConfig({
     port: 3000,
     allowedHosts: true,
   },
-  plugins: [tailwindcss(), tanstackStart(), viteReact()],
+  plugins: [
+    tailwindcss(),
+    tanstackStart({
+      spa: {
+        enabled: true,
+        prerender: {
+          outputPath: '/index.html',
+        },
+      },
+    }),
+    viteReact(),
+  ],
 })
 
 export default config

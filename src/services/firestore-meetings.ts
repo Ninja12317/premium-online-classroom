@@ -1,5 +1,6 @@
 import {
   addDoc,
+  arrayUnion,
   collection,
   deleteDoc,
   doc,
@@ -15,6 +16,7 @@ import {
 } from 'firebase/firestore'
 
 import {
+  auth,
   db,
   ensureAuth,
   ensureClientUid,
@@ -24,11 +26,16 @@ import {
 } from '@/services/firebase'
 import { randomToken, sha256Hex } from '@/lib/hash'
 import { getIceServers } from '@/lib/ice-client'
-import { listHostMeetingIds } from '@/lib/host-keys'
+import {
+  getActiveStorageUid,
+  purgeLegacyUnscopedStorage,
+  scopedStorageKey,
+} from '@/lib/storage-scope'
 import {
   generateMeetingId,
   generatePasscode,
   isValidMeetingId,
+  normalizeMeetingId,
 } from '@/lib/meeting'
 import {
   isModerator,
@@ -59,18 +66,23 @@ import {
 } from '@/components/meeting/whiteboard/infinite-engine'
 
 // ---------------------------------------------------------------------------
-// Local mirror fallback (ONLY used if Firestore returns permission-denied
-// or is unreachable, so the user sees the non-blocking banner instead of a crash)
+// UID-namespaced local mirror fallback (NEVER shared across profiles/guests)
 // ---------------------------------------------------------------------------
 
-const LOCAL_MEETINGS_KEY = 'lectern-fs-meetings-cache'
-const LOCAL_BOARDS_KEY = 'lectern-fs-boards-cache'
+function localMeetingsKey(): string | null {
+  return scopedStorageKey('meetings', auth.currentUser?.uid ?? getActiveStorageUid())
+}
+
+function localBoardsKey(): string | null {
+  return scopedStorageKey('boards', auth.currentUser?.uid ?? getActiveStorageUid())
+}
 
 interface MeetingDoc {
   meetingId: string
   topic: string
   title: string
   hostId: string | null
+  memberIds: string[]
   hostName: string
   hostKeyHash: string
   passcode: string | null
@@ -88,6 +100,7 @@ interface MeetingDoc {
   startedAt: string | null
   endedAt: string | null
   createdAt: number
+  updatedAt: number
   spotlightId: string | null
   breakout: BreakoutState | null
   notes: string
@@ -97,6 +110,7 @@ interface MeetingDoc {
   muteAllAt: number | null
   lastReaction: MeetingReactionEvent | null
   screenAnnotations: ScreenAnnStroke[]
+  presenterCamera?: PresenterCameraState | null
 }
 
 export interface ParticipantDoc {
@@ -120,10 +134,28 @@ export interface ParticipantDoc {
 const memMeetings = new Map<string, MeetingDoc>()
 const memParticipants = new Map<string, Map<string, ParticipantDoc>>()
 
+/** Clears cached meeting/board mirrors on sign-out or profile switch so no prior user's data leaks. */
+export function clearLocalMeetingCaches() {
+  memMeetings.clear()
+  memParticipants.clear()
+  purgeLegacyUnscopedStorage()
+  if (typeof window === 'undefined') return
+  try {
+    const mk = localMeetingsKey()
+    const bk = localBoardsKey()
+    if (mk) localStorage.removeItem(mk)
+    if (bk) localStorage.removeItem(bk)
+  } catch {
+    // ignore
+  }
+}
+
 function loadLocalMeetings(): Record<string, MeetingDoc> {
   if (typeof window === 'undefined') return {}
+  const key = localMeetingsKey()
+  if (!key) return {}
   try {
-    const raw = localStorage.getItem(LOCAL_MEETINGS_KEY)
+    const raw = localStorage.getItem(key)
     return raw ? (JSON.parse(raw) as Record<string, MeetingDoc>) : {}
   } catch {
     return {}
@@ -133,10 +165,29 @@ function loadLocalMeetings(): Record<string, MeetingDoc> {
 function saveLocalMeeting(m: MeetingDoc) {
   memMeetings.set(m.meetingId, m)
   if (typeof window === 'undefined') return
+  const key = localMeetingsKey()
+  if (!key) return
   try {
     const all = loadLocalMeetings()
     all[m.meetingId] = m
-    localStorage.setItem(LOCAL_MEETINGS_KEY, JSON.stringify(all))
+    localStorage.setItem(key, JSON.stringify(all))
+  } catch {
+    // ignore
+  }
+}
+
+function replaceLocalMeetings(list: MeetingDoc[]) {
+  memMeetings.clear()
+  const record: Record<string, MeetingDoc> = {}
+  for (const m of list) {
+    memMeetings.set(m.meetingId, m)
+    record[m.meetingId] = m
+  }
+  if (typeof window === 'undefined') return
+  const key = localMeetingsKey()
+  if (!key) return
+  try {
+    localStorage.setItem(key, JSON.stringify(record))
   } catch {
     // ignore
   }
@@ -146,10 +197,12 @@ function deleteLocalMeeting(meetingId: string) {
   memMeetings.delete(meetingId)
   memParticipants.delete(meetingId)
   if (typeof window === 'undefined') return
+  const key = localMeetingsKey()
+  if (!key) return
   try {
     const all = loadLocalMeetings()
     delete all[meetingId]
-    localStorage.setItem(LOCAL_MEETINGS_KEY, JSON.stringify(all))
+    localStorage.setItem(key, JSON.stringify(all))
   } catch {
     // ignore
   }
@@ -187,11 +240,19 @@ function normalizeMeetingDoc(
       : raw.status === 'live' || startedAt
         ? 'live'
         : 'scheduled'
+  const hostId = typeof raw.hostId === 'string' ? raw.hostId : null
+  const rawMembers = Array.isArray(raw.memberIds)
+    ? raw.memberIds.filter((v): v is string => typeof v === 'string' && v.length > 0)
+    : []
+  const memberIds =
+    hostId && !rawMembers.includes(hostId) ? [hostId, ...rawMembers] : rawMembers
+  const createdAt = typeof raw.createdAt === 'number' ? raw.createdAt : Date.now()
   return {
     meetingId,
     topic: title,
     title,
-    hostId: typeof raw.hostId === 'string' ? raw.hostId : null,
+    hostId,
+    memberIds,
     hostName: String(raw.hostName ?? 'Teacher'),
     hostKeyHash: String(raw.hostKeyHash ?? ''),
     passcode: typeof raw.passcode === 'string' ? raw.passcode : null,
@@ -209,7 +270,8 @@ function normalizeMeetingDoc(
     durationMin: typeof raw.durationMin === 'number' ? raw.durationMin : 60,
     startedAt,
     endedAt,
-    createdAt: typeof raw.createdAt === 'number' ? raw.createdAt : Date.now(),
+    createdAt,
+    updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : createdAt,
     spotlightId: typeof raw.spotlightId === 'string' ? raw.spotlightId : null,
     breakout: (raw.breakout as BreakoutState | null) ?? null,
     notes: typeof raw.notes === 'string' ? raw.notes : '',
@@ -228,6 +290,8 @@ function normalizeMeetingDoc(
     screenAnnotations: Array.isArray(raw.screenAnnotations)
       ? (raw.screenAnnotations as ScreenAnnStroke[])
       : [],
+    presenterCamera:
+      (raw.presenterCamera as PresenterCameraState | null | undefined) ?? null,
   }
 }
 
@@ -249,6 +313,7 @@ export function summaryOf(row: MeetingDoc): MeetingSummary {
     title: row.title,
     hostName: row.hostName,
     hostId: row.hostId,
+    memberIds: row.memberIds,
     hasPasscode: !!row.passcode,
     scheduledAt: row.scheduledAt,
     durationMin: row.durationMin,
@@ -264,6 +329,7 @@ export function summaryOf(row: MeetingDoc): MeetingSummary {
     muteAllAt: row.muteAllAt,
     lastReaction: row.lastReaction,
     screenAnnotations: row.screenAnnotations,
+    presenterCamera: row.presenterCamera ?? null,
   }
 }
 
@@ -317,8 +383,8 @@ function subscribeAfterAuth(
 export async function fetchMeetingDoc(
   meetingId: string,
 ): Promise<MeetingDoc | null> {
-  const id = meetingId.trim().toLowerCase()
-  if (!isValidMeetingId(id)) return null
+  const id = normalizeMeetingId(meetingId)
+  if (!id || !isValidMeetingId(id)) return null
   if (!(await requireAuth())) return getLocalMeeting(id)
   try {
     const snap = await getDoc(doc(db, 'meetings', id))
@@ -340,6 +406,7 @@ export async function fetchMeetingDoc(
 export interface CreateMeetingInput {
   title?: string
   hostName?: string
+  customMeetingId?: string
   passcode?: boolean
   customPasscode?: string | null
   waitingRoom?: boolean
@@ -356,14 +423,19 @@ export async function createMeetingRecord(input: CreateMeetingInput) {
     : input.passcode
       ? generatePasscode()
       : null
-  const meetingId = generateMeetingId()
+  const customId = input.customMeetingId
+    ? normalizeMeetingId(input.customMeetingId)
+    : null
+  const meetingId = customId && isValidMeetingId(customId) ? customId : generateMeetingId()
   const title = input.title?.trim() || 'Live class'
   const waitingRoom = input.waitingRoom ?? true
+  const now = Date.now()
   const record: MeetingDoc = {
     meetingId,
     topic: title,
     title,
     hostId: uid,
+    memberIds: [uid],
     hostName,
     hostKeyHash: sha256Hex(hostKey),
     passcode,
@@ -380,7 +452,8 @@ export async function createMeetingRecord(input: CreateMeetingInput) {
     durationMin: input.durationMin ?? 60,
     startedAt: null,
     endedAt: null,
-    createdAt: Date.now(),
+    createdAt: now,
+    updatedAt: now,
     spotlightId: null,
     breakout: null,
     notes: '',
@@ -390,6 +463,7 @@ export async function createMeetingRecord(input: CreateMeetingInput) {
     muteAllAt: null,
     lastReaction: null,
     screenAnnotations: [],
+    presenterCamera: null,
   }
   saveLocalMeeting(record)
   if (await requireAuth()) {
@@ -449,46 +523,84 @@ export async function getMeetingSummary(
   return { ...summaryOf(row), youAreHost }
 }
 
-export async function listUserMeetings(): Promise<
-  (MeetingSummary & { passcode: string | null })[]
-> {
-  const uid = await ensureClientUid()
-  const byId = new Map<string, MeetingDoc>()
+export async function listUserMeetings(
+  explicitUid?: string | null,
+): Promise<(MeetingSummary & { passcode: string | null })[]> {
+  const uid =
+    explicitUid !== undefined
+      ? explicitUid
+      : (auth.currentUser?.uid ?? getActiveStorageUid())
+  if (!uid) return []
 
-  // Include locally cached meetings owned by this user or browser
-  const hostIds = new Set(listHostMeetingIds())
-  for (const m of Object.values(loadLocalMeetings())) {
-    if (m.hostId === uid || hostIds.has(m.meetingId)) {
-      byId.set(m.meetingId, m)
-    }
-  }
+  const byId = new Map<string, MeetingDoc>()
 
   if (await requireAuth()) {
     try {
-      const q = query(collection(db, 'meetings'), where('hostId', '==', uid))
+      // Strictly uid-scoped single-field array-contains query (ZERO composite indexes)
+      const q = query(
+        collection(db, 'meetings'),
+        where('memberIds', 'array-contains', uid),
+      )
       const snap = await getDocs(q)
       for (const d of snap.docs) {
         const m = normalizeMeetingDoc(d.id, d.data() as Record<string, unknown>)
         byId.set(m.meetingId, m)
-        saveLocalMeeting(m)
       }
+      replaceLocalMeetings(Array.from(byId.values()))
     } catch (err) {
       handleFsError('meetings', err)
-    }
-  }
-
-  // Also fetch any meetings created in this browser whose host key we hold
-  for (const id of hostIds) {
-    if (!byId.has(id)) {
-      const m = await fetchMeetingDoc(id)
-      if (m) byId.set(m.meetingId, m)
+      // Fallback only to UID-scoped cache if offline
+      for (const m of Object.values(loadLocalMeetings())) {
+        if (m.hostId === uid || m.memberIds.includes(uid)) {
+          byId.set(m.meetingId, m)
+        }
+      }
     }
   }
 
   return Array.from(byId.values())
-    .sort((a, b) => b.createdAt - a.createdAt)
+    .sort((a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt))
     .slice(0, 50)
     .map((row) => ({ ...summaryOf(row), passcode: row.passcode }))
+}
+
+/**
+ * Real-time subscription to ONLY classrooms where `memberIds` contains `uid`.
+ * Uses a single-field `array-contains` query and sorts in JavaScript (zero composite indexes).
+ */
+export function subscribeUserMeetings(
+  uid: string | null,
+  onMeetings: (list: (MeetingSummary & { passcode: string | null })[]) => void,
+): Unsubscribe {
+  if (!uid || typeof window === 'undefined') {
+    onMeetings([])
+    return () => {}
+  }
+  const q = query(
+    collection(db, 'meetings'),
+    where('memberIds', 'array-contains', uid),
+  )
+  return onSnapshot(
+    q,
+    (snap) => {
+      const docs = snap.docs.map((d) =>
+        normalizeMeetingDoc(d.id, d.data() as Record<string, unknown>),
+      )
+      docs.sort(
+        (a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt),
+      )
+      replaceLocalMeetings(docs)
+      onMeetings(
+        docs
+          .slice(0, 50)
+          .map((row) => ({ ...summaryOf(row), passcode: row.passcode })),
+      )
+    },
+    (err) => {
+      handleFsError('meetings', err)
+      onMeetings([])
+    },
+  )
 }
 
 export async function deleteMeetingRecord(meetingId: string) {
@@ -632,12 +744,41 @@ export async function joinMeetingRecord(
   input: JoinMeetingInput,
 ): Promise<JoinResult> {
   const uid = await ensureClientUid()
-  const meetingId = input.meetingId.trim().toLowerCase()
+  const meetingId = normalizeMeetingId(input.meetingId)
+  if (!meetingId) return { status: 'not-found' }
   const meeting = await fetchMeetingDoc(meetingId)
   if (!meeting) return { status: 'not-found' }
   const summary = summaryOf(meeting)
   if (meeting.endedAt || meeting.status === 'ended') {
     return { status: 'ended', meeting: summary }
+  }
+
+  const ensureMembership = async () => {
+    const now = Date.now()
+    if (!meeting.memberIds.includes(uid)) {
+      meeting.memberIds = [...meeting.memberIds, uid]
+      meeting.updatedAt = now
+      saveLocalMeeting(meeting)
+    }
+    try {
+      await updateDoc(doc(db, 'meetings', meetingId), {
+        memberIds: arrayUnion(uid),
+        updatedAt: now,
+      })
+    } catch {
+      try {
+        await setDoc(
+          doc(db, 'meetings', meetingId),
+          { memberIds: arrayUnion(uid), updatedAt: now },
+          { merge: true },
+        )
+      } catch (err) {
+        handleFsError(`meetings/${meetingId}`, err)
+      }
+    }
+    if (meeting.activeWhiteboardId) {
+      void joinWhiteboardMembership(meeting.activeWhiteboardId)
+    }
   }
 
   const byKey =
@@ -669,8 +810,12 @@ export async function joinMeetingRecord(
     if (!meeting.startedAt) {
       meeting.startedAt = new Date(now).toISOString()
       meeting.status = 'live'
-      saveLocalMeeting(meeting)
     }
+    meeting.updatedAt = now
+    if (!meeting.memberIds.includes(uid)) {
+      meeting.memberIds = [...meeting.memberIds, uid]
+    }
+    saveLocalMeeting(meeting)
     try {
       await setDoc(
         doc(db, 'meetings', meetingId, 'participants', identity),
@@ -679,11 +824,19 @@ export async function joinMeetingRecord(
       )
       await setDoc(
         doc(db, 'meetings', meetingId),
-        { startedAt: meeting.startedAt, status: 'live' },
+        {
+          startedAt: meeting.startedAt,
+          status: 'live',
+          memberIds: arrayUnion(uid),
+          updatedAt: now,
+        },
         { merge: true },
       )
     } catch (err) {
       handleFsError(`meetings/${meetingId}/participants/${identity}`, err)
+    }
+    if (meeting.activeWhiteboardId) {
+      void joinWhiteboardMembership(meeting.activeWhiteboardId)
     }
     return joinedPayload(meeting, participant, hostSecret)
   }
@@ -710,6 +863,7 @@ export async function joinMeetingRecord(
             err,
           )
         }
+        await ensureMembership()
         return joinedPayload(meeting, existing, input.participantKey)
       }
       if (existing.status === 'waiting') {
@@ -727,7 +881,7 @@ export async function joinMeetingRecord(
     }
   }
 
-  // New student
+  // New student / guest joining by exact ID or invite link
   if (meeting.passcode) {
     if (!input.passcode) {
       return { status: 'passcode-required', meeting: summary, wrong: false }
@@ -765,6 +919,9 @@ export async function joinMeetingRecord(
   } catch (err) {
     handleFsError(`meetings/${meetingId}/participants/${identity}`, err)
   }
+
+  // Append uid to meeting.memberIds so this room & its live chat appear in the joiner's workspace
+  await ensureMembership()
 
   if (status === 'waiting') {
     return {
@@ -970,6 +1127,7 @@ export async function updateMeetingMeta(
     muteAllAt: number | null
     lastReaction: MeetingReactionEvent | null
     screenAnnotations: ScreenAnnStroke[]
+    presenterCamera: PresenterCameraState | null
   }>,
 ) {
   const existing = getLocalMeeting(meetingId)
@@ -1449,18 +1607,23 @@ function whiteboardCollectionPath(scope: WhiteboardScope) {
     : (['whiteboards', scope.boardId, 'elements'] as const)
 }
 
-function wbCacheKey(scope: WhiteboardScope) {
-  return scope.kind === 'meeting'
-    ? `lectern-wb-el-cache:meeting:${scope.meetingId}`
-    : `lectern-wb-el-cache:board:${scope.boardId}`
+function wbCacheKey(scope: WhiteboardScope): string | null {
+  const uid = auth.currentUser?.uid ?? getActiveStorageUid()
+  const ns =
+    scope.kind === 'meeting'
+      ? `wb_meeting_${scope.meetingId}`
+      : `wb_board_${scope.boardId}`
+  return scopedStorageKey(ns, uid)
 }
 
 function loadLocalWbElements<T extends { id: string }>(
   scope: WhiteboardScope,
 ): T[] {
   if (typeof window === 'undefined') return []
+  const key = wbCacheKey(scope)
+  if (!key) return []
   try {
-    const raw = localStorage.getItem(wbCacheKey(scope))
+    const raw = localStorage.getItem(key)
     return raw ? (JSON.parse(raw) as T[]) : []
   } catch {
     return []
@@ -1472,8 +1635,10 @@ function saveLocalWbElements<T extends { id: string }>(
   elements: T[],
 ) {
   if (typeof window === 'undefined') return
+  const key = wbCacheKey(scope)
+  if (!key) return
   try {
-    localStorage.setItem(wbCacheKey(scope), JSON.stringify(elements))
+    localStorage.setItem(key, JSON.stringify(elements))
   } catch {
     // ignore quota errors
   }
@@ -1668,8 +1833,10 @@ export function subscribeWhiteboardElements<T extends { id: string }>(
 
 function loadLocalBoards(): StandaloneBoardMeta[] {
   if (typeof window === 'undefined') return []
+  const key = localBoardsKey()
+  if (!key) return []
   try {
-    const raw = localStorage.getItem(LOCAL_BOARDS_KEY)
+    const raw = localStorage.getItem(key)
     return raw ? (JSON.parse(raw) as StandaloneBoardMeta[]) : []
   } catch {
     return []
@@ -1678,34 +1845,96 @@ function loadLocalBoards(): StandaloneBoardMeta[] {
 
 function saveLocalBoards(list: StandaloneBoardMeta[]) {
   if (typeof window === 'undefined') return
+  const key = localBoardsKey()
+  if (!key) return
   try {
-    localStorage.setItem(LOCAL_BOARDS_KEY, JSON.stringify(list))
+    localStorage.setItem(key, JSON.stringify(list))
   } catch {
     // ignore
   }
 }
 
-export async function listStandaloneBoards(): Promise<StandaloneBoardMeta[]> {
-  const uid = await ensureClientUid()
+/** Appends the current user's UID to a shared whiteboard's `memberIds` when opening it in a meeting. */
+export async function joinWhiteboardMembership(boardId: string) {
+  if (!boardId) return
+  const uid = auth.currentUser?.uid
+  if (!uid) return
+  try {
+    await updateDoc(doc(db, 'whiteboards', boardId), {
+      memberIds: arrayUnion(uid),
+    })
+  } catch {
+    // Ignore if board does not exist or offline
+  }
+}
+
+export async function listStandaloneBoards(
+  explicitUid?: string | null,
+): Promise<StandaloneBoardMeta[]> {
+  const uid =
+    explicitUid !== undefined
+      ? explicitUid
+      : (auth.currentUser?.uid ?? getActiveStorageUid())
+  if (!uid) return []
   const byId = new Map<string, StandaloneBoardMeta>()
-  for (const b of loadLocalBoards()) byId.set(b.id, b)
   if (await requireAuth()) {
     try {
-      const q = query(collection(db, 'whiteboards'), where('ownerId', '==', uid))
+      const q = query(
+        collection(db, 'whiteboards'),
+        where('memberIds', 'array-contains', uid),
+      )
       const snap = await getDocs(q)
       for (const d of snap.docs) {
         const b = d.data() as StandaloneBoardMeta
-        byId.set(b.id, { ...byId.get(b.id), ...b, id: b.id || d.id })
+        byId.set(b.id || d.id, { ...b, id: b.id || d.id })
       }
+      const list = Array.from(byId.values()).sort(
+        (a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0),
+      )
+      saveLocalBoards(list)
+      return list
     } catch (err) {
       handleFsError('whiteboards', err)
     }
   }
-  const list = Array.from(byId.values()).sort(
-    (a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0),
+  return loadLocalBoards()
+    .filter((b) => b.ownerId === uid || Boolean(b.memberIds?.includes(uid)))
+    .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+}
+
+/**
+ * Real-time subscription to ONLY standalone whiteboards where `memberIds` contains `uid`.
+ * Uses a single-field `array-contains` query and sorts in JavaScript (zero composite indexes).
+ */
+export function subscribeUserWhiteboards(
+  uid: string | null,
+  onBoards: (boards: StandaloneBoardMeta[]) => void,
+): Unsubscribe {
+  if (!uid || typeof window === 'undefined') {
+    onBoards([])
+    return () => {}
+  }
+  const q = query(
+    collection(db, 'whiteboards'),
+    where('memberIds', 'array-contains', uid),
   )
-  saveLocalBoards(list)
-  return list
+  return onSnapshot(
+    q,
+    (snap) => {
+      const list = snap.docs
+        .map((d) => {
+          const b = d.data() as StandaloneBoardMeta
+          return { ...b, id: b.id || d.id }
+        })
+        .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+      saveLocalBoards(list)
+      onBoards(list)
+    },
+    (err) => {
+      handleFsError('whiteboards', err)
+      onBoards([])
+    },
+  )
 }
 
 export interface CreateBoardOptions {
@@ -1730,6 +1959,7 @@ export async function createStandaloneBoard(
     id: `wb-${randomToken(6)}`,
     title: opts.title?.trim() || 'Untitled whiteboard',
     ownerId: uid,
+    memberIds: [uid],
     createdBy: uid,
     createdByName: opts.createdByName,
     backgroundType: opts.backgroundType ?? 'dots',
@@ -1835,6 +2065,7 @@ export async function duplicateStandaloneBoard(
     id: `wb-${randomToken(6)}`,
     title: copyTitle,
     ownerId: uid,
+    memberIds: [uid],
     createdBy: uid,
     createdByName: sourceMeta?.createdByName,
     backgroundType: sourceMeta?.backgroundType ?? 'dots',
@@ -1885,7 +2116,8 @@ export async function deleteStandaloneBoard(id: string) {
   saveLocalBoards(loadLocalBoards().filter((b) => b.id !== id))
   if (typeof window !== 'undefined') {
     try {
-      localStorage.removeItem(wbCacheKey({ kind: 'board', boardId: id }))
+      const k = wbCacheKey({ kind: 'board', boardId: id })
+      if (k) localStorage.removeItem(k)
     } catch {
       // ignore
     }

@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+.output/
+.tanstack/
+.vercel/
+.netlify/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Local tooling & editor files
+.playwright-cli/
+.DS_Store
+*.log

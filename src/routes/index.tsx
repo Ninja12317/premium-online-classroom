@@ -4,10 +4,12 @@ import {
   ArrowRight,
   CalendarDays,
   CalendarPlus,
+  ChevronDown,
   Clock,
   Copy,
+  Film,
   KeyRound,
-  Link2,
+  MessageSquare,
   MonitorUp,
   Pencil,
   PenTool,
@@ -18,6 +20,8 @@ import {
 } from 'lucide-react'
 import { toast } from 'sonner'
 
+import { AuthModal, type AuthModalMode } from '@/components/auth-modal'
+import { BackButton } from '@/components/back-button'
 import {
   ChatTab,
   MeetingsTab,
@@ -42,6 +46,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { saveHostKey } from '@/lib/host-keys'
@@ -56,20 +67,26 @@ import {
   deleteMeeting,
   listMyMeetings,
 } from '@/lib/meetings.functions'
+import { useJoinPrefs } from '@/lib/prefs'
+import { useUserProfile } from '@/lib/profile'
 import { useMounted } from '@/lib/use-mounted'
+import { subscribeUserMeetings } from '@/services/firestore-meetings'
 
 export const Route = createFileRoute('/')({
   component: HomeDashboard,
 })
 
 function HomeDashboard() {
-  const { user, ready } = useIdentity()
+  const { user, authStatus, role, ready, clientUid } = useIdentity()
+  const profile = useUserProfile()
+  const prefs = useJoinPrefs()
   const navigate = useNavigate()
   const mounted = useMounted()
 
   const [activeTab, setActiveTab] = useState<DashboardTab>('home')
+  const [tabHistory, setTabHistory] = useState<DashboardTab[]>([])
   const [meetings, setMeetings] = useState<DashboardMeeting[]>([])
-  const [loadingMeetings, setLoadingMeetings] = useState(true)
+  const [loadingMeetings, setLoadingMeetings] = useState(false)
   const [starting, setStarting] = useState(false)
   const [sharingStart, setSharingStart] = useState(false)
   const [joinOpen, setJoinOpen] = useState(false)
@@ -80,50 +97,138 @@ function HomeDashboard() {
     null,
   )
   const [whiteboardFullscreen, setWhiteboardFullscreen] = useState(false)
+  const [authModalOpen, setAuthModalOpen] = useState(false)
+  const [authModalMode, setAuthModalMode] = useState<AuthModalMode>('signin')
   const [clock, setClock] = useState(() => new Date())
+
+  const isTeacher = authStatus === 'authenticated' && role === 'teacher'
+  const isStudent = authStatus === 'authenticated' && role === 'student'
+  const teacherPmi = isTeacher ? user?.pmi || profile.pmi || '' : ''
+
+  const resolvedHostName = user
+    ? user.name ||
+      profile.displayName.trim() ||
+      prefs.name.trim() ||
+      displayName(user) ||
+      undefined
+    : undefined
+
+  const openAuthModal = useCallback((mode: AuthModalMode) => {
+    setAuthModalMode(mode)
+    setAuthModalOpen(true)
+  }, [])
+
+  const handleTabChange = useCallback(
+    (next: DashboardTab) => {
+      if (next === activeTab) return
+      setTabHistory((prev) => [...prev.slice(-19), activeTab])
+      setActiveTab(next)
+    },
+    [activeTab],
+  )
+
+  const handleBackTab = useCallback(() => {
+    if (tabHistory.length === 0) {
+      setActiveTab('home')
+      return
+    }
+    const nextTab = tabHistory[tabHistory.length - 1]
+    setTabHistory((prev) => prev.slice(0, -1))
+    setActiveTab(nextTab)
+  }, [tabHistory])
+
+  // Honor cross-route deep link hint (e.g. clicking "All Settings" from the pre-join lobby)
+  useEffect(() => {
+    try {
+      const requested = sessionStorage.getItem('lectern-open-tab')
+      if (
+        requested &&
+        [
+          'home',
+          'meetings',
+          'chat',
+          'whiteboards',
+          'recordings',
+          'settings',
+        ].includes(requested)
+      ) {
+        sessionStorage.removeItem('lectern-open-tab')
+        queueMicrotask(() => setActiveTab(requested as DashboardTab))
+      }
+    } catch {
+      // ignore
+    }
+  }, [])
 
   useEffect(() => {
     const t = window.setInterval(() => setClock(new Date()), 1000)
     return () => window.clearInterval(t)
   }, [])
 
+  const activeProfileUid =
+    ready && (authStatus === 'authenticated' || authStatus === 'guest')
+      ? clientUid || user?.id || null
+      : null
+
   const refreshMeetings = useCallback(async () => {
+    if (!activeProfileUid) {
+      setMeetings([])
+      setLoadingMeetings(false)
+      return
+    }
     try {
       const list = await listMyMeetings()
       setMeetings(list ?? [])
     } catch {
-      // Non-blocking banner already shown on Firestore error
+      // Non-blocking error handling
     } finally {
       setLoadingMeetings(false)
     }
-  }, [])
+  }, [activeProfileUid])
 
+  const [seenProfileUid, setSeenProfileUid] = useState<string | null>(
+    activeProfileUid,
+  )
+  if (activeProfileUid !== seenProfileUid) {
+    setSeenProfileUid(activeProfileUid)
+    setMeetings([])
+    setLoadingMeetings(Boolean(activeProfileUid))
+  }
+
+  // Real-time UID-scoped Firestore listener: immediately clears on logout or UID switch
   useEffect(() => {
-    if (!ready) return
-    let active = true
-    void listMyMeetings()
-      .then((list) => {
-        if (active) setMeetings(list ?? [])
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (active) setLoadingMeetings(false)
-      })
+    if (!ready || !activeProfileUid) return
+    const unsub = subscribeUserMeetings(activeProfileUid, (list) => {
+      setMeetings(list)
+      setLoadingMeetings(false)
+    })
     return () => {
-      active = false
+      unsub()
     }
-  }, [ready, user?.id])
+  }, [ready, activeProfileUid])
 
-  async function startNewMeeting(mode: 'instant' | 'share' = 'instant') {
+  async function startNewMeeting(mode: 'instant' | 'share' | 'pmi' = 'instant') {
+    if (isStudent) {
+      toast.info('Switch to a Teacher account to host a live class.')
+      openAuthModal('teacher')
+      return
+    }
     if (starting || sharingStart) return
     if (mode === 'share') setSharingStart(true)
     else setStarting(true)
     try {
       const result = await createMeeting({
         data: {
-          title: mode === 'share' ? 'Screen share session' : 'Live class',
-          hostName: displayName(user) || undefined,
-          waitingRoom: mode === 'instant',
+          title:
+            mode === 'share'
+              ? 'Screen share session'
+              : mode === 'pmi'
+                ? 'Personal Meeting Room'
+                : 'Live class',
+          hostName: resolvedHostName,
+          waitingRoom: mode !== 'share',
+          customMeetingId:
+            mode === 'pmi' && teacherPmi ? teacherPmi : undefined,
         },
       })
       saveHostKey(result.meetingId, result.hostKey)
@@ -138,11 +243,30 @@ function HomeDashboard() {
     }
   }
 
+  function handleOpenSchedule() {
+    if (isStudent) {
+      toast.info('Sign in with a Teacher account to schedule classes.')
+      openAuthModal('teacher')
+      return
+    }
+    setEditingMeeting(null)
+    setScheduleOpen(true)
+  }
+
+  function handleCopyPmi() {
+    if (!teacherPmi) return
+    void navigator.clipboard
+      .writeText(teacherPmi)
+      .then(() => toast.success(`Copied PMI: ${teacherPmi}`))
+  }
+
   function handleJoinSubmit(event: FormEvent) {
     event.preventDefault()
     const id = parseMeetingInput(joinValue)
     if (!id) {
-      setJoinError('Paste the invite link or type the 10-letter meeting ID.')
+      setJoinError(
+        'Paste an invite link or enter a meeting ID like LEC-4829-7315.',
+      )
       return
     }
     setJoinError(null)
@@ -178,9 +302,25 @@ function HomeDashboard() {
   const nextScheduled = useMemo(
     () =>
       upcoming.find(
-        (m) => m.scheduledAt && Date.parse(m.scheduledAt) >= clock.getTime() - 30 * 60_000,
-      ) ?? upcoming[0] ?? null,
+        (m) =>
+          m.scheduledAt &&
+          Date.parse(m.scheduledAt) >= clock.getTime() - 30 * 60_000,
+      ) ??
+      upcoming[0] ??
+      null,
     [upcoming, clock],
+  )
+
+  const todaysClassCount = useMemo(() => {
+    const todayKey = clock.toDateString()
+    return upcoming.filter(
+      (m) => m.scheduledAt && new Date(m.scheduledAt).toDateString() === todayKey,
+    ).length
+  }, [upcoming, clock])
+
+  const hasLiveClass = useMemo(
+    () => upcoming.some((m) => Boolean(m.startedAt && !m.endedAt)),
+    [upcoming],
   )
 
   return (
@@ -191,7 +331,7 @@ function HomeDashboard() {
           : 'min-h-svh bg-background pb-24 md:pb-0'
       }
     >
-      <SiteHeader activeTab={activeTab} onTabChange={setActiveTab} />
+      <SiteHeader activeTab={activeTab} onTabChange={handleTabChange} />
 
       <main className="relative">
         {activeTab === 'home' && (
@@ -201,126 +341,196 @@ function HomeDashboard() {
                 className="paper-grid pointer-events-none absolute inset-0 -z-10"
                 aria-hidden
               />
-              <div className="mx-auto max-w-content px-4 py-10 sm:px-6 lg:py-14">
-                {/* Headline preserving Lectern identity */}
-                <div className="mb-8 flex flex-wrap items-end justify-between gap-4">
-                  <div className="animate-fade-up motion-reduce:animate-none">
-                    <Badge
-                      variant="secondary"
-                      className="mb-3 gap-1.5 rounded-full px-3 py-1"
+              <div className="mx-auto max-w-content px-4 py-6 sm:px-6 sm:py-8">
+                {/* Editorial Lectern Hero */}
+                <div className="relative mb-6 overflow-hidden rounded-2xl border border-border/80 bg-card/95 px-5 py-5 shadow-xs sm:px-7 sm:py-6">
+                  <div
+                    className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_60%_100%_at_92%_10%,var(--primary),transparent_72%)] opacity-15 dark:opacity-25"
+                    aria-hidden
+                  />
+                  <div className="relative flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between lg:gap-8">
+                    <div className="max-w-2xl space-y-2.5">
+                      <div className="inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/10 px-3 py-1 text-xs font-medium text-primary">
+                        <span className="size-1.5 rounded-full bg-live animate-pulse-dot motion-reduce:animate-none" />
+                        <span>Interactive Classroom &amp; Meeting Studio</span>
+                      </div>
+                      <h1 className="font-display text-2xl font-semibold tracking-tight text-foreground sm:text-3xl lg:text-[2rem] lg:leading-[1.15]">
+                        Your classroom,{' '}
+                        <span className="text-primary">one link away.</span>
+                      </h1>
+                      <p className="max-w-xl text-sm leading-relaxed text-muted-foreground sm:text-[15px]">
+                        Live video sessions, real-time infinite whiteboards, and
+                        seamless classroom collaboration in one quiet workspace.
+                      </p>
+                    </div>
+
+                    <div
+                      aria-label="Workspace overview"
+                      className="hidden shrink-0 items-center divide-x divide-border/80 rounded-xl border border-border/80 bg-background/80 px-5 py-3.5 shadow-2xs backdrop-blur-sm lg:flex"
                     >
-                      <span className="size-1.5 rounded-full bg-live animate-pulse-dot" />
-                      Live classes, zero setup for students
-                    </Badge>
-                    <h1 className="font-display text-3xl font-semibold leading-[1.08] tracking-tight sm:text-4xl lg:text-5xl">
-                      Your classroom,{' '}
-                      <span className="text-primary">one link away.</span>
-                    </h1>
+                      <div className="pr-5">
+                        <div className="flex items-center gap-2">
+                          <span className="size-2 rounded-full bg-live animate-pulse-dot motion-reduce:animate-none" />
+                          <span className="font-display text-base font-semibold tracking-tight text-foreground">
+                            {hasLiveClass ? 'In Session' : 'Studio Ready'}
+                          </span>
+                        </div>
+                        <p className="mt-0.5 text-xs text-muted-foreground">
+                          Video · Whiteboard
+                        </p>
+                      </div>
+                      <div className="pl-5">
+                        <p className="font-display text-base font-semibold tabular-nums tracking-tight text-foreground">
+                          {mounted ? todaysClassCount : 0}
+                        </p>
+                        <p className="mt-0.5 text-xs text-muted-foreground">
+                          {mounted && todaysClassCount === 1
+                            ? 'Class today'
+                            : 'Classes today'}
+                        </p>
+                      </div>
+                    </div>
                   </div>
-                  <p className="max-w-md text-sm text-muted-foreground">
-                    Start a class in one click, teach with video, screen share,
-                    an infinite synced whiteboard, live polls, breakout rooms
-                    and chat.
-                  </p>
                 </div>
 
                 {/* Zoom-ergonomics Dashboard Grid styled 100% with Lectern tokens */}
                 <div className="grid gap-6 lg:grid-cols-[1.05fr_0.95fr] lg:items-start">
-                  {/* Left: 4 Quick-Action Tiles + Inline Student Join */}
+                  {/* Left: 4 Role-Aware Quick-Action Tiles */}
                   <div className="space-y-6">
-                    <div className="grid grid-cols-2 gap-3.5 sm:gap-4">
-                      <QuickActionCard
-                        icon={Video}
-                        title={starting ? 'Preparing room…' : 'New Meeting'}
-                        description="Start an instant live class right now"
-                        primary
-                        disabled={starting}
-                        onClick={() => void startNewMeeting('instant')}
-                      />
-                      <QuickActionCard
-                        icon={PlusSquare}
-                        title="Join"
-                        description="Enter a meeting ID or invite link"
-                        onClick={() => {
-                          setJoinError(null)
-                          setJoinOpen(true)
-                        }}
-                      />
-                      <QuickActionCard
-                        icon={CalendarPlus}
-                        title="Schedule"
-                        description="Plan a class with permanent link & passcode"
-                        onClick={() => {
-                          setEditingMeeting(null)
-                          setScheduleOpen(true)
-                        }}
-                      />
-                      <QuickActionCard
-                        icon={MonitorUp}
-                        title={sharingStart ? 'Starting…' : 'Share Screen'}
-                        description="Open a room ready to present immediately"
-                        disabled={sharingStart}
-                        onClick={() => void startNewMeeting('share')}
-                      />
-                    </div>
-
-                    {/* Preserved direct Student Join bar */}
-                    <form
-                      onSubmit={handleJoinSubmit}
-                      className="rounded-2xl border bg-card p-4 shadow-sm"
-                      noValidate
-                    >
-                      <label
-                        htmlFor="join-code"
-                        className="mb-1.5 block text-sm font-medium"
-                      >
-                        Joining as a student?
-                      </label>
-                      <div className="flex gap-2">
-                        <div className="relative flex-1">
-                          <Link2 className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-                          <Input
-                            id="join-code"
-                            value={joinValue}
-                            onChange={(e) => {
-                              setJoinValue(e.target.value)
-                              if (joinError) setJoinError(null)
-                            }}
-                            placeholder="Paste the class link or meeting ID"
-                            className="h-10 pl-9"
-                            autoComplete="off"
-                            aria-invalid={!!joinError}
-                            aria-describedby={
-                              joinError ? 'join-error' : undefined
-                            }
-                          />
+                    {!isStudent ? (
+                      <div className="grid grid-cols-2 gap-3.5 sm:gap-4">
+                        {/* New Meeting primary card (with PMI dropdown caret for signed-in Teachers) */}
+                        <div className="relative flex flex-col justify-between rounded-2xl border border-primary/20 bg-primary text-primary-foreground shadow-md shadow-primary/15 transition-all hover:bg-primary/95">
+                          <button
+                            type="button"
+                            disabled={starting}
+                            onClick={() => void startNewMeeting('instant')}
+                            className="flex flex-1 flex-col items-start justify-between rounded-2xl p-5 text-left disabled:opacity-60"
+                          >
+                            <span className="mb-4 grid size-11 place-items-center rounded-xl bg-primary-foreground/15 text-primary-foreground">
+                              <Video className="size-5" />
+                            </span>
+                            <div className={isTeacher ? 'pr-7' : undefined}>
+                              <span className="block font-display text-lg font-semibold leading-tight">
+                                {starting ? 'Preparing room…' : 'New Meeting'}
+                              </span>
+                              <span className="mt-1 block text-xs text-primary-foreground/80">
+                                Start an instant live class right now
+                              </span>
+                            </div>
+                          </button>
+                          {isTeacher && (
+                            <DropdownMenu>
+                              <DropdownMenuTrigger asChild>
+                                <button
+                                  type="button"
+                                  aria-label="New meeting options and Personal Meeting ID"
+                                  className="absolute right-3 top-3 grid size-8 place-items-center rounded-lg bg-primary-foreground/15 text-primary-foreground transition-colors hover:bg-primary-foreground/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-foreground"
+                                >
+                                  <ChevronDown className="size-4" />
+                                </button>
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent
+                                align="end"
+                                className="w-64 rounded-xl"
+                              >
+                                <DropdownMenuItem
+                                  onClick={() => void startNewMeeting('instant')}
+                                >
+                                  <Video className="size-4 text-primary" />
+                                  Start Instant Meeting
+                                </DropdownMenuItem>
+                                {teacherPmi && (
+                                  <>
+                                    <DropdownMenuSeparator />
+                                    <div className="px-2 py-1.5">
+                                      <p className="text-[11px] font-medium text-muted-foreground">
+                                        Personal Meeting ID
+                                      </p>
+                                      <p className="font-mono text-xs font-semibold text-foreground">
+                                        {teacherPmi}
+                                      </p>
+                                    </div>
+                                    <DropdownMenuItem
+                                      onClick={() => void startNewMeeting('pmi')}
+                                    >
+                                      <Video className="size-4 text-primary" />
+                                      Start with PMI
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem onClick={handleCopyPmi}>
+                                      <Copy className="size-4 text-muted-foreground" />
+                                      Copy Personal Meeting ID
+                                    </DropdownMenuItem>
+                                  </>
+                                )}
+                              </DropdownMenuContent>
+                            </DropdownMenu>
+                          )}
                         </div>
-                        <Button
-                          type="submit"
-                          variant="secondary"
-                          className="h-10 gap-1.5 px-4"
-                        >
-                          Join <ArrowRight className="size-4" />
-                        </Button>
+
+                        <QuickActionCard
+                          icon={PlusSquare}
+                          title="Join"
+                          description="Enter a meeting ID or invite link"
+                          onClick={() => {
+                            setJoinError(null)
+                            setJoinOpen(true)
+                          }}
+                        />
+                        <QuickActionCard
+                          icon={CalendarPlus}
+                          title="Schedule"
+                          description="Plan a class with permanent link & passcode"
+                          onClick={handleOpenSchedule}
+                        />
+                        <QuickActionCard
+                          icon={MonitorUp}
+                          title={sharingStart ? 'Starting…' : 'Share Screen'}
+                          description="Open a room ready to present immediately"
+                          disabled={sharingStart}
+                          onClick={() => void startNewMeeting('share')}
+                        />
                       </div>
-                      {joinError && (
-                        <p
-                          id="join-error"
-                          role="alert"
-                          className="mt-1.5 text-sm text-destructive"
-                        >
-                          {joinError}
-                        </p>
-                      )}
-                    </form>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-3.5 sm:gap-4">
+                        <QuickActionCard
+                          icon={PlusSquare}
+                          title="Join Meeting"
+                          description="Enter a meeting ID or invite link"
+                          primary
+                          onClick={() => {
+                            setJoinError(null)
+                            setJoinOpen(true)
+                          }}
+                        />
+                        <QuickActionCard
+                          icon={PenTool}
+                          title="My Whiteboards"
+                          description="Open infinite canvases & collaborate"
+                          onClick={() => handleTabChange('whiteboards')}
+                        />
+                        <QuickActionCard
+                          icon={MessageSquare}
+                          title="Class Chat"
+                          description="Catch up on classroom messages"
+                          onClick={() => handleTabChange('chat')}
+                        />
+                        <QuickActionCard
+                          icon={Film}
+                          title="Recordings"
+                          description="Replay saved local class recordings"
+                          onClick={() => handleTabChange('recordings')}
+                        />
+                      </div>
+                    )}
                   </div>
 
                   {/* Right: Live Clock Card + Upcoming Scheduled Meetings */}
                   <div className="space-y-4">
                     {/* Live Clock Card */}
-                    <div className="relative overflow-hidden rounded-2xl border bg-stage p-5 text-stage-tile-foreground shadow-sm">
+                    <div className="relative overflow-hidden rounded-2xl border border-border/80 bg-stage p-5 text-foreground shadow-sm">
                       <div
-                        className="pointer-events-none absolute inset-0 opacity-35"
+                        className="pointer-events-none absolute inset-0 opacity-20 dark:opacity-35"
                         style={{
                           background:
                             'radial-gradient(circle at 85% 20%, var(--primary), transparent 65%)',
@@ -328,14 +538,14 @@ function HomeDashboard() {
                       />
                       <div className="relative flex items-start justify-between gap-4">
                         <div>
-                          <p className="font-display text-4xl font-semibold tabular-nums tracking-tight sm:text-5xl">
+                          <p className="font-display text-4xl font-semibold tabular-nums tracking-tight text-foreground sm:text-5xl">
                             {mounted
                               ? clock.toLocaleTimeString(undefined, {
                                   hour: 'numeric',
                                   minute: '2-digit',
                                 })
                               : '--:--'}
-                            <span className="ml-1.5 text-lg font-normal opacity-70">
+                            <span className="ml-1.5 text-lg font-normal text-foreground/65 dark:text-foreground/70">
                               {mounted
                                 ? clock.toLocaleTimeString(undefined, {
                                     second: '2-digit',
@@ -343,7 +553,7 @@ function HomeDashboard() {
                                 : ''}
                             </span>
                           </p>
-                          <p className="mt-1 text-sm opacity-80">
+                          <p className="mt-1 text-sm font-medium text-foreground/75 dark:text-foreground/80">
                             {mounted
                               ? clock.toLocaleDateString(undefined, {
                                   weekday: 'long',
@@ -354,19 +564,21 @@ function HomeDashboard() {
                               : 'Loading date…'}
                           </p>
                         </div>
-                        <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-white/10">
+                        <span className="grid size-10 shrink-0 place-items-center rounded-xl border border-primary/15 bg-primary/12 text-primary dark:border-white/10 dark:bg-white/10 dark:text-foreground">
                           <Clock className="size-5" />
                         </span>
                       </div>
                       {nextScheduled && (
-                        <div className="relative mt-4 flex flex-wrap items-center justify-between gap-2 rounded-xl bg-white/10 px-3.5 py-2.5 text-xs backdrop-blur-sm">
+                        <div className="relative mt-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border/70 bg-card/85 px-3.5 py-2.5 text-xs text-foreground shadow-2xs backdrop-blur-sm dark:border-white/10 dark:bg-white/10 dark:text-foreground">
                           <div className="min-w-0">
-                            <span className="opacity-75">Up next: </span>
-                            <span className="font-semibold">
+                            <span className="text-muted-foreground dark:text-foreground/75">
+                              Up next:{' '}
+                            </span>
+                            <span className="font-semibold text-foreground">
                               {nextScheduled.title}
                             </span>
                             {mounted && nextScheduled.scheduledAt && (
-                              <span className="ml-1.5 opacity-80">
+                              <span className="ml-1.5 text-muted-foreground dark:text-foreground/80">
                                 ·{' '}
                                 {new Date(
                                   nextScheduled.scheduledAt,
@@ -386,7 +598,7 @@ function HomeDashboard() {
                               to="/join/$meetingId"
                               params={{ meetingId: nextScheduled.meetingId }}
                             >
-                              Start
+                              {isTeacher ? 'Start' : 'Join'}
                             </Link>
                           </Button>
                         </div>
@@ -401,41 +613,48 @@ function HomeDashboard() {
                             Upcoming meetings
                           </h2>
                           <p className="text-xs text-muted-foreground">
-                            Start, copy invite, edit, or delete anytime.
+                            {isStudent
+                              ? 'Your upcoming classroom sessions.'
+                              : 'Start, copy invite, edit, or delete anytime.'}
                           </p>
                         </div>
-                        <Button
-                          size="xs"
-                          variant="outline"
-                          className="gap-1"
-                          onClick={() => {
-                            setEditingMeeting(null)
-                            setScheduleOpen(true)
-                          }}
-                        >
-                          <CalendarPlus className="size-3.5" /> Schedule
-                        </Button>
+                        {!isStudent && (
+                          <Button
+                            size="xs"
+                            variant="outline"
+                            className="gap-1"
+                            onClick={handleOpenSchedule}
+                          >
+                            <CalendarPlus className="size-3.5" /> Schedule
+                          </Button>
+                        )}
                       </div>
 
-                      {loadingMeetings ? (
+                      {!ready || loadingMeetings ? (
                         <div className="space-y-2">
                           <Skeleton className="h-20 rounded-xl" />
                           <Skeleton className="h-20 rounded-xl" />
                         </div>
                       ) : upcoming.length === 0 ? (
                         <div className="rounded-xl border border-dashed p-6 text-center text-sm text-muted-foreground">
-                          No upcoming classes scheduled yet. Click{' '}
-                          <button
-                            type="button"
-                            className="font-medium text-primary underline underline-offset-4"
-                            onClick={() => {
-                              setEditingMeeting(null)
-                              setScheduleOpen(true)
-                            }}
-                          >
-                            Schedule
-                          </button>{' '}
-                          to create one.
+                          {isStudent ? (
+                            <>
+                              No classes scheduled today. Select Join Meeting to
+                              enter a live room.
+                            </>
+                          ) : (
+                            <>
+                              No upcoming classes scheduled yet. Click{' '}
+                              <button
+                                type="button"
+                                className="font-medium text-primary underline underline-offset-4"
+                                onClick={handleOpenSchedule}
+                              >
+                                Schedule
+                              </button>{' '}
+                              to create one.
+                            </>
+                          )}
                         </div>
                       ) : (
                         <ul className="space-y-2.5">
@@ -453,16 +672,15 @@ function HomeDashboard() {
                                     <span className="inline-flex items-center gap-1">
                                       <CalendarDays className="size-3" />
                                       {mounted && m.scheduledAt
-                                        ? new Date(m.scheduledAt).toLocaleString(
-                                            undefined,
-                                            {
-                                              weekday: 'short',
-                                              month: 'short',
-                                              day: 'numeric',
-                                              hour: 'numeric',
-                                              minute: '2-digit',
-                                            },
-                                          )
+                                        ? new Date(
+                                            m.scheduledAt,
+                                          ).toLocaleString(undefined, {
+                                            weekday: 'short',
+                                            month: 'short',
+                                            day: 'numeric',
+                                            hour: 'numeric',
+                                            minute: '2-digit',
+                                          })
                                         : 'Open class'}
                                     </span>
                                     <span>· {m.durationMin} min</span>
@@ -490,7 +708,8 @@ function HomeDashboard() {
                                     to="/join/$meetingId"
                                     params={{ meetingId: m.meetingId }}
                                   >
-                                    <Video className="size-3.5" /> Start
+                                    <Video className="size-3.5" />{' '}
+                                    {isTeacher ? 'Start' : 'Join'}
                                   </Link>
                                 </Button>
                                 <Button
@@ -516,17 +735,19 @@ function HomeDashboard() {
                                 >
                                   <Copy className="size-3" /> Copy Invite
                                 </Button>
-                                <Button
-                                  size="xs"
-                                  variant="ghost"
-                                  className="gap-1"
-                                  onClick={() => {
-                                    setEditingMeeting(m)
-                                    setScheduleOpen(true)
-                                  }}
-                                >
-                                  <Pencil className="size-3" /> Edit
-                                </Button>
+                                {isTeacher && (
+                                  <Button
+                                    size="xs"
+                                    variant="ghost"
+                                    className="gap-1"
+                                    onClick={() => {
+                                      setEditingMeeting(m)
+                                      setScheduleOpen(true)
+                                    }}
+                                  >
+                                    <Pencil className="size-3" /> Edit
+                                  </Button>
+                                )}
                                 {m.scheduledAt && (
                                   <Button
                                     size="icon"
@@ -550,17 +771,19 @@ function HomeDashboard() {
                                     <CalendarDays className="size-3.5" />
                                   </Button>
                                 )}
-                                <Button
-                                  size="icon"
-                                  variant="ghost"
-                                  className="ml-auto size-7 text-muted-foreground hover:text-destructive"
-                                  aria-label={`Delete ${m.title}`}
-                                  onClick={() =>
-                                    void handleDeleteMeeting(m.meetingId)
-                                  }
-                                >
-                                  <Trash2 className="size-3.5" />
-                                </Button>
+                                {isTeacher && (
+                                  <Button
+                                    size="icon"
+                                    variant="ghost"
+                                    className="ml-auto size-7 text-muted-foreground hover:text-destructive"
+                                    aria-label={`Delete ${m.title}`}
+                                    onClick={() =>
+                                      void handleDeleteMeeting(m.meetingId)
+                                    }
+                                  >
+                                    <Trash2 className="size-3.5" />
+                                  </Button>
+                                )}
                               </div>
                             </li>
                           ))}
@@ -572,7 +795,7 @@ function HomeDashboard() {
                           variant="ghost"
                           size="sm"
                           className="mt-2 w-full"
-                          onClick={() => setActiveTab('meetings')}
+                          onClick={() => handleTabChange('meetings')}
                         >
                           View all {upcoming.length} meetings
                         </Button>
@@ -610,19 +833,26 @@ function HomeDashboard() {
           <div className="mx-auto max-w-content px-4 py-8 sm:px-6">
             <MeetingsTab
               meetings={meetings}
+              onBack={handleBackTab}
               onEdit={(m) => {
                 setEditingMeeting(m)
                 setScheduleOpen(true)
               }}
               onDelete={(id) => void handleDeleteMeeting(id)}
               onRefresh={() => void refreshMeetings()}
+              onStartWithPmi={() => void startNewMeeting('pmi')}
+              onOpenJoin={() => {
+                setJoinError(null)
+                setJoinOpen(true)
+              }}
+              onOpenAuth={openAuthModal}
             />
           </div>
         )}
 
         {activeTab === 'chat' && (
           <div className="mx-auto max-w-content px-4 py-8 sm:px-6">
-            <ChatTab meetings={meetings} />
+            <ChatTab meetings={meetings} onBack={handleBackTab} />
           </div>
         )}
 
@@ -630,6 +860,7 @@ function HomeDashboard() {
           <div className="mx-auto max-w-content px-4 py-6 sm:px-6">
             <WhiteboardsTab
               meetings={meetings}
+              onBack={handleBackTab}
               onFullscreenChange={setWhiteboardFullscreen}
             />
           </div>
@@ -637,13 +868,13 @@ function HomeDashboard() {
 
         {activeTab === 'recordings' && (
           <div className="mx-auto max-w-content px-4 py-8 sm:px-6">
-            <RecordingsTab />
+            <RecordingsTab onBack={handleBackTab} />
           </div>
         )}
 
         {activeTab === 'settings' && (
           <div className="mx-auto max-w-content px-4 py-8 sm:px-6">
-            <SettingsTab />
+            <SettingsTab onBack={handleBackTab} onOpenAuth={openAuthModal} />
           </div>
         )}
       </main>
@@ -657,7 +888,7 @@ function HomeDashboard() {
 
       {/* Mobile-only fixed bottom navigation (auto-hidden during full-screen whiteboard; never mounted in meetings/lobbies) */}
       {!whiteboardFullscreen && (
-        <MobileBottomNav activeTab={activeTab} onTabChange={setActiveTab} />
+        <MobileBottomNav activeTab={activeTab} onTabChange={handleTabChange} />
       )}
 
       {/* Controlled Schedule / Edit Meeting Dialog */}
@@ -668,15 +899,31 @@ function HomeDashboard() {
         onSaved={() => void refreshMeetings()}
       />
 
+      {/* Unified Auth Modal (Teacher, Student & Guest) */}
+      <AuthModal
+        open={authModalOpen}
+        onOpenChange={setAuthModalOpen}
+        initialMode={authModalMode}
+      />
+
       {/* Join Meeting Dialog */}
       <Dialog open={joinOpen} onOpenChange={setJoinOpen}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>Join a class</DialogTitle>
-            <DialogDescription>
-              Paste the invite link or enter the 10-letter meeting ID shared by
-              your teacher.
-            </DialogDescription>
+            <div className="flex items-center gap-2.5 pr-6">
+              <BackButton
+                onClick={() => setJoinOpen(false)}
+                ariaLabel="Back to dashboard"
+                className="size-10 sm:hidden"
+              />
+              <div>
+                <DialogTitle>Join a class</DialogTitle>
+                <DialogDescription>
+                  Paste an invite link or enter the meeting ID (such as
+                  LEC-4829-7315) shared by your teacher.
+                </DialogDescription>
+              </div>
+            </div>
           </DialogHeader>
           <form onSubmit={handleJoinSubmit} className="space-y-4">
             <Input
@@ -686,7 +933,7 @@ function HomeDashboard() {
                 setJoinValue(e.target.value)
                 if (joinError) setJoinError(null)
               }}
-              placeholder="e.g. abc-defg-hij or full invite URL"
+              placeholder="e.g. LEC-4829-7315 or full invite URL"
             />
             {joinError && (
               <p role="alert" className="text-sm text-destructive">

@@ -12,6 +12,7 @@ import {
 } from 'lucide-react'
 
 import { AvatarBubble } from '@/components/avatar-bubble'
+import { useUserProfile } from '@/lib/profile'
 import { cn } from '@/lib/utils'
 import type { TileModel } from './types'
 
@@ -71,6 +72,7 @@ export const ParticipantTile = memo(function ParticipantTile({
   large,
   className,
 }: TileProps) {
+  const profile = useUserProfile()
   const showVideo = tile.camOn && video
   return (
     <div
@@ -96,6 +98,8 @@ export const ParticipantTile = memo(function ParticipantTile({
           <AvatarBubble
             name={tile.name}
             seed={tile.id}
+            color={tile.isLocal ? profile.avatarColor : undefined}
+            photo={tile.isLocal ? profile.avatarPhoto : undefined}
             className={cn(
               large
                 ? 'size-24 text-3xl'

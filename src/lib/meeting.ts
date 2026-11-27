@@ -1,47 +1,120 @@
-/** Meeting IDs look like `kqv-mhzp-dwr`: easy to read aloud and type on a phone. */
-const ALPHABET = 'abcdefghijkmnpqrstuvwxyz' // no l/o to avoid confusion
+/**
+ * Branded alphanumeric Meeting IDs look like `LEC-7K4M-9284` or `LEC-4829-7315`.
+ * Excludes confusing characters (0, O, 1, I, L) when generating so codes are
+ * crisp, professional, and easy to read aloud.
+ */
+const LETTERS = 'ABCDEFGHJKMNPQRSTUVWXYZ'
+const DIGITS = '23456789'
+const ALPHANUM = `${DIGITS}${LETTERS}`
 
-function chunk(length: number) {
-  let out = ''
+function randomBytes(length: number): Uint8Array {
   const values = new Uint8Array(length)
   if (typeof crypto !== 'undefined' && 'getRandomValues' in crypto) {
     crypto.getRandomValues(values)
   } else {
-    for (let i = 0; i < length; i++) values[i] = Math.floor(Math.random() * 256)
+    for (let i = 0; i < length; i++) {
+      values[i] = Math.floor(Math.random() * 256)
+    }
   }
+  return values
+}
+
+function segment(length: number, alphabet: string): string {
+  const bytes = randomBytes(length)
+  let out = ''
   for (let i = 0; i < length; i++) {
-    out += ALPHABET[values[i] % ALPHABET.length]
+    out += alphabet[bytes[i] % alphabet.length]
   }
   return out
 }
 
-export function generateMeetingId() {
-  return `${chunk(3)}-${chunk(4)}-${chunk(3)}`
+/**
+ * Generates a branded alphanumeric meeting ID (`LEC-XXXX-XXXX`), guaranteeing
+ * a clean text + numbers mix (e.g. `LEC-7K4M-9284`).
+ */
+export function generateMeetingId(): string {
+  const raw = Array.from(segment(8, ALPHANUM))
+  const hasLetter = raw.some((c) => LETTERS.includes(c))
+  const hasDigit = raw.some((c) => DIGITS.includes(c))
+  const fix = randomBytes(2)
+  if (!hasLetter) raw[1] = LETTERS[fix[0] % LETTERS.length]
+  if (!hasDigit) raw[6] = DIGITS[fix[1] % DIGITS.length]
+  const code = raw.join('')
+  return `LEC-${code.slice(0, 4)}-${code.slice(4, 8)}`
 }
 
 export function generatePasscode() {
   return String(Math.floor(100000 + Math.random() * 900000))
 }
 
-const ID_PATTERN = /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/
+const MODERN_ID_PATTERN = /^LEC-[A-Z0-9]{4}-[A-Z0-9]{4}$/
+const LEGACY_ID_PATTERN = /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/
 
-export function isValidMeetingId(id: string) {
-  return ID_PATTERN.test(id)
+/** True for modern branded `LEC-XXXX-XXXX` IDs. */
+export function isModernMeetingId(id: string): boolean {
+  return MODERN_ID_PATTERN.test(id.trim().toUpperCase())
+}
+
+/** Accepts both modern `LEC-XXXX-XXXX` IDs and legacy `abc-defg-hij` links. */
+export function isValidMeetingId(id: string): boolean {
+  const trimmed = id.trim()
+  return (
+    MODERN_ID_PATTERN.test(trimmed.toUpperCase()) ||
+    LEGACY_ID_PATTERN.test(trimmed.toLowerCase())
+  )
 }
 
 /**
- * Accepts whatever a student pastes: a full invite link, a bare ID, or an ID
- * with spaces/uppercase. Returns a normalized ID or null.
+ * Normalizes a meeting ID or URL parameter to its canonical Firestore document ID:
+ * - `lec48297315`, `LEC 4829 7315`, `lec-4829-7315` -> `LEC-4829-7315`
+ * - legacy `abc-defg-hij` -> `abc-defg-hij`
+ */
+export function normalizeMeetingId(raw: string): string | null {
+  return parseMeetingInput(raw)
+}
+
+/**
+ * Accepts whatever a student or teacher pastes: a full invite link, a bare ID
+ * (`LEC-4829-7315`), spaces (`LEC 4829 7315`), no separators (`lec48297315`),
+ * or a legacy 10-letter ID. Returns the canonical ID or null.
  */
 export function parseMeetingInput(raw: string): string | null {
   const text = raw.trim()
   if (!text) return null
-  const urlMatch = text.match(/\/(?:join|meet)\/([a-z]{3}-[a-z]{4}-[a-z]{3})/i)
-  if (urlMatch) return urlMatch[1].toLowerCase()
-  const compact = text.toLowerCase().replace(/[^a-z]/g, '')
-  if (compact.length === 10) {
-    return `${compact.slice(0, 3)}-${compact.slice(3, 7)}-${compact.slice(7)}`
+
+  // Match branded ID in invite URLs
+  const brandedUrlMatch = text.match(
+    /\/(?:join|meet)\/(LEC[\s-]?[A-Z0-9]{4}[\s-]?[A-Z0-9]{4})/i,
+  )
+  if (brandedUrlMatch) {
+    const clean = brandedUrlMatch[1].toUpperCase().replace(/[\s-]+/g, '')
+    if (clean.length === 11 && clean.startsWith('LEC')) {
+      return `LEC-${clean.slice(3, 7)}-${clean.slice(7, 11)}`
+    }
   }
+
+  // Match legacy 10-letter ID in invite URLs
+  const legacyUrlMatch = text.match(/\/(?:join|meet)\/([a-z]{3}-[a-z]{4}-[a-z]{3})/i)
+  if (legacyUrlMatch) return legacyUrlMatch[1].toLowerCase()
+
+  const compact = text.toUpperCase().replace(/[\s-]+/g, '')
+
+  // Branded `LEC` + 8 alphanumeric chars (e.g. `lec48297315`, `LEC 7K4M 9284`)
+  if (/^LEC[A-Z0-9]{8}$/.test(compact)) {
+    return `LEC-${compact.slice(3, 7)}-${compact.slice(7, 11)}`
+  }
+
+  // Shorthand 8 alphanumeric chars without prefix (e.g. `4829-7315` or `7K4M9284`)
+  if (/^[A-Z0-9]{8}$/.test(compact)) {
+    return `LEC-${compact.slice(0, 4)}-${compact.slice(4, 8)}`
+  }
+
+  // Legacy 10-letter format (`abc-defg-hij` or `abcdefghij`)
+  if (/^[A-Z]{10}$/.test(compact)) {
+    const lower = compact.toLowerCase()
+    return `${lower.slice(0, 3)}-${lower.slice(3, 7)}-${lower.slice(7)}`
+  }
+
   return null
 }
 

@@ -13,6 +13,7 @@ import {
 } from 'lucide-react'
 
 import { SiteHeader } from '@/components/site-header'
+import { BackButton } from '@/components/back-button'
 import { DeviceSettings } from '@/components/device-settings'
 import { MediaError } from '@/components/media-error'
 import { AvatarBubble } from '@/components/avatar-bubble'
@@ -30,15 +31,16 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog'
 import { getMeeting } from '@/lib/meetings.functions'
+import { normalizeMeetingId } from '@/lib/meeting'
 import type { MeetingSummary } from '@/lib/meeting-types'
 import { useAttachStream, useLocalMedia } from '@/lib/use-local-media'
 import { useSpeaking } from '@/lib/use-speaking'
 import {
-  loadPrefsCached,
   savePrefs,
+  useJoinPrefs,
   type JoinPrefs,
-  defaultPrefs,
 } from '@/lib/prefs'
+import { useUserProfile } from '@/lib/profile'
 import { useClientValue } from '@/lib/use-client-value'
 import { loadHostKey } from '@/lib/host-keys'
 import { useMounted } from '@/lib/use-mounted'
@@ -49,7 +51,8 @@ type LobbyMeeting = MeetingSummary & { youAreHost: boolean }
 export const Route = createFileRoute('/join/$meetingId')({
   loader: async ({ params }) => {
     try {
-      return await getMeeting({ data: { meetingId: params.meetingId } })
+      const id = normalizeMeetingId(params.meetingId) ?? params.meetingId
+      return await getMeeting({ data: { meetingId: id } })
     } catch {
       return null
     }
@@ -62,13 +65,15 @@ export const Route = createFileRoute('/join/$meetingId')({
 
 function Lobby() {
   const initialMeeting = Route.useLoaderData()
-  const { meetingId } = Route.useParams()
+  const { meetingId: rawMeetingId } = Route.useParams()
+  const meetingId = normalizeMeetingId(rawMeetingId) ?? rawMeetingId
   const navigate = useNavigate()
   const mounted = useMounted()
-  const { user, ready } = useIdentity()
+  const { user, authStatus, ready, signInAsGuest } = useIdentity()
 
   const [meeting, setMeeting] = useState<LobbyMeeting | null>(initialMeeting)
   const [loadingMeeting, setLoadingMeeting] = useState(!initialMeeting)
+  const [joiningGuest, setJoiningGuest] = useState(false)
 
   // Client-side fetch ensures meetings created in this browser or Firestore load reliably after hydration.
   useEffect(() => {
@@ -86,21 +91,36 @@ function Lobby() {
     }
   }, [meetingId, initialMeeting])
 
-  const stored = useClientValue(loadPrefsCached, defaultPrefs)
+  const stored = useJoinPrefs()
+  const profile = useUserProfile()
   const hostKey = useClientValue(() => loadHostKey(meetingId), null)
   const [edits, setEdits] = useState<Partial<JoinPrefs>>({})
   const [passcode, setPasscode] = useState('')
   const [blurPreview, setBlurPreview] = useState(false)
 
+  const isLoggedOut = ready && authStatus === 'loggedOut'
   const prefs: JoinPrefs = {
     ...stored,
     ...edits,
     name:
-      edits.name ?? (stored.name || (ready && user ? displayName(user) : '')),
+      edits.name ??
+      (isLoggedOut
+        ? ''
+        : profile.displayName.trim() ||
+          stored.name ||
+          (ready && user ? displayName(user) : '')),
   }
   const setPrefs = (update: (p: JoinPrefs) => JoinPrefs) => {
     const next = update(prefs)
     setEdits((e) => ({ ...e, ...next }))
+  }
+
+  function handleBack() {
+    if (typeof window !== 'undefined' && window.history.length > 1) {
+      window.history.back()
+    } else {
+      void navigate({ to: '/' })
+    }
   }
 
   const isHost = !!hostKey || !!meeting?.youAreHost
@@ -129,7 +149,10 @@ function Lobby() {
     return (
       <div className="min-h-svh bg-background">
         <SiteHeader />
-        <main className="mx-auto flex max-w-md flex-col items-center gap-4 px-4 py-24 text-center">
+        <div className="mx-auto max-w-content px-4 pt-4 sm:px-6">
+          <BackButton onClick={handleBack} label="Back" />
+        </div>
+        <main className="mx-auto flex max-w-md flex-col items-center gap-4 px-4 py-20 text-center">
           <span className="grid size-14 place-items-center rounded-2xl bg-primary/10 text-primary">
             <DoorClosed className="size-7" />
           </span>
@@ -149,24 +172,37 @@ function Lobby() {
 
   const name = prefs.name.trim()
   const canJoin =
+    !joiningGuest &&
     name.length > 0 &&
     (!meeting.hasPasscode || isHost || passcode.trim().length > 0)
 
-  function join() {
+  async function join() {
     if (!canJoin) return
-    savePrefs({ ...prefs, name })
+    setJoiningGuest(true)
     try {
-      if (passcode.trim())
-        sessionStorage.setItem(`lectern-passcode:${meetingId}`, passcode.trim())
-      if (blurPreview) {
-        sessionStorage.setItem(`lectern-blur:${meetingId}`, '1')
-      } else {
-        sessionStorage.removeItem(`lectern-blur:${meetingId}`)
+      // Direct meeting link opened while logged out: establish an explicit Guest session smoothly.
+      if (authStatus === 'loggedOut' || !user) {
+        await signInAsGuest(name)
       }
-    } catch {
-      // ignore
+      savePrefs({ ...prefs, name })
+      try {
+        if (passcode.trim())
+          sessionStorage.setItem(
+            `lectern-passcode:${meetingId}`,
+            passcode.trim(),
+          )
+        if (blurPreview) {
+          sessionStorage.setItem(`lectern-blur:${meetingId}`, '1')
+        } else {
+          sessionStorage.removeItem(`lectern-blur:${meetingId}`)
+        }
+      } catch {
+        // ignore
+      }
+      await navigate({ to: '/meet/$meetingId', params: { meetingId } })
+    } finally {
+      setJoiningGuest(false)
     }
-    void navigate({ to: '/meet/$meetingId', params: { meetingId } })
   }
 
   const ended = !!meeting.endedAt
@@ -175,7 +211,10 @@ function Lobby() {
   return (
     <div className="min-h-svh bg-background">
       <SiteHeader />
-      <main className="mx-auto grid max-w-content gap-8 px-4 py-8 sm:px-6 lg:grid-cols-[1.25fr_1fr] lg:items-start lg:py-14">
+      <div className="mx-auto max-w-content px-4 pt-4 sm:px-6 lg:pt-6">
+        <BackButton onClick={handleBack} label="Back" />
+      </div>
+      <main className="mx-auto grid max-w-content gap-8 px-4 pb-10 pt-4 sm:px-6 lg:grid-cols-[1.25fr_1fr] lg:items-start lg:py-8">
         <section
           aria-label="Camera preview"
           className="animate-fade-up motion-reduce:animate-none"
@@ -201,6 +240,8 @@ function Lobby() {
                     <AvatarBubble
                       name={name || 'You'}
                       seed={name || 'you'}
+                      color={profile.avatarColor}
+                      photo={profile.avatarPhoto}
                       className="size-20 text-2xl"
                     />
                     <span className="text-sm opacity-80">
@@ -290,7 +331,13 @@ function Lobby() {
                   In progress
                 </Badge>
               )}
-              {isHost && <Badge variant="secondary">You are the teacher</Badge>}
+              {isHost && <Badge variant="secondary">Teacher · Host</Badge>}
+              {!isHost && user?.role === 'student' && (
+                <Badge variant="secondary">Student</Badge>
+              )}
+              {!isHost && (isLoggedOut || user?.isGuest) && (
+                <Badge variant="secondary">Joining as Guest</Badge>
+              )}
               {ended && <Badge variant="outline">Ended</Badge>}
             </div>
             <h1 className="font-display text-2xl font-semibold leading-tight sm:text-3xl">
@@ -320,7 +367,7 @@ function Lobby() {
             <form
               onSubmit={(e) => {
                 e.preventDefault()
-                join()
+                void join()
               }}
               className="space-y-4"
             >

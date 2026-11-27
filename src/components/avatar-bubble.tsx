@@ -11,13 +11,35 @@ export function hueFor(seed: string) {
 export function AvatarBubble({
   name,
   seed,
+  color,
+  photo,
   className,
 }: {
   name: string
   seed?: string
+  color?: string
+  photo?: string | null
   className?: string
 }) {
   const hue = hueFor(seed ?? name)
+  if (photo) {
+    return (
+      <span
+        aria-hidden
+        className={cn(
+          'inline-block shrink-0 overflow-hidden rounded-full bg-muted',
+          className,
+        )}
+      >
+        <img
+          src={photo}
+          alt=""
+          className="h-full w-full object-cover"
+          draggable={false}
+        />
+      </span>
+    )
+  }
   return (
     <span
       aria-hidden
@@ -25,7 +47,7 @@ export function AvatarBubble({
         'grid shrink-0 place-items-center rounded-full font-display font-semibold text-white',
         className,
       )}
-      style={{ background: `oklch(0.52 0.12 ${hue})` }}
+      style={{ background: color ?? `oklch(0.52 0.12 ${hue})` }}
     >
       {initials(name) || '?'}
     </span>

@@ -10,45 +10,52 @@ import {
 } from 'react'
 import {
   ArrowUpRight,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Circle,
-  Copy,
   Diamond,
   Download,
   Eraser,
+  Eye,
   FilePlus2,
+  FileUp,
+  FolderKanban,
+  Frame,
   Grid2X2,
   Hand,
   Highlighter,
   ImagePlus,
   LayoutTemplate,
-  Lock,
-  LockOpen,
+  Magnet,
   Maximize2,
   MessageCircle,
   Minus,
   Moon,
   MousePointer2,
+  Navigation,
   Pen,
+  PenTool,
+  Pencil,
   Plus,
+  RectangleHorizontal,
   Redo2,
   RotateCcw,
+  Sigma,
   Sparkles,
   Square,
   Star,
   StickyNote,
   Sun,
+  Table2,
   Trash2,
   Triangle,
   Type,
   Undo2,
   Upload,
-  X,
-  BringToFront,
-  SendToBack,
-  RectangleHorizontal,
-  FolderKanban,
-  Eye,
   Users,
+  Wand2,
+  X,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -85,8 +92,26 @@ import {
   upsertWhiteboardElementsBatch,
 } from '@/services/firestore-meetings'
 import { newPage, type WbOp, type WbPage } from './engine'
+import { FramesSidebar } from './frames-sidebar'
+import {
+  alignElements,
+  computeSnapAndGuides,
+  createMindMapBranch,
+  distributeElements,
+  findNearestAnchor,
+  getElementAnchorPoints,
+  isConnectableShape,
+  recognizeSmartShape,
+  reorderElementsZ,
+  updateAttachedConnectors,
+  type AlignmentGuide,
+  type AlignmentKind,
+  type LayerDirection,
+} from './geometry-utils'
+import { ImageCropOverlay } from './image-crop-overlay'
 import {
   BOARD_COLORS,
+  MATH_SYMBOLS,
   STICKY_COLORS,
   createTemplateElements,
   drawBoardElement,
@@ -95,12 +120,14 @@ import {
   exportBoardSvg,
   getContentBounds,
   getElementBounds,
+  getVisibleElements,
   hitTestElement,
   makeElementId,
   parseBoardJson,
   rectsIntersect,
   renderExportCanvas,
   resizeElementToBounds,
+  resolveDeckPageImage,
   translateElement,
   type BoardElement,
   type BoardPattern,
@@ -109,11 +136,23 @@ import {
   type ElementKind,
   type InfiniteTool,
   type LaserTrail,
+  type PenPreset,
   type Rect,
   type StrokeStyle,
   type TemplateKind,
 } from './infinite-engine'
 import { buildPdf } from './pdf'
+import {
+  PdfImportDialog,
+  type PdfImportConfirmPayload,
+} from './pdf-import-dialog'
+import { parsePdfFile, type ParsedPdfSession } from './pdf-importer'
+import { RichTextInlineEditor, type RichTextDraft } from './rich-text-editor'
+import {
+  CanvasContextMenu,
+  SelectionFloatingToolbar,
+} from './selection-toolbar'
+import { TableInlineEditor } from './table-editor'
 
 export interface WhiteboardHandle {
   apply: (op: WbOp) => void
@@ -135,8 +174,19 @@ export interface WhiteboardProps {
   allowParticipantsAnnotate?: boolean
   onToggleParticipantsAnnotate?: (allowed: boolean) => void
   onOpenBoardPicker?: () => void
-  onCameraBroadcast?: (cx: number, cy: number, zoom: number) => void
-  remotePresenterCamera?: { cx: number; cy: number; zoom: number; at: number } | null
+  onCameraBroadcast?: (
+    cx: number,
+    cy: number,
+    zoom: number,
+    force?: boolean,
+  ) => void
+  remotePresenterCamera?: {
+    cx: number
+    cy: number
+    zoom: number
+    at: number
+    force?: boolean
+  } | null
   onClose?: () => void
   handle?: Ref<WhiteboardHandle>
   className?: string
@@ -150,7 +200,11 @@ const SHAPE_TOOLS: {
   icon: typeof Square
 }[] = [
   { tool: 'rect', label: 'Rectangle', icon: Square },
-  { tool: 'rounded-rect', label: 'Rounded rectangle', icon: RectangleHorizontal },
+  {
+    tool: 'rounded-rect',
+    label: 'Rounded rectangle',
+    icon: RectangleHorizontal,
+  },
   { tool: 'ellipse', label: 'Circle / Ellipse', icon: Circle },
   { tool: 'triangle', label: 'Triangle', icon: Triangle },
   { tool: 'diamond', label: 'Diamond', icon: Diamond },
@@ -158,6 +212,40 @@ const SHAPE_TOOLS: {
   { tool: 'speech-bubble', label: 'Speech bubble', icon: MessageCircle },
 ]
 
+const PEN_PRESETS: {
+  id: PenPreset
+  label: string
+  desc: string
+  icon: typeof Pen
+}[] = [
+  { id: 'smooth', label: 'Smooth Pen', desc: 'Crisp vector ink', icon: Pen },
+  {
+    id: 'calligraphy',
+    label: 'Calligraphy / Fountain',
+    desc: 'Velocity-sensitive nib',
+    icon: PenTool,
+  },
+  {
+    id: 'marker',
+    label: 'Marker / Chisel Tip',
+    desc: 'Bold translucent chisel',
+    icon: Highlighter,
+  },
+  {
+    id: 'pencil',
+    label: 'Pencil / Sketch',
+    desc: 'Textured graphite feel',
+    icon: Pencil,
+  },
+  {
+    id: 'smart-shape',
+    label: 'Smart Shape Pen',
+    desc: 'Auto-snaps rough shapes',
+    icon: Wand2,
+  },
+]
+
+const THICKNESS_DOTS = [2, 4, 8, 14]
 const MIN_ZOOM = 0.1
 const MAX_ZOOM = 5.0
 
@@ -165,7 +253,9 @@ function clampZoom(z: number) {
   return Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z))
 }
 
-function getHandlePositions(b: Rect): Record<HandleId, { x: number; y: number }> {
+function getHandlePositions(
+  b: Rect,
+): Record<HandleId, { x: number; y: number }> {
   const mx = b.x + b.w / 2
   const my = b.y + b.h / 2
   return {
@@ -196,7 +286,7 @@ async function compressImageFile(
     el.onerror = () => reject(new Error('Could not decode image'))
     el.src = rawUrl
   })
-  const maxDim = 900
+  const maxDim = 960
   const scale = Math.min(1, maxDim / Math.max(img.width, img.height))
   const w = Math.max(1, Math.round(img.width * scale))
   const h = Math.max(1, Math.round(img.height * scale))
@@ -204,13 +294,15 @@ async function compressImageFile(
   canvas.width = w
   canvas.height = h
   canvas.getContext('2d')!.drawImage(img, 0, 0, w, h)
-  const dataUrl = canvas.toDataURL('image/jpeg', 0.8)
-  return { dataUrl, width: Math.min(420, w), height: Math.min(420, h) }
+  const dataUrl = canvas.toDataURL('image/jpeg', 0.82)
+  return { dataUrl, width: Math.min(460, w), height: Math.min(460, h) }
 }
 
 /**
- * Full infinite whiteboard with real-time Firestore sync, rich shapes,
- * sticky notes, images, templates, laser pointer, minimap, and export.
+ * Complete infinite whiteboard with real-time Firestore sync, Zoom-level
+ * drawing presets, PDF deck/canvas import, floating object controls,
+ * rich inline text, lesson frames, editable tables, smart connectors,
+ * snap alignment guides, and presenter camera sync.
  */
 export function Whiteboard({
   canDraw,
@@ -235,15 +327,20 @@ export function Whiteboard({
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const minimapRef = useRef<HTMLCanvasElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const replaceImgInputRef = useRef<HTMLInputElement>(null)
+  const pdfInputRef = useRef<HTMLInputElement>(null)
   const jsonInputRef = useRef<HTMLInputElement>(null)
   const viewportRef = useRef({ width: 0, height: 0 })
+  const [viewportSize, setViewportSize] = useState({ width: 1000, height: 640 })
 
   const [elements, setElements] = useState<BoardElement[]>([])
   const elementsRef = useRef<BoardElement[]>(elements)
   const [selectedIds, setSelectedIds] = useState<string[]>([])
   const selectedIdsRef = useRef<string[]>(selectedIds)
+  const [clipboard, setClipboard] = useState<BoardElement[]>([])
 
   const [tool, setTool] = useState<InfiniteTool>('pen')
+  const [penPreset, setPenPreset] = useState<PenPreset>('smooth')
   const [lastShapeTool, setLastShapeTool] = useState<InfiniteTool>('rect')
   const [strokeColor, setStrokeColor] = useState(BOARD_COLORS[0])
   const [fillColor, setFillColor] = useState<string>('transparent')
@@ -258,6 +355,33 @@ export function Whiteboard({
       ? 'dark'
       : 'light',
   )
+  const [snapToGrid, setSnapToGrid] = useState(false)
+  const [framesOpen, setFramesOpen] = useState(false)
+
+  // Table insertion picker state
+  const [tableRowsPick, setTableRowsPick] = useState(3)
+  const [tableColsPick, setTableColsPick] = useState(3)
+  const [editingTableId, setEditingTableId] = useState<string | null>(null)
+
+  // Image crop / replace state
+  const [croppingId, setCroppingId] = useState<string | null>(null)
+  const replaceTargetIdRef = useRef<string | null>(null)
+
+  // Context menu state
+  const [contextMenu, setContextMenu] = useState<{
+    x: number
+    y: number
+  } | null>(null)
+
+  // PDF import dialog state
+  const [pdfDialogOpen, setPdfDialogOpen] = useState(false)
+  const [pdfLoadingFile, setPdfLoadingFile] = useState(false)
+  const [pdfSession, setPdfSession] = useState<ParsedPdfSession | null>(null)
+  const [pdfImporting, setPdfImporting] = useState(false)
+  const [pdfProgress, setPdfProgress] = useState<{
+    done: number
+    total: number
+  } | null>(null)
 
   const [camera, setCamera] = useState<Camera>({ panX: 0, panY: 0, zoom: 1 })
   const cameraRef = useRef<Camera>(camera)
@@ -268,7 +392,10 @@ export function Whiteboard({
     cy: number
     zoom: number
     at: number
+    force?: boolean
   } | null>(null)
+  const lastForcedCamAtRef = useRef<number>(0)
+
   const [spacePressed, setSpacePressed] = useState(false)
   const [clearConfirmOpen, setClearConfirmOpen] = useState(false)
   const [showMinimap, setShowMinimap] = useState(true)
@@ -281,22 +408,17 @@ export function Whiteboard({
   const lastFsLaserAtRef = useRef(0)
   const activeEditingIdsRef = useRef<Set<string>>(new Set())
 
+  // Alignment guides & connector anchor hover indicators drawn on canvas
+  const guidesRef = useRef<AlignmentGuide[]>([])
+  const hoveredAnchorRef = useRef<{ x: number; y: number } | null>(null)
+
   // Undo / Redo snapshot history
   const undoStackRef = useRef<BoardElement[][]>([])
   const redoStackRef = useRef<BoardElement[][]>([])
   const [historySizes, setHistorySizes] = useState({ undo: 0, redo: 0 })
 
-  // Inline text / sticky editor
-  const [textEdit, setTextEdit] = useState<{
-    elementId: string | null
-    kind: 'text' | 'sticky' | 'shape'
-    wx: number
-    wy: number
-    w: number
-    h: number
-    value: string
-    stickyBg?: string
-  } | null>(null)
+  // Rich inline text / sticky editor
+  const [textEdit, setTextEdit] = useState<RichTextDraft | null>(null)
 
   // Local laser trail points
   const localLaserRef = useRef<{ x: number; y: number; at: number }[]>([])
@@ -304,6 +426,9 @@ export function Whiteboard({
 
   // Active pointer interaction
   const draftRef = useRef<BoardElement | null>(null)
+  const lastDrawSampleRef = useRef<{ x: number; y: number; t: number } | null>(
+    null,
+  )
   const marqueeRef = useRef<Rect | null>(null)
   const interactionRef = useRef<{
     mode:
@@ -327,7 +452,14 @@ export function Whiteboard({
     erasedIds?: Set<string>
   } | null>(null)
   const activeTouchesRef = useRef(new Map<number, { x: number; y: number }>())
-  const pinchStartRef = useRef<{ dist: number; zoom: number; cx: number; cy: number; panX: number; panY: number } | null>(null)
+  const pinchStartRef = useRef<{
+    dist: number
+    zoom: number
+    cx: number
+    cy: number
+    panX: number
+    panY: number
+  } | null>(null)
 
   useLayoutEffect(() => {
     elementsRef.current = elements
@@ -367,7 +499,6 @@ export function Whiteboard({
     const unsubEls = subscribeWhiteboardElements<BoardElement>(
       syncScope,
       (remote) => {
-        // Keep locally in-flight drawn/dragged elements authoritative until pointerUp
         const activeIds = activeEditingIdsRef.current
         const draftId = draftRef.current?.id
         if (activeIds.size === 0 && !draftId) {
@@ -388,15 +519,13 @@ export function Whiteboard({
         ? subscribeWhiteboardMeta(syncScope.boardId, (meta) => {
             if (meta.backgroundType) setPattern(meta.backgroundType)
             if (meta.boardTheme) setBoardTheme(meta.boardTheme)
-            if (
-              meta.presenterCamera &&
-              meta.presenterCamera.by !== author
-            ) {
+            if (meta.presenterCamera && meta.presenterCamera.by !== author) {
               setFsPresenterCam({
                 cx: meta.presenterCamera.cx,
                 cy: meta.presenterCamera.cy,
                 zoom: meta.presenterCamera.zoom,
                 at: meta.presenterCamera.at,
+                force: meta.presenterCamera.force,
               })
             }
             if (
@@ -446,7 +575,8 @@ export function Whiteboard({
 
   const syncDelete = useCallback(
     (ids: string[]) => {
-      if (syncScope && ids.length > 0) void deleteWhiteboardElements(syncScope, ids)
+      if (syncScope && ids.length > 0)
+        void deleteWhiteboardElements(syncScope, ids)
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [syncKey],
@@ -484,16 +614,47 @@ export function Whiteboard({
     lastCamBroadcastRef.current = now
     const cx = (rect.width / 2 - camera.panX) / camera.zoom
     const cy = (rect.height / 2 - camera.panY) / camera.zoom
-    onCameraBroadcast?.(cx, cy, camera.zoom)
+    onCameraBroadcast?.(cx, cy, camera.zoom, false)
     if (syncScope?.kind === 'board') {
       void updateWhiteboardMeta(syncScope.boardId, {
-        presenterCamera: { cx, cy, zoom: camera.zoom, by: author, at: now },
+        presenterCamera: {
+          cx,
+          cy,
+          zoom: camera.zoom,
+          by: author,
+          at: now,
+          force: false,
+        },
       })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [camera, isTeacher, author, syncKey, onCameraBroadcast])
 
-  // Apply Follow Presenter viewport when enabled for participants
+  const bringEveryoneToMe = useCallback(() => {
+    const rect = containerRef.current?.getBoundingClientRect()
+    if (!rect || rect.width <= 0 || rect.height <= 0) return
+    const cam = cameraRef.current
+    const cx = (rect.width / 2 - cam.panX) / cam.zoom
+    const cy = (rect.height / 2 - cam.panY) / cam.zoom
+    const now = Date.now()
+    onCameraBroadcast?.(cx, cy, cam.zoom, true)
+    if (syncScope?.kind === 'board') {
+      void updateWhiteboardMeta(syncScope.boardId, {
+        presenterCamera: {
+          cx,
+          cy,
+          zoom: cam.zoom,
+          by: author,
+          at: now,
+          force: true,
+        },
+      })
+    }
+    toast.success('Brought everyone to your current view')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [author, onCameraBroadcast, syncKey])
+
+  // Apply Follow Presenter viewport OR forced "Bring Everyone to Me" camera jump
   const latestPresenterCam = useMemo(() => {
     if (remotePresenterCamera && fsPresenterCam) {
       return remotePresenterCamera.at >= fsPresenterCam.at
@@ -504,9 +665,17 @@ export function Whiteboard({
   }, [remotePresenterCamera, fsPresenterCam])
 
   useEffect(() => {
-    if (!followPresenter || isTeacher || !latestPresenterCam) return
+    if (isTeacher || !latestPresenterCam) return
+    const isForcedJump =
+      Boolean(latestPresenterCam.force) &&
+      latestPresenterCam.at > lastForcedCamAtRef.current
+    if (!followPresenter && !isForcedJump) return
     const rect = containerRef.current?.getBoundingClientRect()
     if (!rect || rect.width <= 0 || rect.height <= 0) return
+    if (isForcedJump) {
+      lastForcedCamAtRef.current = latestPresenterCam.at
+      toast.info('Presenter brought your view to this section')
+    }
     const z = clampZoom(latestPresenterCam.zoom)
     setCamera({
       zoom: z,
@@ -578,7 +747,7 @@ export function Whiteboard({
     setSelectedIds([])
   }, [applyElementsReplace])
 
-  // ---- Coordinate conversions (1:1 against canvas.getBoundingClientRect) ---
+  // ---- Coordinate conversions ----------------------------------------------
   const screenToWorld = useCallback((clientX: number, clientY: number) => {
     const rect =
       canvasRef.current?.getBoundingClientRect() ??
@@ -588,6 +757,17 @@ export function Whiteboard({
     return {
       x: (clientX - rect.left - c.panX) / c.zoom,
       y: (clientY - rect.top - c.panY) / c.zoom,
+    }
+  }, [])
+
+  const getViewportCenterWorld = useCallback(() => {
+    const rect =
+      canvasRef.current?.getBoundingClientRect() ??
+      containerRef.current?.getBoundingClientRect()
+    if (!rect || rect.width <= 0 || rect.height <= 0) return { x: 0, y: 0 }
+    return {
+      x: (rect.width / 2 - cameraRef.current.panX) / cameraRef.current.zoom,
+      y: (rect.height / 2 - cameraRef.current.panY) / cameraRef.current.zoom,
     }
   }, [])
 
@@ -623,22 +803,16 @@ export function Whiteboard({
     setCamera({ panX: rect.width / 2, panY: rect.height / 2, zoom: 1 })
   }, [])
 
-  const fitToContent = useCallback(() => {
+  const jumpToRect = useCallback((bounds: Rect, pad = 72) => {
     const rect =
       canvasRef.current?.getBoundingClientRect() ??
       containerRef.current?.getBoundingClientRect()
     if (!rect || rect.width <= 0 || rect.height <= 0) return
     const { width, height } = rect
-    const bounds = getContentBounds(elementsRef.current)
-    if (!bounds) {
-      resetView()
-      return
-    }
-    const pad = 72
     const zoom = clampZoom(
       Math.min(
-        (width - pad * 2) / bounds.w,
-        (height - pad * 2) / bounds.h,
+        (width - pad * 2) / Math.max(40, bounds.w),
+        (height - pad * 2) / Math.max(40, bounds.h),
         1.5,
       ),
     )
@@ -647,7 +821,16 @@ export function Whiteboard({
       panX: width / 2 - (bounds.x + bounds.w / 2) * zoom,
       panY: height / 2 - (bounds.y + bounds.h / 2) * zoom,
     })
-  }, [resetView])
+  }, [])
+
+  const fitToContent = useCallback(() => {
+    const bounds = getContentBounds(elementsRef.current)
+    if (!bounds) {
+      resetView()
+      return
+    }
+    jumpToRect(bounds, 72)
+  }, [jumpToRect, resetView])
 
   const addSection = useCallback(() => {
     const rect =
@@ -663,6 +846,18 @@ export function Whiteboard({
     }))
     toast.success(`Moved to fresh canvas space #${nextIndex + 1}`)
   }, [sectionCount])
+
+  // Detect if a point falls inside an Interactive PDF Deck (for per-page annotations)
+  const findEnclosingPdfDeck = useCallback((wx: number, wy: number) => {
+    const decks = elementsRef.current.filter((e) => e.kind === 'pdf-deck')
+    for (const d of decks) {
+      const b = getElementBounds(d)
+      if (wx >= b.x && wx <= b.x + b.w && wy >= b.y && wy <= b.y + b.h) {
+        return d
+      }
+    }
+    return null
+  }, [])
 
   // ---- Main Canvas & Minimap Painting --------------------------------------
   const paintCanvas = useCallback(() => {
@@ -690,26 +885,82 @@ export function Whiteboard({
     const cam = cameraRef.current
 
     ctx.save()
-    // 1. Reset transform to Retina DPR BEFORE painting full logical viewport
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
     drawInfiniteBackground(ctx, cssW, cssH, cam, pattern, boardTheme)
 
-    // 2. Apply camera transform (pan + zoom) for all world-space objects
     ctx.translate(cam.panX, cam.panY)
     ctx.scale(cam.zoom, cam.zoom)
 
-    const sorted = [...elementsRef.current].sort((a, b) => a.zIndex - b.zIndex)
+    const visible = getVisibleElements(elementsRef.current)
+    const sorted = [...visible].sort((a, b) => a.zIndex - b.zIndex)
     for (const el of sorted) {
-      drawBoardElement(ctx, el, () => setRenderTick((t) => t + 1))
+      const deckImg =
+        el.kind === 'pdf-deck'
+          ? resolveDeckPageImage(elementsRef.current, el)
+          : undefined
+      drawBoardElement(ctx, el, () => setRenderTick((t) => t + 1), deckImg)
     }
     if (draftRef.current) {
       drawBoardElement(ctx, draftRef.current)
     }
 
+    // Smart alignment guides while moving objects
+    if (guidesRef.current.length > 0) {
+      const invZ = 1 / cam.zoom
+      ctx.save()
+      ctx.strokeStyle = '#c94a38'
+      ctx.lineWidth = 1.2 * invZ
+      ctx.setLineDash([4 * invZ, 3 * invZ])
+      for (const g of guidesRef.current) {
+        ctx.beginPath()
+        if (g.axis === 'x') {
+          ctx.moveTo(g.pos, g.from)
+          ctx.lineTo(g.pos, g.to)
+        } else {
+          ctx.moveTo(g.from, g.pos)
+          ctx.lineTo(g.to, g.pos)
+        }
+        ctx.stroke()
+      }
+      ctx.restore()
+    }
+
+    // Smart connector anchor dots when using line or arrow tool
+    if ((tool === 'line' || tool === 'arrow') && canDraw) {
+      const invZ = 1 / cam.zoom
+      ctx.save()
+      for (const el of sorted) {
+        if (!isConnectableShape(el)) continue
+        const anchors = getElementAnchorPoints(el)
+        for (const pt of Object.values(anchors)) {
+          ctx.fillStyle = 'rgba(35,100,70,0.28)'
+          ctx.strokeStyle = '#236446'
+          ctx.lineWidth = 1.2 * invZ
+          ctx.beginPath()
+          ctx.arc(pt.x, pt.y, 4 * invZ, 0, Math.PI * 2)
+          ctx.fill()
+          ctx.stroke()
+        }
+      }
+      if (hoveredAnchorRef.current) {
+        ctx.fillStyle = '#236446'
+        ctx.beginPath()
+        ctx.arc(
+          hoveredAnchorRef.current.x,
+          hoveredAnchorRef.current.y,
+          6.5 * invZ,
+          0,
+          Math.PI * 2,
+        )
+        ctx.fill()
+      }
+      ctx.restore()
+    }
+
     // Selection outlines & resize/rotate handles
     const selSet = new Set(selectedIdsRef.current)
     const selectedEls = sorted.filter((e) => selSet.has(e.id))
-    if (selectedEls.length > 0 && canDraw) {
+    if (selectedEls.length > 0 && canDraw && !croppingId) {
       const invZ = 1 / cam.zoom
       ctx.save()
       ctx.strokeStyle = '#236446'
@@ -717,14 +968,18 @@ export function Whiteboard({
       ctx.setLineDash([5 * invZ, 4 * invZ])
       for (const el of selectedEls) {
         const b = getElementBounds(el)
-        ctx.strokeRect(b.x - 4 * invZ, b.y - 4 * invZ, b.w + 8 * invZ, b.h + 8 * invZ)
+        ctx.strokeRect(
+          b.x - 4 * invZ,
+          b.y - 4 * invZ,
+          b.w + 8 * invZ,
+          b.h + 8 * invZ,
+        )
       }
       ctx.setLineDash([])
       if (selectedEls.length === 1 && !selectedEls[0].locked) {
         const b = getElementBounds(selectedEls[0])
         const handles = getHandlePositions(b)
         const r = 5 * invZ
-        // Rotate stem
         ctx.beginPath()
         ctx.moveTo(handles.n.x, handles.n.y)
         ctx.lineTo(handles.rotate.x, handles.rotate.y)
@@ -762,10 +1017,10 @@ export function Whiteboard({
 
     // Laser pointer glowing fade trails (1.5s lifetime)
     const now = Date.now()
-    const allLasers: { points: { x: number; y: number; at: number }[]; name?: string }[] = [
-      { points: localLaserRef.current },
-      ...mergedRemoteLasers,
-    ]
+    const allLasers: {
+      points: { x: number; y: number; at: number }[]
+      name?: string
+    }[] = [{ points: localLaserRef.current }, ...mergedRemoteLasers]
     for (const trail of allLasers) {
       const fresh = trail.points.filter((pt) => now - pt.at < 1500)
       if (fresh.length === 0) continue
@@ -803,7 +1058,7 @@ export function Whiteboard({
 
     ctx.restore()
 
-    // Paint Minimap (Retina DPR-scaled and aligned 1:1 with full viewport)
+    // Paint Minimap
     const mini = minimapRef.current
     if (mini && showMinimap) {
       const mctx = mini.getContext('2d')
@@ -878,10 +1133,8 @@ export function Whiteboard({
         mctx.restore()
       }
     }
-  }, [pattern, boardTheme, canDraw, mergedRemoteLasers, showMinimap])
+  }, [pattern, boardTheme, canDraw, mergedRemoteLasers, showMinimap, tool, croppingId])
 
-  // ResizeObserver + window resize so initial mount, window resize, and side
-  // panel open/close ALWAYS keep the canvas 100% edge-to-edge and painted.
   const didInitCamera = useRef(false)
   const paintCanvasRef = useRef(paintCanvas)
   useLayoutEffect(() => {
@@ -901,6 +1154,7 @@ export function Whiteboard({
         c.width = Math.max(1, Math.floor(rect.width * dpr))
         c.height = Math.max(1, Math.floor(rect.height * dpr))
         viewportRef.current = { width: rect.width, height: rect.height }
+        setViewportSize({ width: rect.width, height: rect.height })
       }
       if (!didInitCamera.current && rect.width > 0 && rect.height > 0) {
         didInitCamera.current = true
@@ -925,7 +1179,7 @@ export function Whiteboard({
     paintCanvas()
   }, [paintCanvas, elements, selectedIds, camera, renderTick])
 
-  // Animate laser fade at 60fps while any laser points are active
+  // Animate laser fade at 60fps
   useEffect(() => {
     let raf = 0
     const step = () => {
@@ -950,10 +1204,25 @@ export function Whiteboard({
     return () => cancelAnimationFrame(raf)
   }, [mergedRemoteLasers, paintCanvas, renderTick])
 
-  // ---- Selection operations ------------------------------------------------
+  // ---- Selection & Object Manipulation Actions -----------------------------
+  const visibleElements = useMemo(
+    () => getVisibleElements(elements),
+    [elements],
+  )
   const selectedElements = useMemo(
-    () => elements.filter((e) => selectedIds.includes(e.id)),
-    [elements, selectedIds],
+    () => visibleElements.filter((e) => selectedIds.includes(e.id)),
+    [visibleElements, selectedIds],
+  )
+  const frameElements = useMemo(
+    () =>
+      elements
+        .filter((e) => e.kind === 'frame')
+        .sort((a, b) => a.createdAt - b.createdAt),
+    [elements],
+  )
+  const pdfDecks = useMemo(
+    () => elements.filter((e) => e.kind === 'pdf-deck'),
+    [elements],
   )
 
   const deleteSelected = useCallback(() => {
@@ -963,16 +1232,56 @@ export function Whiteboard({
       (e) => sel.has(e.id) && !e.locked,
     )
     if (deletable.length === 0) return
-    const delIds = deletable.map((e) => e.id)
-    const delSet = new Set(delIds)
+    const delIds = new Set(deletable.map((e) => e.id))
+    // If deleting a pdf-deck, also clean up its child pdf-page docs
+    for (const d of deletable) {
+      if (d.kind === 'pdf-deck') {
+        for (const child of elementsRef.current) {
+          if (child.pdfDeckId === d.id) delIds.add(child.id)
+        }
+      }
+    }
     const prev = elementsRef.current
-    const next = prev.filter((e) => !delSet.has(e.id))
+    const next = prev.filter((e) => !delIds.has(e.id))
     pushHistory(prev)
     elementsRef.current = next
     setElements(next)
     setSelectedIds([])
-    syncDelete(delIds)
+    syncDelete(Array.from(delIds))
   }, [canDraw, pushHistory, syncDelete])
+
+  const copySelected = useCallback(() => {
+    if (selectedIdsRef.current.length === 0) return
+    const sel = new Set(selectedIdsRef.current)
+    const picked = elementsRef.current.filter(
+      (e) => sel.has(e.id) && e.kind !== 'pdf-deck',
+    )
+    if (picked.length === 0) return
+    setClipboard(picked)
+    toast.success(`Copied ${picked.length} ${picked.length === 1 ? 'item' : 'items'}`)
+  }, [])
+
+  const pasteClipboard = useCallback(() => {
+    if (!canDraw || clipboard.length === 0) return
+    const prev = elementsRef.current
+    const maxZ = prev.reduce((m, e) => Math.max(m, e.zIndex), 0)
+    let z = maxZ + 1
+    const copies = clipboard.map((el) => ({
+      ...translateElement(el, 32, 32),
+      id: makeElementId(),
+      locked: false,
+      groupId: undefined,
+      zIndex: z++,
+      createdAt: Date.now(),
+    }))
+    const next = [...prev, ...copies]
+    pushHistory(prev)
+    elementsRef.current = next
+    setElements(next)
+    setSelectedIds(copies.map((c) => c.id))
+    setTool('select')
+    syncBatch(copies)
+  }, [canDraw, clipboard, pushHistory, syncBatch])
 
   const duplicateSelected = useCallback(() => {
     if (!canDraw || selectedIdsRef.current.length === 0) return
@@ -982,11 +1291,12 @@ export function Whiteboard({
     const copies: BoardElement[] = []
     let z = maxZ + 1
     for (const el of prev) {
-      if (!sel.has(el.id)) continue
+      if (!sel.has(el.id) || el.kind === 'pdf-deck') continue
       copies.push({
         ...translateElement(el, 28, 28),
         id: makeElementId(),
         locked: false,
+        groupId: undefined,
         zIndex: z++,
         createdAt: Date.now(),
       })
@@ -1021,20 +1331,15 @@ export function Whiteboard({
   }, [canDraw, pushHistory, syncBatch])
 
   const reorderSelected = useCallback(
-    (dir: 'front' | 'back') => {
+    (dir: LayerDirection) => {
       if (!canDraw || selectedIdsRef.current.length === 0) return
-      const sel = new Set(selectedIdsRef.current)
       const prev = elementsRef.current
-      const minZ = prev.reduce((m, e) => Math.min(m, e.zIndex), 0)
-      const maxZ = prev.reduce((m, e) => Math.max(m, e.zIndex), 0)
-      let z = dir === 'front' ? maxZ + 1 : minZ - sel.size - 1
-      const changed: BoardElement[] = []
-      const next = prev.map((e) => {
-        if (!sel.has(e.id)) return e
-        const updated = { ...e, zIndex: z++ }
-        changed.push(updated)
-        return updated
-      })
+      const { next, changed } = reorderElementsZ(
+        prev,
+        selectedIdsRef.current,
+        dir,
+      )
+      if (changed.length === 0) return
       pushHistory(prev)
       elementsRef.current = next
       setElements(next)
@@ -1043,20 +1348,401 @@ export function Whiteboard({
     [canDraw, pushHistory, syncBatch],
   )
 
+  const rotateSelected90 = useCallback(() => {
+    if (!canDraw || selectedIdsRef.current.length === 0) return
+    const sel = new Set(selectedIdsRef.current)
+    const prev = elementsRef.current
+    const changed: BoardElement[] = []
+    const next = prev.map((el) => {
+      if (!sel.has(el.id) || el.locked) return el
+      const updated = {
+        ...el,
+        rotation: ((el.rotation || 0) + Math.PI / 2) % (Math.PI * 2),
+      }
+      changed.push(updated)
+      return updated
+    })
+    if (changed.length === 0) return
+    pushHistory(prev)
+    elementsRef.current = next
+    setElements(next)
+    syncBatch(changed)
+  }, [canDraw, pushHistory, syncBatch])
+
+  const flipSelected = useCallback(
+    (axis: 'x' | 'y') => {
+      if (!canDraw || selectedIdsRef.current.length === 0) return
+      const sel = new Set(selectedIdsRef.current)
+      const prev = elementsRef.current
+      const changed: BoardElement[] = []
+      const next = prev.map((el) => {
+        if (!sel.has(el.id) || el.locked) return el
+        const updated =
+          axis === 'x'
+            ? { ...el, flipX: !el.flipX }
+            : { ...el, flipY: !el.flipY }
+        changed.push(updated)
+        return updated
+      })
+      if (changed.length === 0) return
+      pushHistory(prev)
+      elementsRef.current = next
+      setElements(next)
+      syncBatch(changed)
+    },
+    [canDraw, pushHistory, syncBatch],
+  )
+
+  const setSelectedOpacity = useCallback(
+    (nextOp: number) => {
+      if (!canDraw || selectedIdsRef.current.length === 0) return
+      const clamped = Math.max(0.1, Math.min(1, nextOp))
+      const sel = new Set(selectedIdsRef.current)
+      const prev = elementsRef.current
+      const changed: BoardElement[] = []
+      const next = prev.map((el) => {
+        if (!sel.has(el.id)) return el
+        const updated = { ...el, opacity: clamped }
+        changed.push(updated)
+        return updated
+      })
+      if (changed.length === 0) return
+      elementsRef.current = next
+      setElements(next)
+      syncBatch(changed)
+    },
+    [canDraw, syncBatch],
+  )
+
+  const toggleGroupSelected = useCallback(() => {
+    if (!canDraw || selectedIdsRef.current.length < 2) return
+    const sel = new Set(selectedIdsRef.current)
+    const prev = elementsRef.current
+    const picked = prev.filter((e) => sel.has(e.id))
+    const sharedGroup =
+      picked[0]?.groupId &&
+      picked.every((e) => e.groupId === picked[0].groupId)
+    const nextGroupId = sharedGroup ? undefined : `grp_${makeElementId()}`
+    const changed: BoardElement[] = []
+    const next = prev.map((e) => {
+      if (!sel.has(e.id)) return e
+      const updated = { ...e, groupId: nextGroupId }
+      changed.push(updated)
+      return updated
+    })
+    pushHistory(prev)
+    elementsRef.current = next
+    setElements(next)
+    syncBatch(changed)
+    toast.success(sharedGroup ? 'Ungrouped objects' : 'Grouped objects')
+  }, [canDraw, pushHistory, syncBatch])
+
+  const handleAlignSelected = useCallback(
+    (alignment: AlignmentKind) => {
+      if (!canDraw || selectedIdsRef.current.length < 2) return
+      const prev = elementsRef.current
+      const { next, changed } = alignElements(
+        prev,
+        selectedIdsRef.current,
+        alignment,
+      )
+      if (changed.length === 0) return
+      const { next: withConn, updatedConnectors } = updateAttachedConnectors(
+        next,
+        new Set(changed.map((c) => c.id)),
+      )
+      pushHistory(prev)
+      elementsRef.current = withConn
+      setElements(withConn)
+      syncBatch([...changed, ...updatedConnectors])
+    },
+    [canDraw, pushHistory, syncBatch],
+  )
+
+  const handleDistributeSelected = useCallback(
+    (axis: 'horizontal' | 'vertical') => {
+      if (!canDraw || selectedIdsRef.current.length < 3) return
+      const prev = elementsRef.current
+      const { next, changed } = distributeElements(
+        prev,
+        selectedIdsRef.current,
+        axis,
+      )
+      if (changed.length === 0) return
+      const { next: withConn, updatedConnectors } = updateAttachedConnectors(
+        next,
+        new Set(changed.map((c) => c.id)),
+      )
+      pushHistory(prev)
+      elementsRef.current = withConn
+      setElements(withConn)
+      syncBatch([...changed, ...updatedConnectors])
+    },
+    [canDraw, pushHistory, syncBatch],
+  )
+
+  const handleStyleImage = useCallback(
+    (
+      el: BoardElement,
+      patch: {
+        borderRadius?: number
+        borderWidth?: number
+        borderColor?: string
+      },
+    ) => {
+      const updated = { ...el, ...patch }
+      const next = elementsRef.current.map((item) =>
+        item.id === el.id ? updated : item,
+      )
+      elementsRef.current = next
+      setElements(next)
+      syncUpsert(updated)
+    },
+    [syncUpsert],
+  )
+
+  const handleDownloadImage = useCallback((el: BoardElement) => {
+    if (!el.imageDataUrl) return
+    const a = document.createElement('a')
+    a.href = el.imageDataUrl
+    a.download = `lectern-image-${el.id.slice(-4)}.png`
+    a.click()
+  }, [])
+
+  const handleReplaceImageFile = useCallback(
+    async (file: File) => {
+      const targetId = replaceTargetIdRef.current
+      replaceTargetIdRef.current = null
+      if (!targetId || !canDraw) return
+      try {
+        const { dataUrl } = await compressImageFile(file)
+        const prev = elementsRef.current
+        const target = prev.find((e) => e.id === targetId)
+        if (!target) return
+        const updated: BoardElement = { ...target, imageDataUrl: dataUrl }
+        const next = prev.map((e) => (e.id === targetId ? updated : e))
+        pushHistory(prev)
+        elementsRef.current = next
+        setElements(next)
+        syncUpsert(updated)
+        toast.success('Image replaced')
+      } catch {
+        toast.error('Could not replace image.')
+      }
+    },
+    [canDraw, pushHistory, syncUpsert],
+  )
+
+  const handleAddMindMapBranch = useCallback(
+    (parent: BoardElement) => {
+      if (!canDraw) return
+      const prev = elementsRef.current
+      const { node, connector } = createMindMapBranch(parent, prev, author)
+      const next = [...prev, connector, node]
+      pushHistory(prev)
+      elementsRef.current = next
+      setElements(next)
+      setSelectedIds([node.id])
+      syncBatch([connector, node])
+    },
+    [author, canDraw, pushHistory, syncBatch],
+  )
+
+  // ---- Frames / Lesson Slides Actions --------------------------------------
+  const addPresetFrame = useCallback(
+    (ratio: '16:9' | 'A4') => {
+      if (!canDraw) return
+      const prev = elementsRef.current
+      const existingFrames = prev.filter((e) => e.kind === 'frame')
+      const w = ratio === '16:9' ? 960 : 720
+      const h = ratio === '16:9' ? 540 : 1018
+      let fx: number
+      let fy: number
+      if (existingFrames.length > 0) {
+        const last = existingFrames[existingFrames.length - 1]
+        const lb = getElementBounds(last)
+        fx = lb.x + lb.w + 80
+        fy = lb.y
+      } else {
+        const center = getViewportCenterWorld()
+        fx = center.x - w / 2
+        fy = center.y - h / 2
+      }
+      const minZ = prev.reduce((m, e) => Math.min(m, e.zIndex), 1)
+      const frame: BoardElement = {
+        id: makeElementId(),
+        kind: 'frame',
+        x: fx,
+        y: fy,
+        w,
+        h,
+        rotation: 0,
+        strokeColor: '#236446',
+        fillColor:
+          boardTheme === 'dark'
+            ? 'rgba(30,40,35,0.45)'
+            : 'rgba(255,255,255,0.65)',
+        strokeWidth: 2,
+        strokeStyle: 'dashed',
+        opacity: 1,
+        frameTitle: `Slide ${existingFrames.length + 1}`,
+        frameRatio: ratio,
+        zIndex: minZ - 1,
+        author,
+        createdAt: Date.now(),
+      }
+      const next = [...prev, frame]
+      pushHistory(prev)
+      elementsRef.current = next
+      setElements(next)
+      setSelectedIds([frame.id])
+      syncUpsert(frame)
+      jumpToRect(getElementBounds(frame), 96)
+    },
+    [author, boardTheme, canDraw, getViewportCenterWorld, jumpToRect, pushHistory, syncUpsert],
+  )
+
+  const renameFrame = useCallback(
+    (id: string, nextTitle: string) => {
+      const prev = elementsRef.current
+      const target = prev.find((e) => e.id === id)
+      if (!target) return
+      const updated = { ...target, frameTitle: nextTitle }
+      const next = prev.map((e) => (e.id === id ? updated : e))
+      elementsRef.current = next
+      setElements(next)
+      syncUpsert(updated)
+    },
+    [syncUpsert],
+  )
+
+  const deleteFrame = useCallback(
+    (id: string) => {
+      const prev = elementsRef.current
+      const next = prev.filter((e) => e.id !== id)
+      pushHistory(prev)
+      elementsRef.current = next
+      setElements(next)
+      setSelectedIds((s) => s.filter((x) => x !== id))
+      syncDelete([id])
+    },
+    [pushHistory, syncDelete],
+  )
+
+  // ---- Editable Table Insertion & Update -----------------------------------
+  const insertTable = useCallback(
+    (rows: number, cols: number) => {
+      if (!canDraw) return
+      const center = getViewportCenterWorld()
+      const w = Math.max(240, cols * 120)
+      const h = Math.max(120, rows * 44)
+      const prev = elementsRef.current
+      const maxZ = prev.reduce((m, e) => Math.max(m, e.zIndex), 0)
+      const cells = Array.from({ length: rows * cols }, (_, idx) =>
+        idx < cols ? `Header ${idx + 1}` : '',
+      )
+      const tableEl: BoardElement = {
+        id: makeElementId(),
+        kind: 'table',
+        x: center.x - w / 2,
+        y: center.y - h / 2,
+        w,
+        h,
+        rotation: 0,
+        strokeColor: '#236446',
+        fillColor: '#ffffff',
+        strokeWidth: 1.5,
+        strokeStyle: 'solid',
+        opacity: 1,
+        tableRows: rows,
+        tableCols: cols,
+        tableCells: cells,
+        tableHeaderBg: true,
+        fontSize: 14,
+        zIndex: maxZ + 1,
+        author,
+        createdAt: Date.now(),
+      }
+      const next = [...prev, tableEl]
+      pushHistory(prev)
+      elementsRef.current = next
+      setElements(next)
+      setSelectedIds([tableEl.id])
+      setEditingTableId(tableEl.id)
+      setTool('select')
+      syncUpsert(tableEl)
+    },
+    [author, canDraw, getViewportCenterWorld, pushHistory, syncUpsert],
+  )
+
+  const updateTableElement = useCallback(
+    (updated: BoardElement) => {
+      const next = elementsRef.current.map((e) =>
+        e.id === updated.id ? updated : e,
+      )
+      elementsRef.current = next
+      setElements(next)
+      syncUpsert(updated)
+    },
+    [syncUpsert],
+  )
+
+  // ---- Math Symbol Quick Insert --------------------------------------------
+  const insertMathSymbol = useCallback(
+    (sym: string) => {
+      if (!canDraw) return
+      if (textEdit) {
+        setTextEdit((prev) => (prev ? { ...prev, value: prev.value + sym } : prev))
+        return
+      }
+      const center = getViewportCenterWorld()
+      const prev = elementsRef.current
+      const maxZ = prev.reduce((m, e) => Math.max(m, e.zIndex), 0)
+      const el: BoardElement = {
+        id: makeElementId(),
+        kind: 'text',
+        x: center.x - 40,
+        y: center.y - 24,
+        w: 120,
+        h: 48,
+        rotation: 0,
+        strokeColor,
+        fillColor: 'transparent',
+        strokeWidth: 2,
+        strokeStyle: 'solid',
+        opacity: 1,
+        text: sym,
+        fontSize: 32,
+        fontFamily: 'serif',
+        zIndex: maxZ + 1,
+        author,
+        createdAt: Date.now(),
+      }
+      const next = [...prev, el]
+      pushHistory(prev)
+      elementsRef.current = next
+      setElements(next)
+      setSelectedIds([el.id])
+      setTool('select')
+      syncUpsert(el)
+    },
+    [author, canDraw, getViewportCenterWorld, pushHistory, strokeColor, syncUpsert, textEdit],
+  )
+
+  // ---- Templates & Image Upload --------------------------------------------
   const insertTemplate = useCallback(
     (kind: TemplateKind) => {
       if (!canDraw) return
-      const el = containerRef.current
-      const rect = el?.getBoundingClientRect()
-      const cx = rect
-        ? (rect.width / 2 - cameraRef.current.panX) / cameraRef.current.zoom
-        : 0
-      const cy = rect
-        ? (rect.height / 2 - cameraRef.current.panY) / cameraRef.current.zoom
-        : 0
+      const center = getViewportCenterWorld()
       const prev = elementsRef.current
       const maxZ = prev.reduce((m, e) => Math.max(m, e.zIndex), 0)
-      const items = createTemplateElements(kind, cx, cy, author, maxZ + 1)
+      const items = createTemplateElements(
+        kind,
+        center.x,
+        center.y,
+        author,
+        maxZ + 1,
+      )
       const next = [...prev, ...items]
       pushHistory(prev)
       elementsRef.current = next
@@ -1066,7 +1752,7 @@ export function Whiteboard({
       syncBatch(items)
       toast.success('Template added to board')
     },
-    [author, canDraw, pushHistory, syncBatch],
+    [author, canDraw, getViewportCenterWorld, pushHistory, syncBatch],
   )
 
   const addImageAt = useCallback(
@@ -1074,18 +1760,9 @@ export function Whiteboard({
       if (!canDraw) return
       try {
         const { dataUrl, width, height } = await compressImageFile(file)
-        const rect = containerRef.current?.getBoundingClientRect()
-        const cx =
-          wx ??
-          (rect
-            ? (rect.width / 2 - cameraRef.current.panX) / cameraRef.current.zoom
-            : 0)
-        const cy =
-          wy ??
-          (rect
-            ? (rect.height / 2 - cameraRef.current.panY) /
-              cameraRef.current.zoom
-            : 0)
+        const center = getViewportCenterWorld()
+        const cx = wx ?? center.x
+        const cy = wy ?? center.y
         const prev = elementsRef.current
         const maxZ = prev.reduce((m, e) => Math.max(m, e.zIndex), 0)
         const imgEl: BoardElement = {
@@ -1117,7 +1794,206 @@ export function Whiteboard({
         toast.error('Could not load that image.')
       }
     },
-    [author, canDraw, pushHistory, syncUpsert],
+    [author, canDraw, getViewportCenterWorld, pushHistory, syncUpsert],
+  )
+
+  // ---- PDF File Import & Interactive PDF Deck Page Flipping ----------------
+  const openPdfFileForImport = useCallback(
+    async (file: File) => {
+      if (!canDraw) return
+      setPdfDialogOpen(true)
+      setPdfLoadingFile(true)
+      setPdfSession(null)
+      try {
+        const session = await parsePdfFile(file)
+        setPdfSession(session)
+      } catch (err) {
+        console.error(err)
+        toast.error('Could not read that PDF file. Please try another PDF.')
+        setPdfDialogOpen(false)
+      } finally {
+        setPdfLoadingFile(false)
+      }
+    },
+    [canDraw],
+  )
+
+  const closePdfDialog = useCallback(() => {
+    pdfSession?.destroy()
+    setPdfSession(null)
+    setPdfDialogOpen(false)
+    setPdfProgress(null)
+  }, [pdfSession])
+
+  const confirmPdfImport = useCallback(
+    async ({
+      session,
+      pageIndices,
+      layout,
+      autoLock,
+    }: PdfImportConfirmPayload) => {
+      if (!canDraw || pageIndices.length === 0) return
+      setPdfImporting(true)
+      setPdfProgress({ done: 0, total: pageIndices.length })
+      try {
+        const rendered = await session.renderPages(pageIndices, (done, total) =>
+          setPdfProgress({ done, total }),
+        )
+        if (rendered.length === 0) return
+
+        const center = getViewportCenterWorld()
+        const prev = elementsRef.current
+        const minZ = prev.reduce((m, e) => Math.min(m, e.zIndex), 1)
+        const now = Date.now()
+        const newEls: BoardElement[] = []
+
+        if (layout === 'deck') {
+          const first = rendered[0]
+          const deckId = makeElementId()
+          const deckX = center.x - first.width / 2
+          const deckY = center.y - first.height / 2
+          const deckFrame: BoardElement = {
+            id: deckId,
+            kind: 'pdf-deck',
+            x: deckX,
+            y: deckY,
+            w: first.width,
+            h: first.height,
+            rotation: 0,
+            strokeColor: '#236446',
+            fillColor: '#ffffff',
+            strokeWidth: 2,
+            strokeStyle: 'solid',
+            opacity: 1,
+            pdfDeckId: deckId,
+            pdfPageIndex: 0,
+            pdfPageCount: rendered.length,
+            pdfTitle: session.title,
+            locked: autoLock,
+            zIndex: minZ - 1,
+            author,
+            createdAt: now,
+          }
+          newEls.push(deckFrame)
+          rendered.forEach((pg, idx) => {
+            newEls.push({
+              id: makeElementId(),
+              kind: 'pdf-page',
+              x: deckX,
+              y: deckY,
+              w: pg.width,
+              h: pg.height,
+              rotation: 0,
+              strokeColor: '#236446',
+              fillColor: '#ffffff',
+              strokeWidth: 1,
+              strokeStyle: 'solid',
+              opacity: 1,
+              imageDataUrl: pg.dataUrl,
+              pdfDeckId: deckId,
+              pdfPageIndex: idx,
+              pdfTitle: session.title,
+              locked: true,
+              zIndex: minZ - 2,
+              author,
+              createdAt: now + idx + 1,
+            })
+          })
+        } else {
+          // Spread all pages on canvas (Row, Column, or Grid)
+          const gap = 36
+          const cols =
+            layout === 'grid'
+              ? Math.max(2, Math.ceil(Math.sqrt(rendered.length)))
+              : layout === 'row'
+                ? rendered.length
+                : 1
+          const cellW = Math.max(...rendered.map((r) => r.width))
+          const cellH = Math.max(...rendered.map((r) => r.height))
+          const totalGridW = cols * cellW + (cols - 1) * gap
+          const rowsCount = Math.ceil(rendered.length / cols)
+          const totalGridH = rowsCount * cellH + (rowsCount - 1) * gap
+          const startX = center.x - totalGridW / 2
+          const startY = center.y - totalGridH / 2
+
+          rendered.forEach((pg, idx) => {
+            const col = idx % cols
+            const row = Math.floor(idx / cols)
+            newEls.push({
+              id: makeElementId(),
+              kind: 'pdf-page',
+              x: startX + col * (cellW + gap),
+              y: startY + row * (cellH + gap),
+              w: pg.width,
+              h: pg.height,
+              rotation: 0,
+              strokeColor: '#236446',
+              fillColor: '#ffffff',
+              strokeWidth: 1,
+              strokeStyle: 'solid',
+              opacity: 1,
+              imageDataUrl: pg.dataUrl,
+              pdfPageIndex: pg.pageIndex,
+              pdfTitle: session.title,
+              locked: autoLock,
+              zIndex: minZ - rendered.length + idx,
+              author,
+              createdAt: now + idx,
+            })
+          })
+        }
+
+        const next = [...prev, ...newEls]
+        pushHistory(prev)
+        elementsRef.current = next
+        setElements(next)
+        setSelectedIds([])
+        // Batch upsert in small chunks so large PDFs sync smoothly without exceeding batch byte size
+        for (let i = 0; i < newEls.length; i += 4) {
+          syncBatch(newEls.slice(i, i + 4))
+        }
+        if (syncScope?.kind === 'board') {
+          void updateWhiteboardMeta(syncScope.boardId, {
+            elementCount: next.length,
+            updatedAt: Date.now(),
+          })
+        }
+        const fitTarget =
+          layout === 'deck'
+            ? getElementBounds(newEls[0])
+            : getContentBounds(newEls)
+        if (fitTarget) jumpToRect(fitTarget, 90)
+        toast.success(
+          layout === 'deck'
+            ? `Imported "${session.title}" as Interactive PDF Deck (${rendered.length} pages)`
+            : `Placed ${rendered.length} PDF ${rendered.length === 1 ? 'page' : 'pages'} on canvas`,
+        )
+        closePdfDialog()
+      } catch {
+        toast.error('Failed to import PDF pages.')
+      } finally {
+        setPdfImporting(false)
+        setPdfProgress(null)
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [author, canDraw, closePdfDialog, getViewportCenterWorld, jumpToRect, pushHistory, syncBatch, syncKey],
+  )
+
+  const flipPdfDeckPage = useCallback(
+    (deck: BoardElement, delta: number) => {
+      const total = Math.max(1, deck.pdfPageCount ?? 1)
+      const nextIdx = Math.max(0, Math.min(total - 1, (deck.pdfPageIndex ?? 0) + delta))
+      if (nextIdx === (deck.pdfPageIndex ?? 0)) return
+      const updated: BoardElement = { ...deck, pdfPageIndex: nextIdx }
+      const next = elementsRef.current.map((e) =>
+        e.id === deck.id ? updated : e,
+      )
+      elementsRef.current = next
+      setElements(next)
+      syncUpsert(updated)
+    },
+    [syncUpsert],
   )
 
   const clearBoardConfirmed = useCallback(() => {
@@ -1135,55 +2011,81 @@ export function Whiteboard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canDraw, onOp, pushHistory, syncKey])
 
-  // ---- Inline text / sticky commit -----------------------------------------
+  // ---- Rich Inline Text Commit ---------------------------------------------
   const commitTextEdit = useCallback(
-    (value: string) => {
-      const edit = textEdit
+    (draft: RichTextDraft) => {
       setTextEdit(null)
-      if (!edit) return
-      const trimmed = value.trimEnd()
+      const trimmed = draft.value.trimEnd()
       const prev = elementsRef.current
+      const textDecoration: BoardElement['textDecoration'] =
+        draft.underline && draft.strikethrough
+          ? 'underline line-through'
+          : draft.underline
+            ? 'underline'
+            : draft.strikethrough
+              ? 'line-through'
+              : 'none'
 
-      if (edit.elementId) {
-        const existing = prev.find((e) => e.id === edit.elementId)
+      if (draft.elementId) {
+        const existing = prev.find((e) => e.id === draft.elementId)
         if (!existing) return
         if (!trimmed && existing.kind === 'text') {
           pushHistory(prev)
-          const next = prev.filter((e) => e.id !== edit.elementId)
+          const next = prev.filter((e) => e.id !== draft.elementId)
           elementsRef.current = next
           setElements(next)
-          syncDelete([edit.elementId])
+          syncDelete([draft.elementId])
           return
         }
-        const updated: BoardElement = { ...existing, text: trimmed }
+        const updated: BoardElement = {
+          ...existing,
+          w: draft.w,
+          text: trimmed,
+          fontFamily: draft.fontFamily,
+          fontSize: draft.fontSize,
+          fontWeight: draft.fontWeight,
+          fontStyle: draft.fontStyle,
+          textDecoration,
+          textAlign: draft.textAlign,
+          textBg: draft.textBg,
+          strokeColor:
+            existing.kind === 'text' ? draft.color : existing.strokeColor,
+        }
         pushHistory(prev)
-        const next = prev.map((e) => (e.id === edit.elementId ? updated : e))
+        const next = prev.map((e) => (e.id === draft.elementId ? updated : e))
         elementsRef.current = next
         setElements(next)
         syncUpsert(updated)
         return
       }
 
-      if (!trimmed && edit.kind === 'text') return
+      if (!trimmed && draft.kind === 'text') return
       const maxZ = prev.reduce((m, e) => Math.max(m, e.zIndex), 0)
+      const deck = findEnclosingPdfDeck(draft.wx, draft.wy)
       const created: BoardElement =
-        edit.kind === 'sticky'
+        draft.kind === 'sticky'
           ? {
               id: makeElementId(),
               kind: 'sticky',
-              x: edit.wx,
-              y: edit.wy,
-              w: edit.w,
-              h: edit.h,
+              x: draft.wx,
+              y: draft.wy,
+              w: draft.w,
+              h: draft.h,
               rotation: 0,
-              strokeColor,
+              strokeColor: draft.color,
               fillColor: 'transparent',
               strokeWidth: 2,
               strokeStyle: 'solid',
               opacity,
               text: trimmed || 'Note',
-              fontSize: 16,
-              stickyBg: edit.stickyBg || stickyColor,
+              fontFamily: draft.fontFamily,
+              fontSize: draft.fontSize,
+              fontWeight: draft.fontWeight,
+              fontStyle: draft.fontStyle,
+              textAlign: draft.textAlign,
+              stickyBg: draft.stickyBg || stickyColor,
+              pdfDeckId: deck?.id,
+              pdfDeckPage: deck ? (deck.pdfPageIndex ?? 0) : undefined,
               zIndex: maxZ + 1,
               author,
               createdAt: Date.now(),
@@ -1191,18 +2093,26 @@ export function Whiteboard({
           : {
               id: makeElementId(),
               kind: 'text',
-              x: edit.wx,
-              y: edit.wy,
-              w: Math.max(140, trimmed.length * 11),
-              h: Math.max(32, trimmed.split('\n').length * 28),
+              x: draft.wx,
+              y: draft.wy,
+              w: Math.max(140, draft.w),
+              h: Math.max(36, trimmed.split('\n').length * draft.fontSize * 1.38),
               rotation: 0,
-              strokeColor,
+              strokeColor: draft.color,
               fillColor: 'transparent',
               strokeWidth,
               strokeStyle: 'solid',
               opacity,
               text: trimmed,
-              fontSize: Math.max(18, strokeWidth * 5),
+              fontFamily: draft.fontFamily,
+              fontSize: draft.fontSize,
+              fontWeight: draft.fontWeight,
+              fontStyle: draft.fontStyle,
+              textDecoration,
+              textAlign: draft.textAlign,
+              textBg: draft.textBg,
+              pdfDeckId: deck?.id,
+              pdfDeckPage: deck ? (deck.pdfPageIndex ?? 0) : undefined,
               zIndex: maxZ + 1,
               author,
               createdAt: Date.now(),
@@ -1216,25 +2126,30 @@ export function Whiteboard({
     },
     [
       author,
+      findEnclosingPdfDeck,
       opacity,
       pushHistory,
       stickyColor,
-      strokeColor,
       strokeWidth,
       syncDelete,
       syncUpsert,
-      textEdit,
     ],
   )
 
   // ---- Pointer Events ------------------------------------------------------
   const hitElementTop = (wx: number, wy: number) => {
     const tol = 8 / cameraRef.current.zoom
-    const sorted = [...elementsRef.current].sort((a, b) => b.zIndex - a.zIndex)
+    const sorted = [...getVisibleElements(elementsRef.current)].sort(
+      (a, b) => b.zIndex - a.zIndex,
+    )
     return sorted.find((el) => hitTestElement(el, wx, wy, tol)) ?? null
   }
 
-  const hitHandle = (el: BoardElement, wx: number, wy: number): HandleId | null => {
+  const hitHandle = (
+    el: BoardElement,
+    wx: number,
+    wy: number,
+  ): HandleId | null => {
     if (el.locked) return null
     const handles = getHandlePositions(getElementBounds(el))
     const tol = 10 / cameraRef.current.zoom
@@ -1249,7 +2164,7 @@ export function Whiteboard({
 
   const eraseAt = (wx: number, wy: number) => {
     const hit = hitElementTop(wx, wy)
-    if (!hit || hit.locked) return
+    if (!hit || hit.locked || hit.kind === 'pdf-deck') return
     interactionRef.current?.erasedIds?.add(hit.id)
     const next = elementsRef.current.filter((e) => e.id !== hit.id)
     elementsRef.current = next
@@ -1258,11 +2173,21 @@ export function Whiteboard({
   }
 
   const onPointerDown = (e: React.PointerEvent) => {
-    if (textEdit) return
+    if (contextMenu) setContextMenu(null)
+    if (textEdit) {
+      commitTextEdit(textEdit)
+      return
+    }
+    if (editingTableId) {
+      setEditingTableId(null)
+      return
+    }
+    if (croppingId) return
+
     const target = e.currentTarget as HTMLElement
     target.setPointerCapture(e.pointerId)
 
-    // Track multi-touch for pinch zoom
+    // Multi-touch pinch zoom
     if (e.pointerType === 'touch') {
       activeTouchesRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
       if (activeTouchesRef.current.size === 2) {
@@ -1335,14 +2260,24 @@ export function Whiteboard({
     }
 
     if (tool === 'text') {
+      e.preventDefault()
       setTextEdit({
         elementId: null,
         kind: 'text',
         wx,
         wy,
-        w: 220,
-        h: 44,
+        w: 300,
+        h: 56,
         value: '',
+        fontFamily: 'sans',
+        fontSize: Math.max(18, strokeWidth * 5),
+        fontWeight: 'normal',
+        fontStyle: 'normal',
+        underline: false,
+        strikethrough: false,
+        color: strokeColor,
+        textBg: 'transparent',
+        textAlign: 'left',
       })
       return
     }
@@ -1351,13 +2286,27 @@ export function Whiteboard({
       setTextEdit({
         elementId: null,
         kind: 'sticky',
-        wx: wx - 90,
-        wy: wy - 70,
+        wx: wx - 95,
+        wy: wy - 75,
         w: 190,
         h: 150,
         value: '',
         stickyBg: stickyColor,
+        fontFamily: 'sans',
+        fontSize: 16,
+        fontWeight: 'normal',
+        fontStyle: 'normal',
+        underline: false,
+        strikethrough: false,
+        color: '#1f2924',
+        textBg: 'transparent',
+        textAlign: 'left',
       })
+      return
+    }
+
+    if (tool === 'table') {
+      insertTable(tableRowsPick, tableColsPick)
       return
     }
 
@@ -1379,7 +2328,6 @@ export function Whiteboard({
     }
 
     if (tool === 'select') {
-      // Check resize / rotate handles on single selected element
       if (selectedIdsRef.current.length === 1) {
         const selEl = elementsRef.current.find(
           (el) => el.id === selectedIdsRef.current[0],
@@ -1407,13 +2355,21 @@ export function Whiteboard({
 
       const hit = hitElementTop(wx, wy)
       if (hit) {
+        // If object belongs to a group, expand selection to whole group
+        const groupMembers = hit.groupId
+          ? elementsRef.current
+              .filter((el) => el.groupId === hit.groupId)
+              .map((el) => el.id)
+          : [hit.id]
+
         let nextSel = selectedIdsRef.current
         if (e.shiftKey) {
-          nextSel = nextSel.includes(hit.id)
-            ? nextSel.filter((id) => id !== hit.id)
-            : [...nextSel, hit.id]
+          const allIn = groupMembers.every((id) => nextSel.includes(id))
+          nextSel = allIn
+            ? nextSel.filter((id) => !groupMembers.includes(id))
+            : Array.from(new Set([...nextSel, ...groupMembers]))
         } else if (!nextSel.includes(hit.id)) {
-          nextSel = [hit.id]
+          nextSel = groupMembers
         }
         selectedIdsRef.current = nextSel
         setSelectedIds(nextSel)
@@ -1450,44 +2406,91 @@ export function Whiteboard({
       return
     }
 
-    // Drawing tools (pen, highlighter, line, arrow, shapes)
+    // Drawing tools (pen, highlighter, line, arrow, shapes, frame)
     const maxZ = elementsRef.current.reduce((m, el) => Math.max(m, el.zIndex), 0)
     const kind = tool as ElementKind
     const isFree = kind === 'pen' || kind === 'highlighter'
     const isLine = kind === 'line' || kind === 'arrow'
+    const deck = kind !== 'frame' ? findEnclosingPdfDeck(wx, wy) : null
+
+    let startX = wx
+    let startY = wy
+    let startAnchor: BoardElement['startAnchor']
+    if (isLine) {
+      const snapped = findNearestAnchor(
+        getVisibleElements(elementsRef.current),
+        wx,
+        wy,
+        new Set(),
+        24 / cameraRef.current.zoom,
+      )
+      if (snapped) {
+        startX = snapped.x
+        startY = snapped.y
+        startAnchor = snapped.anchor
+      }
+    }
+
     const draft: BoardElement = {
       id: makeElementId(),
       kind,
-      x: wx,
-      y: wy,
+      x: startX,
+      y: startY,
       w: 0,
       h: 0,
-      points: isFree || isLine ? [wx, wy, wx, wy] : undefined,
+      points: isFree || isLine ? [startX, startY, startX, startY] : undefined,
+      pointWidths:
+        kind === 'pen' && penPreset === 'calligraphy'
+          ? [strokeWidth, strokeWidth]
+          : undefined,
+      penPreset: kind === 'pen' ? penPreset : undefined,
+      startAnchor,
       rotation: 0,
-      strokeColor,
-      fillColor: isFree || isLine ? 'transparent' : fillColor,
-      strokeWidth,
-      strokeStyle,
+      strokeColor: kind === 'frame' ? '#236446' : strokeColor,
+      fillColor:
+        kind === 'frame'
+          ? boardTheme === 'dark'
+            ? 'rgba(30,40,35,0.45)'
+            : 'rgba(255,255,255,0.65)'
+          : isFree || isLine
+            ? 'transparent'
+            : fillColor,
+      strokeWidth: kind === 'frame' ? 2 : strokeWidth,
+      strokeStyle: kind === 'frame' ? 'dashed' : strokeStyle,
       opacity,
-      zIndex: maxZ + 1,
+      frameTitle:
+        kind === 'frame'
+          ? `Slide ${elementsRef.current.filter((e) => e.kind === 'frame').length + 1}`
+          : undefined,
+      frameRatio: kind === 'frame' ? 'custom' : undefined,
+      pdfDeckId: deck?.id,
+      pdfDeckPage: deck ? (deck.pdfPageIndex ?? 0) : undefined,
+      zIndex:
+        kind === 'frame'
+          ? elementsRef.current.reduce((m, el) => Math.min(m, el.zIndex), 1) - 1
+          : maxZ + 1,
       author,
       createdAt: Date.now(),
     }
     draftRef.current = draft
+    lastDrawSampleRef.current = { x: startX, y: startY, t: Date.now() }
     interactionRef.current = {
       mode: 'draw',
       pointerId: e.pointerId,
       startClientX: e.clientX,
       startClientY: e.clientY,
-      startWx: wx,
-      startWy: wy,
+      startWx: startX,
+      startWy: startY,
       startCamera: { ...cameraRef.current },
     }
     paintCanvas()
   }
 
   const onPointerMove = (e: React.PointerEvent) => {
-    if (e.pointerType === 'touch' && activeTouchesRef.current.has(e.pointerId)) {
+    if (
+      e.pointerType === 'touch' &&
+      activeTouchesRef.current.has(e.pointerId)
+    ) {
       activeTouchesRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
       if (activeTouchesRef.current.size === 2 && pinchStartRef.current) {
         const pts = Array.from(activeTouchesRef.current.values())
@@ -1509,7 +2512,23 @@ export function Whiteboard({
       }
     }
 
+    const { x: wx, y: wy } = screenToWorld(e.clientX, e.clientY)
     const inter = interactionRef.current
+
+    // Highlight nearest smart connector anchor on hover when using line/arrow
+    if (!inter && (tool === 'line' || tool === 'arrow') && canDraw) {
+      const snap = findNearestAnchor(
+        getVisibleElements(elementsRef.current),
+        wx,
+        wy,
+        new Set(),
+        24 / cameraRef.current.zoom,
+      )
+      hoveredAnchorRef.current = snap ? { x: snap.x, y: snap.y } : null
+      paintCanvas()
+      return
+    }
+
     if (!inter || inter.pointerId !== e.pointerId) return
 
     if (inter.mode === 'pan') {
@@ -1521,8 +2540,6 @@ export function Whiteboard({
       return
     }
 
-    const { x: wx, y: wy } = screenToWorld(e.clientX, e.clientY)
-
     if (inter.mode === 'laser') {
       const now = Date.now()
       localLaserRef.current.push({ x: wx, y: wy, at: now })
@@ -1530,7 +2547,10 @@ export function Whiteboard({
         lastLaserEmitRef.current = now
         onLaser?.(wx, wy)
       }
-      if (syncScope?.kind === 'board' && now - lastFsLaserEmitRef.current > 90) {
+      if (
+        syncScope?.kind === 'board' &&
+        now - lastFsLaserEmitRef.current > 90
+      ) {
         lastFsLaserEmitRef.current = now
         void updateWhiteboardMeta(syncScope.boardId, {
           laser: {
@@ -1563,27 +2583,57 @@ export function Whiteboard({
     }
 
     if (inter.mode === 'move' && inter.initialElements) {
-      const dx = wx - inter.startWx
-      const dy = wy - inter.startWy
+      let dx = wx - inter.startWx
+      let dy = wy - inter.startWy
+
+      // Smart alignment guides & snap-to-grid
+      const movingList = Array.from(inter.initialElements.values())
+      const movingIds = new Set(movingList.map((el) => el.id))
+      const rawBounds = getContentBounds(
+        movingList.map((el) => translateElement(el, dx, dy)),
+      )
+      if (rawBounds) {
+        const others = getVisibleElements(elementsRef.current).filter(
+          (el) => !movingIds.has(el.id),
+        )
+        const snap = computeSnapAndGuides(rawBounds, others, {
+          snapToGrid,
+          gridStep: 32,
+          tolerance: 6 / cameraRef.current.zoom,
+        })
+        dx += snap.dx
+        dy += snap.dy
+        guidesRef.current = snap.guides
+      }
+
       const movedEls: BoardElement[] = []
-      const next = elementsRef.current.map((el) => {
+      const translatedList = elementsRef.current.map((el) => {
         const orig = inter.initialElements!.get(el.id)
         if (!orig) return el
         const translated = translateElement(orig, dx, dy)
         movedEls.push(translated)
         return translated
       })
+      const { next, updatedConnectors } = updateAttachedConnectors(
+        translatedList,
+        movingIds,
+      )
       elementsRef.current = next
       setElements(next)
       const now = Date.now()
       if (movedEls.length > 0 && now - lastStreamSyncRef.current > 90) {
         lastStreamSyncRef.current = now
-        syncBatch(movedEls)
+        syncBatch([...movedEls, ...updatedConnectors])
       }
       return
     }
 
-    if (inter.mode === 'resize' && inter.initialElements && inter.initialBounds && inter.handleId) {
+    if (
+      inter.mode === 'resize' &&
+      inter.initialElements &&
+      inter.initialBounds &&
+      inter.handleId
+    ) {
       const [id, orig] = Array.from(inter.initialElements.entries())[0]
       const b = inter.initialBounds
       let x = b.x
@@ -1606,18 +2656,28 @@ export function Whiteboard({
         y = ny
       }
       const resized = resizeElementToBounds(orig, { x, y, w, h })
-      const next = elementsRef.current.map((el) => (el.id === id ? resized : el))
+      const updatedList = elementsRef.current.map((el) =>
+        el.id === id ? resized : el,
+      )
+      const { next, updatedConnectors } = updateAttachedConnectors(
+        updatedList,
+        new Set([id]),
+      )
       elementsRef.current = next
       setElements(next)
       const now = Date.now()
       if (now - lastStreamSyncRef.current > 90) {
         lastStreamSyncRef.current = now
-        syncUpsert(resized)
+        syncBatch([resized, ...updatedConnectors])
       }
       return
     }
 
-    if (inter.mode === 'rotate' && inter.initialElements && inter.initialBounds) {
+    if (
+      inter.mode === 'rotate' &&
+      inter.initialElements &&
+      inter.initialBounds
+    ) {
       const [id, orig] = Array.from(inter.initialElements.entries())[0]
       const b = inter.initialBounds
       const cx = b.x + b.w / 2
@@ -1646,12 +2706,37 @@ export function Whiteboard({
         const pts = d.points!
         const lx = pts[pts.length - 2]
         const ly = pts[pts.length - 1]
-        if (Math.hypot(wx - lx, wy - ly) < 1.5 / cameraRef.current.zoom) return
+        const dist = Math.hypot(wx - lx, wy - ly)
+        if (dist < 1.5 / cameraRef.current.zoom) return
         pts.push(wx, wy)
+        if (d.kind === 'pen' && d.penPreset === 'calligraphy') {
+          const nowT = Date.now()
+          const prevSample = lastDrawSampleRef.current
+          const dt = Math.max(4, nowT - (prevSample?.t ?? nowT - 16))
+          const velocity = dist / dt // px per ms
+          // Slower stroke = wider ink deposit, faster stroke = crisp tapered stroke
+          const factor = Math.max(0.35, Math.min(1.65, 1.5 - velocity * 0.45))
+          const prevW =
+            d.pointWidths?.[d.pointWidths.length - 1] ?? d.strokeWidth
+          const smoothedW = prevW * 0.6 + d.strokeWidth * factor * 0.4
+          d.pointWidths = [...(d.pointWidths ?? []), smoothedW]
+          lastDrawSampleRef.current = { x: wx, y: wy, t: nowT }
+        }
       } else if (d.kind === 'line' || d.kind === 'arrow') {
-        d.points = [inter.startWx, inter.startWy, wx, wy]
-        d.w = wx - inter.startWx
-        d.h = wy - inter.startWy
+        const snap = findNearestAnchor(
+          getVisibleElements(elementsRef.current),
+          wx,
+          wy,
+          new Set([d.id]),
+          24 / cameraRef.current.zoom,
+        )
+        const ex = snap ? snap.x : wx
+        const ey = snap ? snap.y : wy
+        hoveredAnchorRef.current = snap ? { x: snap.x, y: snap.y } : null
+        d.endAnchor = snap?.anchor
+        d.points = [inter.startWx, inter.startWy, ex, ey]
+        d.w = ex - inter.startWx
+        d.h = ey - inter.startWy
       } else {
         d.x = Math.min(inter.startWx, wx)
         d.y = Math.min(inter.startWy, wy)
@@ -1659,11 +2744,14 @@ export function Whiteboard({
         d.h = Math.abs(wy - inter.startWy)
       }
       paintCanvas()
-      // Stream live stroke to Firestore so opposite joiners watch drawing in real time
       const now = Date.now()
       if (now - lastStreamSyncRef.current > 85) {
         lastStreamSyncRef.current = now
-        syncUpsert({ ...d, points: d.points ? [...d.points] : undefined })
+        syncUpsert({
+          ...d,
+          points: d.points ? [...d.points] : undefined,
+          pointWidths: d.pointWidths ? [...d.pointWidths] : undefined,
+        })
       }
     }
   }
@@ -1676,13 +2764,15 @@ export function Whiteboard({
     const inter = interactionRef.current
     if (!inter || inter.pointerId !== e.pointerId) return
     interactionRef.current = null
+    guidesRef.current = []
+    hoveredAnchorRef.current = null
 
     if (inter.mode === 'marquee') {
       const m = marqueeRef.current
       marqueeRef.current = null
       if (m && (m.w > 4 || m.h > 4)) {
-        const hits = elementsRef.current
-          .filter((el) => rectsIntersect(m, getElementBounds(el)))
+        const hits = getVisibleElements(elementsRef.current)
+          .filter((el) => el.kind !== 'frame' && rectsIntersect(m, getElementBounds(el)))
           .map((el) => el.id)
         setSelectedIds(hits)
       }
@@ -1690,7 +2780,11 @@ export function Whiteboard({
       return
     }
 
-    if (inter.mode === 'erase' && inter.erasedIds && inter.erasedIds.size > 0) {
+    if (
+      inter.mode === 'erase' &&
+      inter.erasedIds &&
+      inter.erasedIds.size > 0
+    ) {
       const before = Array.from(inter.initialElements?.values() ?? [])
       pushHistory(before)
       syncDelete(Array.from(inter.erasedIds))
@@ -1698,7 +2792,9 @@ export function Whiteboard({
     }
 
     if (
-      (inter.mode === 'move' || inter.mode === 'resize' || inter.mode === 'rotate') &&
+      (inter.mode === 'move' ||
+        inter.mode === 'resize' ||
+        inter.mode === 'rotate') &&
       inter.initialElements
     ) {
       activeEditingIdsRef.current.clear()
@@ -1712,17 +2808,35 @@ export function Whiteboard({
           (el) => inter.initialElements!.get(el.id) ?? el,
         )
         pushHistory(prev)
-        const updated = elementsRef.current.filter((el) =>
-          inter.initialElements!.has(el.id),
+        const changedIds = new Set(inter.initialElements.keys())
+        const updated = elementsRef.current.filter(
+          (el) =>
+            changedIds.has(el.id) ||
+            (el.startAnchor && changedIds.has(el.startAnchor.elementId)) ||
+            (el.endAnchor && changedIds.has(el.endAnchor.elementId)),
         )
         syncBatch(updated)
       }
+      paintCanvas()
       return
     }
 
     if (inter.mode === 'draw' && draftRef.current) {
-      const draft = draftRef.current
+      let draft = draftRef.current
       draftRef.current = null
+
+      // Smart Shape Pen: recognize rough strokes & snap to clean vector shape
+      if (
+        draft.kind === 'pen' &&
+        draft.penPreset === 'smart-shape' &&
+        draft.points
+      ) {
+        const snapped = recognizeSmartShape(draft.points, draft)
+        if (snapped) {
+          draft = snapped
+        }
+      }
+
       const b = getElementBounds(draft)
       if (
         draft.kind !== 'pen' &&
@@ -1753,6 +2867,10 @@ export function Whiteboard({
     if (!canDraw) return
     const { x: wx, y: wy } = screenToWorld(e.clientX, e.clientY)
     const hit = hitElementTop(wx, wy)
+    if (hit && !hit.locked && hit.kind === 'table') {
+      setEditingTableId(hit.id)
+      return
+    }
     if (
       hit &&
       !hit.locked &&
@@ -1765,6 +2883,7 @@ export function Whiteboard({
         hit.kind === 'speech-bubble')
     ) {
       const b = getElementBounds(hit)
+      const dec = hit.textDecoration ?? 'none'
       setTextEdit({
         elementId: hit.id,
         kind:
@@ -1775,14 +2894,45 @@ export function Whiteboard({
               : 'shape',
         wx: b.x,
         wy: b.y,
-        w: Math.max(160, b.w),
-        h: Math.max(44, b.h),
+        w: Math.max(180, b.w),
+        h: Math.max(48, b.h),
         value: hit.text ?? '',
         stickyBg: hit.stickyBg,
+        fontFamily: hit.fontFamily ?? 'sans',
+        fontSize: hit.fontSize ?? (hit.kind === 'sticky' ? 16 : 20),
+        fontWeight: hit.fontWeight ?? 'normal',
+        fontStyle: hit.fontStyle ?? 'normal',
+        underline: dec.includes('underline'),
+        strikethrough: dec.includes('line-through'),
+        color: hit.strokeColor,
+        textBg: hit.textBg ?? 'transparent',
+        textAlign: hit.textAlign ?? 'left',
       })
     } else if (tool === 'hand') {
       fitToContent()
     }
+  }
+
+  const onContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault()
+    if (!canDraw) return
+    const rect = containerRef.current?.getBoundingClientRect()
+    if (!rect) return
+    const { x: wx, y: wy } = screenToWorld(e.clientX, e.clientY)
+    const hit = hitElementTop(wx, wy)
+    if (hit && !selectedIdsRef.current.includes(hit.id)) {
+      const groupMembers = hit.groupId
+        ? elementsRef.current
+            .filter((el) => el.groupId === hit.groupId)
+            .map((el) => el.id)
+        : [hit.id]
+      setSelectedIds(groupMembers)
+      selectedIdsRef.current = groupMembers
+    }
+    if (selectedIdsRef.current.length === 0 && clipboard.length === 0) return
+    const mx = Math.min(rect.width - 200, Math.max(8, e.clientX - rect.left))
+    const my = Math.min(rect.height - 260, Math.max(8, e.clientY - rect.top))
+    setContextMenu({ x: mx, y: my })
   }
 
   const onWheel = (e: React.WheelEvent) => {
@@ -1799,17 +2949,26 @@ export function Whiteboard({
     }
   }
 
-  // Drag-and-drop image upload
+  // Drag-and-drop Image OR PDF upload onto canvas
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault()
     if (!canDraw) return
     const file = e.dataTransfer.files?.[0]
-    if (!file || !file.type.startsWith('image/')) return
-    const { x, y } = screenToWorld(e.clientX, e.clientY)
-    void addImageAt(file, x, y)
+    if (!file) return
+    if (
+      file.type === 'application/pdf' ||
+      file.name.toLowerCase().endsWith('.pdf')
+    ) {
+      void openPdfFileForImport(file)
+      return
+    }
+    if (file.type.startsWith('image/')) {
+      const { x, y } = screenToWorld(e.clientX, e.clientY)
+      void addImageAt(file, x, y)
+    }
   }
 
-  // Interactive Minimap click/drag panning (aligned with logical 176x112 minimap)
+  // Interactive Minimap click/drag panning
   const panFromMinimap = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const mini = minimapRef.current
     const container = containerRef.current
@@ -1864,6 +3023,7 @@ export function Whiteboard({
       if (
         target?.tagName === 'TEXTAREA' ||
         target?.tagName === 'INPUT' ||
+        target?.tagName === 'SELECT' ||
         target?.isContentEditable
       )
         return
@@ -1872,18 +3032,22 @@ export function Whiteboard({
         return
       }
       if (e.ctrlKey || e.metaKey) {
-        if (e.key.toLowerCase() === 'z' && !e.shiftKey) {
+        const k = e.key.toLowerCase()
+        if (k === 'z' && !e.shiftKey) {
           e.preventDefault()
           undo()
-        } else if (
-          e.key.toLowerCase() === 'y' ||
-          (e.key.toLowerCase() === 'z' && e.shiftKey)
-        ) {
+        } else if (k === 'y' || (k === 'z' && e.shiftKey)) {
           e.preventDefault()
           redo()
-        } else if (e.key.toLowerCase() === 'd') {
+        } else if (k === 'd') {
           e.preventDefault()
           duplicateSelected()
+        } else if (k === 'c') {
+          e.preventDefault()
+          copySelected()
+        } else if (k === 'v') {
+          e.preventDefault()
+          pasteClipboard()
         }
         return
       }
@@ -1921,7 +3085,15 @@ export function Whiteboard({
       window.removeEventListener('keydown', onKeyDown)
       window.removeEventListener('keyup', onKeyUp)
     }
-  }, [canDraw, deleteSelected, duplicateSelected, redo, undo])
+  }, [
+    canDraw,
+    copySelected,
+    deleteSelected,
+    duplicateSelected,
+    pasteClipboard,
+    redo,
+    undo,
+  ])
 
   // ---- Export & Import -----------------------------------------------------
   const downloadBlob = (blob: Blob, filename: string) => {
@@ -2002,6 +3174,34 @@ export function Whiteboard({
     }
   }
 
+  const exportFramesPdf = () => {
+    if (frameElements.length === 0) return
+    try {
+      const pages = frameElements.map((frame) => {
+        const b = getElementBounds(frame)
+        const canvas = renderExportCanvas(elementsRef.current, {
+          bounds: b,
+          scale: 1.25,
+          theme: boardTheme,
+          pattern,
+        })
+        return {
+          dataUrl: canvas.toDataURL('image/jpeg', 0.9),
+          width: canvas.width,
+          height: canvas.height,
+        }
+      })
+      const blob = buildPdf(pages)
+      downloadBlob(
+        blob,
+        `${(title || 'lectern-slides').replace(/[^\w-]+/g, '_')}-slides.pdf`,
+      )
+      toast.success(`Exported ${pages.length} slides to PDF`)
+    } catch {
+      toast.error('Could not export frames to PDF.')
+    }
+  }
+
   const exportJson = () => {
     const json = exportBoardJson(elementsRef.current)
     downloadBlob(
@@ -2041,18 +3241,30 @@ export function Whiteboard({
             ? 'cell'
             : 'crosshair'
 
-  const activeShapeIcon =
+  const ActiveShapeIcon =
     SHAPE_TOOLS.find((s) => s.tool === tool)?.icon ??
     SHAPE_TOOLS.find((s) => s.tool === lastShapeTool)?.icon ??
     Square
-  const ActiveShapeIcon = activeShapeIcon
   const isShapeActive = SHAPE_TOOLS.some((s) => s.tool === tool)
+  const ActivePenIcon =
+    PEN_PRESETS.find((p) => p.id === penPreset)?.icon ?? Pen
 
-  const editorScreen = textEdit
-    ? {
-        sx: textEdit.wx * camera.zoom + camera.panX,
-        sy: textEdit.wy * camera.zoom + camera.panY,
-      }
+  // Compute floating toolbar anchor above selected object(s)
+  const selectionAnchor = useMemo(() => {
+    if (selectedElements.length === 0) return null
+    const b = getContentBounds(selectedElements)
+    if (!b) return null
+    return {
+      x: (b.x + b.w / 2) * camera.zoom + camera.panX,
+      y: b.y * camera.zoom + camera.panY,
+    }
+  }, [selectedElements, camera])
+
+  const croppingElement = croppingId
+    ? (elements.find((e) => e.id === croppingId) ?? null)
+    : null
+  const editingTable = editingTableId
+    ? (elements.find((e) => e.id === editingTableId) ?? null)
     : null
 
   return (
@@ -2071,6 +3283,28 @@ export function Whiteboard({
         onChange={(e) => {
           const f = e.target.files?.[0]
           if (f) void addImageAt(f)
+          e.target.value = ''
+        }}
+      />
+      <input
+        ref={replaceImgInputRef}
+        type="file"
+        accept="image/*"
+        className="hidden"
+        onChange={(e) => {
+          const f = e.target.files?.[0]
+          if (f) void handleReplaceImageFile(f)
+          e.target.value = ''
+        }}
+      />
+      <input
+        ref={pdfInputRef}
+        type="file"
+        accept="application/pdf,.pdf"
+        className="hidden"
+        onChange={(e) => {
+          const f = e.target.files?.[0]
+          if (f) void openPdfFileForImport(f)
           e.target.value = ''
         }}
       />
@@ -2104,13 +3338,138 @@ export function Whiteboard({
             >
               <Hand className="size-4" />
             </ToolButton>
-            <ToolButton
-              label="Pen"
-              active={tool === 'pen'}
-              onClick={() => setTool('pen')}
-            >
-              <Pen className="size-4" />
-            </ToolButton>
+
+            {/* Pen button + Expandable Pen Submenu */}
+            <div className="flex items-center">
+              <ToolButton
+                label="Pen"
+                active={tool === 'pen'}
+                onClick={() => setTool('pen')}
+              >
+                <ActivePenIcon className="size-4" />
+              </ToolButton>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="Pen styles and presets"
+                    title="Pen styles, stroke type & thickness"
+                    className={cn(
+                      'grid h-8 w-4 place-items-center rounded-md transition-colors hover:bg-background',
+                      tool === 'pen' && 'text-primary',
+                    )}
+                  >
+                    <ChevronDown className="size-3" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" className="w-64 p-1.5">
+                  <DropdownMenuLabel className="text-xs">
+                    Pen Tip &amp; Mode
+                  </DropdownMenuLabel>
+                  {PEN_PRESETS.map((preset) => (
+                    <DropdownMenuItem
+                      key={preset.id}
+                      onSelect={() => {
+                        setPenPreset(preset.id)
+                        setTool('pen')
+                      }}
+                      className="flex items-center gap-2"
+                    >
+                      <preset.icon className="size-4 shrink-0 text-primary" />
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs font-medium">{preset.label}</p>
+                        <p className="text-[10px] text-muted-foreground">
+                          {preset.desc}
+                        </p>
+                      </div>
+                      {penPreset === preset.id && (
+                        <span className="text-xs text-primary">●</span>
+                      )}
+                    </DropdownMenuItem>
+                  ))}
+                  <DropdownMenuSeparator />
+                  <DropdownMenuLabel className="text-xs">
+                    Stroke Style
+                  </DropdownMenuLabel>
+                  <div className="grid grid-cols-3 gap-1 px-1.5 pb-1.5">
+                    {(['solid', 'dashed', 'dotted'] as StrokeStyle[]).map(
+                      (st) => (
+                        <button
+                          key={st}
+                          type="button"
+                          onClick={() => setStrokeStyle(st)}
+                          className={cn(
+                            'rounded-md border px-2 py-1 text-[11px] capitalize transition-colors',
+                            strokeStyle === st
+                              ? 'border-primary bg-primary/12 font-medium text-primary'
+                              : 'border-border hover:bg-muted',
+                          )}
+                        >
+                          {st}
+                        </button>
+                      ),
+                    )}
+                  </div>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuLabel className="text-xs">
+                    Thickness &amp; Opacity
+                  </DropdownMenuLabel>
+                  <div className="space-y-2 px-1.5 pb-1.5">
+                    <div className="flex items-center justify-between gap-1.5">
+                      {THICKNESS_DOTS.map((sz) => (
+                        <button
+                          key={sz}
+                          type="button"
+                          aria-label={`Thickness ${sz}px`}
+                          onClick={() => setStrokeWidth(sz)}
+                          className={cn(
+                            'grid size-7 place-items-center rounded-md border transition-colors',
+                            strokeWidth === sz
+                              ? 'border-primary bg-primary/12'
+                              : 'border-border hover:bg-muted',
+                          )}
+                        >
+                          <span
+                            className="rounded-full bg-foreground"
+                            style={{
+                              width: Math.min(16, sz + 2),
+                              height: Math.min(16, sz + 2),
+                            }}
+                          />
+                        </button>
+                      ))}
+                    </div>
+                    <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                      <span className="w-12">Size {strokeWidth}</span>
+                      <input
+                        type="range"
+                        min={1}
+                        max={24}
+                        value={strokeWidth}
+                        onChange={(e) => setStrokeWidth(Number(e.target.value))}
+                        className="flex-1 accent-primary"
+                      />
+                    </div>
+                    <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                      <span className="w-12">
+                        Op {Math.round(opacity * 100)}%
+                      </span>
+                      <input
+                        type="range"
+                        min={10}
+                        max={100}
+                        value={Math.round(opacity * 100)}
+                        onChange={(e) =>
+                          setOpacity(Number(e.target.value) / 100)
+                        }
+                        className="flex-1 accent-primary"
+                      />
+                    </div>
+                  </div>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+
             <ToolButton
               label="Highlighter"
               active={tool === 'highlighter'}
@@ -2119,14 +3478,14 @@ export function Whiteboard({
               <Highlighter className="size-4" />
             </ToolButton>
             <ToolButton
-              label="Line"
+              label="Line (Smart Connector)"
               active={tool === 'line'}
               onClick={() => setTool('line')}
             >
               <Minus className="size-4" />
             </ToolButton>
             <ToolButton
-              label="Arrow"
+              label="Arrow (Smart Connector)"
               active={tool === 'arrow'}
               onClick={() => setTool('arrow')}
             >
@@ -2169,19 +3528,6 @@ export function Whiteboard({
                   </DropdownMenuItem>
                 ))}
                 <DropdownMenuSeparator />
-                <DropdownMenuLabel>Border style</DropdownMenuLabel>
-                {(['solid', 'dashed', 'dotted'] as StrokeStyle[]).map((st) => (
-                  <DropdownMenuItem
-                    key={st}
-                    onSelect={() => setStrokeStyle(st)}
-                  >
-                    <span className="capitalize">{st}</span>
-                    {strokeStyle === st && (
-                      <span className="ml-auto text-xs text-primary">●</span>
-                    )}
-                  </DropdownMenuItem>
-                ))}
-                <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onSelect={() =>
                     setFillColor((f) =>
@@ -2210,12 +3556,164 @@ export function Whiteboard({
             >
               <StickyNote className="size-4" />
             </ToolButton>
+
+            {/* Editable Table Picker */}
+            <DropdownMenu>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      type="button"
+                      aria-label="Insert table"
+                      className="grid size-8 place-items-center rounded-md hover:bg-background"
+                    >
+                      <Table2 className="size-4" />
+                    </button>
+                  </DropdownMenuTrigger>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Insert table</TooltipContent>
+              </Tooltip>
+              <DropdownMenuContent align="start" className="w-52 p-3">
+                <DropdownMenuLabel className="px-0 pt-0 text-xs">
+                  Insert Editable Table
+                </DropdownMenuLabel>
+                <div className="space-y-2.5 text-xs">
+                  <div className="flex items-center justify-between">
+                    <span className="text-muted-foreground">Rows</span>
+                    <div className="flex items-center gap-1">
+                      <Button
+                        size="icon"
+                        variant="outline"
+                        className="size-6"
+                        onClick={() =>
+                          setTableRowsPick((r) => Math.max(1, r - 1))
+                        }
+                      >
+                        <Minus className="size-3" />
+                      </Button>
+                      <span className="w-6 text-center font-medium tabular-nums">
+                        {tableRowsPick}
+                      </span>
+                      <Button
+                        size="icon"
+                        variant="outline"
+                        className="size-6"
+                        onClick={() =>
+                          setTableRowsPick((r) => Math.min(10, r + 1))
+                        }
+                      >
+                        <Plus className="size-3" />
+                      </Button>
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-muted-foreground">Columns</span>
+                    <div className="flex items-center gap-1">
+                      <Button
+                        size="icon"
+                        variant="outline"
+                        className="size-6"
+                        onClick={() =>
+                          setTableColsPick((c) => Math.max(1, c - 1))
+                        }
+                      >
+                        <Minus className="size-3" />
+                      </Button>
+                      <span className="w-6 text-center font-medium tabular-nums">
+                        {tableColsPick}
+                      </span>
+                      <Button
+                        size="icon"
+                        variant="outline"
+                        className="size-6"
+                        onClick={() =>
+                          setTableColsPick((c) => Math.min(8, c + 1))
+                        }
+                      >
+                        <Plus className="size-3" />
+                      </Button>
+                    </div>
+                  </div>
+                  <Button
+                    size="xs"
+                    className="w-full"
+                    onClick={() => insertTable(tableRowsPick, tableColsPick)}
+                  >
+                    Insert {tableRowsPick}×{tableColsPick} Table
+                  </Button>
+                </div>
+              </DropdownMenuContent>
+            </DropdownMenu>
+
+            {/* Frame / Lesson Slide tool */}
+            <ToolButton
+              label="Draw Lesson Frame"
+              active={tool === 'frame'}
+              onClick={() => setTool('frame')}
+            >
+              <Frame className="size-4" />
+            </ToolButton>
+
             <ToolButton
               label="Upload image"
               onClick={() => fileInputRef.current?.click()}
             >
               <ImagePlus className="size-4" />
             </ToolButton>
+            <ToolButton
+              label="Import PDF"
+              onClick={() => pdfInputRef.current?.click()}
+            >
+              <FileUp className="size-4" />
+            </ToolButton>
+
+            {/* Quick Math & Symbols Picker */}
+            <DropdownMenu>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      type="button"
+                      aria-label="Math symbols and coordinate plane"
+                      className="grid size-8 place-items-center rounded-md hover:bg-background"
+                    >
+                      <Sigma className="size-4" />
+                    </button>
+                  </DropdownMenuTrigger>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">
+                  Math symbols &amp; graph grid
+                </TooltipContent>
+              </Tooltip>
+              <DropdownMenuContent align="start" className="w-60 p-2">
+                <DropdownMenuLabel className="px-1 pt-0 text-xs">
+                  Math &amp; Science Symbols
+                </DropdownMenuLabel>
+                <div className="grid grid-cols-6 gap-1">
+                  {MATH_SYMBOLS.map((sym) => (
+                    <button
+                      key={sym}
+                      type="button"
+                      onClick={() => insertMathSymbol(sym)}
+                      className="grid size-8 place-items-center rounded-md border border-transparent text-sm font-medium hover:border-border hover:bg-muted"
+                    >
+                      {sym}
+                    </button>
+                  ))}
+                </div>
+                <DropdownMenuSeparator className="my-2" />
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="outline"
+                  className="w-full gap-1.5"
+                  onClick={() => insertTemplate('coordGrid')}
+                >
+                  <Grid2X2 className="size-3.5" /> Insert Coordinate Plane
+                </Button>
+              </DropdownMenuContent>
+            </DropdownMenu>
+
             <ToolButton
               label="Laser pointer"
               active={tool === 'laser'}
@@ -2273,11 +3771,14 @@ export function Whiteboard({
           </span>
         )}
 
-        {/* Color swatches, width, opacity */}
+        {/* Color swatches, width, undo/redo, clear */}
         {canDraw && (
           <div className="flex flex-wrap items-center gap-1.5">
             {tool === 'sticky' ? (
-              <div className="flex items-center gap-1" aria-label="Sticky note colour">
+              <div
+                className="flex items-center gap-1"
+                aria-label="Sticky note colour"
+              >
                 {STICKY_COLORS.map((sc) => (
                   <button
                     key={sc.bg}
@@ -2344,21 +3845,8 @@ export function Whiteboard({
                 max={20}
                 value={strokeWidth}
                 onChange={(e) => setStrokeWidth(Number(e.target.value))}
-                className="w-14 accent-primary"
-                aria-label="Stroke width"
-              />
-            </label>
-
-            <label className="hidden items-center gap-1 text-xs text-muted-foreground xl:flex">
-              <span>Op</span>
-              <input
-                type="range"
-                min={20}
-                max={100}
-                value={Math.round(opacity * 100)}
-                onChange={(e) => setOpacity(Number(e.target.value) / 100)}
                 className="w-12 accent-primary"
-                aria-label="Opacity"
+                aria-label="Stroke width"
               />
             </label>
 
@@ -2378,6 +3866,13 @@ export function Whiteboard({
                 <Redo2 className="size-4" />
               </ToolButton>
               <ToolButton
+                label="Snap to grid"
+                active={snapToGrid}
+                onClick={() => setSnapToGrid((s) => !s)}
+              >
+                <Magnet className="size-4" />
+              </ToolButton>
+              <ToolButton
                 label="Clear board"
                 onClick={() => setClearConfirmOpen(true)}
                 disabled={elements.length === 0}
@@ -2388,8 +3883,48 @@ export function Whiteboard({
           </div>
         )}
 
-        {/* Right utilities: Boards, Allow Annotate, Follow Presenter, Background, Theme, Add Frame/Space, Export, Close */}
+        {/* Right utilities: Slides, Bring Everyone, Boards, Annotate, Follow, Background, Export, Close */}
         <div className="ml-auto flex flex-wrap items-center gap-1">
+          <button
+            type="button"
+            aria-pressed={framesOpen}
+            aria-label="Lesson slides and frames"
+            onClick={() => setFramesOpen((o) => !o)}
+            className={cn(
+              'flex h-8 items-center gap-1.5 rounded-lg border px-2 text-xs font-medium transition-colors',
+              framesOpen
+                ? 'border-primary/40 bg-primary/12 text-primary'
+                : 'border-border bg-muted/60 text-muted-foreground hover:text-foreground',
+            )}
+          >
+            <Frame className="size-3.5 shrink-0" />
+            <span className="hidden sm:inline">
+              Slides{frameElements.length > 0 ? ` (${frameElements.length})` : ''}
+            </span>
+          </button>
+
+          {isTeacher && (onCameraBroadcast || syncScope?.kind === 'board') && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="outline"
+                  className="h-8 gap-1.5 px-2 text-xs"
+                  aria-label="Bring everyone to my view"
+                  onClick={bringEveryoneToMe}
+                >
+                  <Navigation className="size-3.5 text-primary" />
+                  <span className="hidden xl:inline">Bring everyone</span>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">
+                Jump all students immediately to your current viewport &amp;
+                zoom
+              </TooltipContent>
+            </Tooltip>
+          )}
+
           {isTeacher && onOpenBoardPicker && (
             <Button
               type="button"
@@ -2550,6 +4085,11 @@ export function Whiteboard({
               <DropdownMenuItem onSelect={exportPdf}>
                 PDF document
               </DropdownMenuItem>
+              {frameElements.length > 0 && (
+                <DropdownMenuItem onSelect={exportFramesPdf}>
+                  Export Slides ({frameElements.length}) to PDF
+                </DropdownMenuItem>
+              )}
               <DropdownMenuSeparator />
               <DropdownMenuItem onSelect={exportJson}>
                 Save board JSON
@@ -2578,64 +4118,7 @@ export function Whiteboard({
         </div>
       </div>
 
-      {/* Selection floating action bar */}
-      {canDraw && selectedElements.length > 0 && (
-        <div className="flex items-center gap-1 border-b border-border bg-muted/60 px-3 py-1 text-xs">
-          <span className="mr-1 font-medium text-muted-foreground">
-            {selectedElements.length} selected
-          </span>
-          <Button
-            size="xs"
-            variant="ghost"
-            className="gap-1"
-            onClick={duplicateSelected}
-          >
-            <Copy className="size-3.5" /> Duplicate
-          </Button>
-          <Button
-            size="xs"
-            variant="ghost"
-            className="gap-1"
-            onClick={toggleLockSelected}
-          >
-            {selectedElements.every((e) => e.locked) ? (
-              <>
-                <LockOpen className="size-3.5" /> Unlock
-              </>
-            ) : (
-              <>
-                <Lock className="size-3.5" /> Lock
-              </>
-            )}
-          </Button>
-          <Button
-            size="xs"
-            variant="ghost"
-            className="gap-1"
-            onClick={() => reorderSelected('front')}
-          >
-            <BringToFront className="size-3.5" /> Forward
-          </Button>
-          <Button
-            size="xs"
-            variant="ghost"
-            className="gap-1"
-            onClick={() => reorderSelected('back')}
-          >
-            <SendToBack className="size-3.5" /> Back
-          </Button>
-          <Button
-            size="xs"
-            variant="ghost"
-            className="ml-auto gap-1 text-destructive hover:text-destructive"
-            onClick={deleteSelected}
-          >
-            <Trash2 className="size-3.5" /> Delete
-          </Button>
-        </div>
-      )}
-
-      {/* Infinite Canvas Viewport — full-viewport stage container */}
+      {/* Infinite Canvas Viewport */}
       <div className="relative min-h-0 flex-1 overflow-hidden">
         <div
           ref={containerRef}
@@ -2646,6 +4129,7 @@ export function Whiteboard({
           onPointerUp={onPointerUp}
           onPointerCancel={onPointerUp}
           onDoubleClick={onDoubleClick}
+          onContextMenu={onContextMenu}
           onWheel={onWheel}
           onDragOver={(e) => e.preventDefault()}
           onDrop={onDrop}
@@ -2657,109 +4141,239 @@ export function Whiteboard({
             className="absolute inset-0 block h-full w-full"
           />
 
-        {/* Inline text / sticky editor */}
-        {textEdit && editorScreen && (
-          <textarea
-            autoFocus
-            aria-label="Text"
-            defaultValue={textEdit.value}
-            className="absolute z-20 resize rounded-lg border-2 border-primary p-2 font-medium leading-snug shadow-lg outline-none"
-            style={{
-              left: editorScreen.sx,
-              top: editorScreen.sy,
-              width: Math.max(160, textEdit.w * camera.zoom),
-              height: Math.max(48, textEdit.h * camera.zoom),
-              fontSize:
-                (textEdit.kind === 'sticky' ? 16 : Math.max(18, strokeWidth * 5)) *
-                camera.zoom,
-              background:
-                textEdit.kind === 'sticky'
-                  ? textEdit.stickyBg || stickyColor
-                  : boardTheme === 'dark'
-                    ? 'rgba(23,31,27,0.95)'
-                    : 'rgba(250,249,245,0.96)',
-              color:
-                textEdit.kind === 'sticky'
-                  ? '#1f2924'
-                  : strokeColor,
-            }}
-            onBlur={(e) => commitTextEdit(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Escape') {
-                setTextEdit(null)
-              } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-                commitTextEdit((e.target as HTMLTextAreaElement).value)
-              }
-            }}
-            placeholder={
-              textEdit.kind === 'sticky'
-                ? 'Write sticky note…'
-                : 'Type text (Ctrl+Enter to finish)'
-            }
-          />
-        )}
+          {/* Interactive PDF Deck Page Flipper Overlays */}
+          {pdfDecks.map((deck) => {
+            const b = getElementBounds(deck)
+            const sx = (b.x + b.w / 2) * camera.zoom + camera.panX
+            const sy = (b.y + b.h) * camera.zoom + camera.panY + 8
+            const page = (deck.pdfPageIndex ?? 0) + 1
+            const total = Math.max(1, deck.pdfPageCount ?? 1)
+            return (
+              <div
+                key={deck.id}
+                onPointerDown={(e) => e.stopPropagation()}
+                style={{ left: sx, top: sy }}
+                className="absolute z-20 flex -translate-x-1/2 items-center gap-1 rounded-full border border-border bg-card/95 px-2 py-1 text-xs text-card-foreground shadow-md backdrop-blur"
+              >
+                <button
+                  type="button"
+                  aria-label="Previous PDF page"
+                  disabled={page <= 1}
+                  onClick={() => flipPdfDeckPage(deck, -1)}
+                  className="grid size-6 place-items-center rounded-full hover:bg-muted disabled:opacity-35"
+                >
+                  <ChevronLeft className="size-3.5" />
+                </button>
+                <span className="min-w-20 text-center font-medium tabular-nums">
+                  Page {page} / {total}
+                </span>
+                <button
+                  type="button"
+                  aria-label="Next PDF page"
+                  disabled={page >= total}
+                  onClick={() => flipPdfDeckPage(deck, 1)}
+                  className="grid size-6 place-items-center rounded-full hover:bg-muted disabled:opacity-35"
+                >
+                  <ChevronRight className="size-3.5" />
+                </button>
+              </div>
+            )
+          })}
 
-        {/* Bottom-right Navigation HUD & Interactive Minimap */}
-        <div
-          className="absolute bottom-3 right-3 z-10 flex flex-col items-end gap-2"
-          onPointerDown={(e) => e.stopPropagation()}
-        >
-          {showMinimap && (
-            <div className="overflow-hidden rounded-lg border border-border bg-card/95 shadow-md backdrop-blur">
-              <canvas
-                ref={minimapRef}
-                width={176}
-                height={112}
-                className="block h-[112px] w-[176px] cursor-crosshair"
-                onPointerDown={(e) => {
-                  e.currentTarget.setPointerCapture(e.pointerId)
-                  panFromMinimap(e)
+          {/* Zoom-Style Floating Selection Toolbar */}
+          {canDraw &&
+            selectionAnchor &&
+            selectedElements.length > 0 &&
+            !textEdit &&
+            !croppingElement &&
+            !editingTable && (
+              <SelectionFloatingToolbar
+                selectedElements={selectedElements}
+                anchor={selectionAnchor}
+                containerWidth={viewportSize.width}
+                containerHeight={viewportSize.height}
+                hasClipboard={clipboard.length > 0}
+                onDelete={deleteSelected}
+                onDuplicate={duplicateSelected}
+                onCopy={copySelected}
+                onPaste={pasteClipboard}
+                onToggleLock={toggleLockSelected}
+                onReorder={reorderSelected}
+                onRotate90={rotateSelected90}
+                onFlip={flipSelected}
+                onOpacityChange={setSelectedOpacity}
+                onStartCrop={(el) => setCroppingId(el.id)}
+                onReplaceImage={(el) => {
+                  replaceTargetIdRef.current = el.id
+                  replaceImgInputRef.current?.click()
                 }}
-                onPointerMove={(e) => {
-                  if (e.buttons === 1) panFromMinimap(e)
-                }}
+                onDownloadImage={handleDownloadImage}
+                onStyleImage={handleStyleImage}
+                onGroupToggle={toggleGroupSelected}
+                onAlign={handleAlignSelected}
+                onDistribute={handleDistributeSelected}
+                onAddMindMapBranch={handleAddMindMapBranch}
               />
-            </div>
+            )}
+
+          {/* Right-Click Context Menu */}
+          {contextMenu && canDraw && (
+            <CanvasContextMenu
+              pos={contextMenu}
+              hasSelection={selectedElements.length > 0}
+              allLocked={
+                selectedElements.length > 0 &&
+                selectedElements.every((e) => e.locked)
+              }
+              hasClipboard={clipboard.length > 0}
+              onClose={() => setContextMenu(null)}
+              onCopy={copySelected}
+              onPaste={pasteClipboard}
+              onDuplicate={duplicateSelected}
+              onToggleLock={toggleLockSelected}
+              onReorder={reorderSelected}
+              onDelete={deleteSelected}
+            />
           )}
-          <div className="flex items-center gap-0.5 rounded-xl border border-border bg-card/95 p-1 text-card-foreground shadow-md backdrop-blur">
-            <ToolButton label="Zoom out" onClick={() => zoomAt(1 / 1.25)}>
-              <Minus className="size-3.5" />
-            </ToolButton>
-            <button
-              type="button"
-              onClick={resetView}
-              className="min-w-12 rounded-md px-1.5 py-1 text-xs font-medium tabular-nums hover:bg-muted"
-              title="Reset zoom to 100%"
-            >
-              {Math.round(camera.zoom * 100)}%
-            </button>
-            <ToolButton label="Zoom in" onClick={() => zoomAt(1.25)}>
-              <Plus className="size-3.5" />
-            </ToolButton>
-            <span className="mx-0.5 h-4 w-px bg-border" />
-            <ToolButton label="Fit to content" onClick={fitToContent}>
-              <Maximize2 className="size-3.5" />
-            </ToolButton>
-            <ToolButton label="Reset view" onClick={resetView}>
-              <RotateCcw className="size-3.5" />
-            </ToolButton>
-            <button
-              type="button"
-              onClick={() => setShowMinimap((m) => !m)}
-              className={cn(
-                'rounded-md px-2 py-1 text-[11px] font-medium transition-colors',
-                showMinimap
-                  ? 'bg-primary/15 text-primary'
-                  : 'text-muted-foreground hover:bg-muted',
-              )}
-              aria-label="Toggle minimap"
-            >
-              Map
-            </button>
+
+          {/* Interactive Image Crop Mode */}
+          {croppingElement && (
+            <ImageCropOverlay
+              element={croppingElement}
+              camera={camera}
+              onCancel={() => setCroppingId(null)}
+              onApply={(res) => {
+                const prev = elementsRef.current
+                const updated: BoardElement = {
+                  ...croppingElement,
+                  x: res.x,
+                  y: res.y,
+                  w: res.w,
+                  h: res.h,
+                  imageDataUrl: res.dataUrl,
+                }
+                const next = prev.map((e) =>
+                  e.id === croppingElement.id ? updated : e,
+                )
+                pushHistory(prev)
+                elementsRef.current = next
+                setElements(next)
+                syncUpsert(updated)
+                setCroppingId(null)
+                toast.success('Image cropped')
+              }}
+            />
+          )}
+
+          {/* Full Rich Text Inline Editor */}
+          {textEdit && (
+            <RichTextInlineEditor
+              draft={textEdit}
+              camera={camera}
+              boardTheme={boardTheme}
+              containerWidth={viewportSize.width}
+              onChange={setTextEdit}
+              onCommit={commitTextEdit}
+              onCancel={() => setTextEdit(null)}
+            />
+          )}
+
+          {/* Inline Editable Table Overlay */}
+          {editingTable && (
+            <TableInlineEditor
+              table={editingTable}
+              camera={camera}
+              onUpdate={updateTableElement}
+              onClose={() => setEditingTableId(null)}
+            />
+          )}
+
+          {/* Collapsible Lesson Slides / Frames Navigator Sidebar */}
+          {framesOpen && (
+            <FramesSidebar
+              frames={frameElements}
+              canDraw={canDraw}
+              onJumpToFrame={(f) => jumpToRect(getElementBounds(f), 90)}
+              onAddFrame={addPresetFrame}
+              onRenameFrame={renameFrame}
+              onDeleteFrame={deleteFrame}
+              onExportFramesPdf={exportFramesPdf}
+              onClose={() => setFramesOpen(false)}
+            />
+          )}
+
+          {/* Bottom-right Navigation HUD & Interactive Minimap */}
+          <div
+            className="absolute bottom-3 right-3 z-10 flex flex-col items-end gap-2"
+            onPointerDown={(e) => e.stopPropagation()}
+          >
+            {showMinimap && (
+              <div className="overflow-hidden rounded-lg border border-border bg-card/95 shadow-md backdrop-blur">
+                <canvas
+                  ref={minimapRef}
+                  width={176}
+                  height={112}
+                  className="block h-[112px] w-[176px] cursor-crosshair"
+                  onPointerDown={(e) => {
+                    e.currentTarget.setPointerCapture(e.pointerId)
+                    panFromMinimap(e)
+                  }}
+                  onPointerMove={(e) => {
+                    if (e.buttons === 1) panFromMinimap(e)
+                  }}
+                />
+              </div>
+            )}
+            <div className="flex items-center gap-0.5 rounded-xl border border-border bg-card/95 p-1 text-card-foreground shadow-md backdrop-blur">
+              <ToolButton label="Zoom out" onClick={() => zoomAt(1 / 1.25)}>
+                <Minus className="size-3.5" />
+              </ToolButton>
+              <button
+                type="button"
+                onClick={resetView}
+                className="min-w-12 rounded-md px-1.5 py-1 text-xs font-medium tabular-nums hover:bg-muted"
+                title="Reset zoom to 100%"
+              >
+                {Math.round(camera.zoom * 100)}%
+              </button>
+              <ToolButton label="Zoom in" onClick={() => zoomAt(1.25)}>
+                <Plus className="size-3.5" />
+              </ToolButton>
+              <span className="mx-0.5 h-4 w-px bg-border" />
+              <ToolButton label="Fit to content" onClick={fitToContent}>
+                <Maximize2 className="size-3.5" />
+              </ToolButton>
+              <ToolButton label="Reset view" onClick={resetView}>
+                <RotateCcw className="size-3.5" />
+              </ToolButton>
+              <button
+                type="button"
+                onClick={() => setShowMinimap((m) => !m)}
+                className={cn(
+                  'rounded-md px-2 py-1 text-[11px] font-medium transition-colors',
+                  showMinimap
+                    ? 'bg-primary/15 text-primary'
+                    : 'text-muted-foreground hover:bg-muted',
+                )}
+                aria-label="Toggle minimap"
+              >
+                Map
+              </button>
+            </div>
           </div>
         </div>
-        </div>
       </div>
+
+      {/* PDF Import Dialog */}
+      <PdfImportDialog
+        open={pdfDialogOpen}
+        session={pdfSession}
+        loadingFile={pdfLoadingFile}
+        importing={pdfImporting}
+        importProgress={pdfProgress}
+        onClose={closePdfDialog}
+        onConfirm={(payload) => void confirmPdfImport(payload)}
+      />
 
       {/* Clear Board Confirmation Dialog */}
       <Dialog open={clearConfirmOpen} onOpenChange={setClearConfirmOpen}>

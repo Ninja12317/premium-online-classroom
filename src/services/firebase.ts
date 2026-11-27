@@ -8,14 +8,30 @@ import {
   type User,
 } from 'firebase/auth'
 
+function readEnv(key: keyof ImportMetaEnv): string | undefined {
+  const value = import.meta.env?.[key]
+  return typeof value === 'string' && value.trim().length > 0
+    ? value.trim()
+    : undefined
+}
+
 const firebaseConfig = {
-  apiKey: 'AIzaSyABTogRRkiPsOzjc8A5d1lYqgoAFo3ZKXM',
-  authDomain: 'lectern-by-quizzy.firebaseapp.com',
-  projectId: 'lectern-by-quizzy',
-  storageBucket: 'lectern-by-quizzy.firebasestorage.app',
-  messagingSenderId: '341944006560',
-  appId: '1:341944006560:web:cb7543604d5561915a56c5',
-  measurementId: 'G-07R01K67GB',
+  apiKey:
+    readEnv('VITE_FIREBASE_API_KEY') ??
+    'AIzaSyABTogRRkiPsOzjc8A5d1lYqgoAFo3ZKXM',
+  authDomain:
+    readEnv('VITE_FIREBASE_AUTH_DOMAIN') ??
+    'lectern-by-quizzy.firebaseapp.com',
+  projectId: readEnv('VITE_FIREBASE_PROJECT_ID') ?? 'lectern-by-quizzy',
+  storageBucket:
+    readEnv('VITE_FIREBASE_STORAGE_BUCKET') ??
+    'lectern-by-quizzy.firebasestorage.app',
+  messagingSenderId:
+    readEnv('VITE_FIREBASE_MESSAGING_SENDER_ID') ?? '341944006560',
+  appId:
+    readEnv('VITE_FIREBASE_APP_ID') ??
+    '1:341944006560:web:cb7543604d5561915a56c5',
+  measurementId: readEnv('VITE_FIREBASE_MEASUREMENT_ID') ?? 'G-07R01K67GB',
 }
 
 export const app = getApps().length ? getApp() : initializeApp(firebaseConfig)
@@ -121,6 +137,15 @@ export async function ensureClientUid(): Promise<string> {
 export function getCachedClientUid(): string {
   if (auth.currentUser?.uid) return auth.currentUser.uid
   return getOrCreateLocalUid()
+}
+
+export function clearCachedClientUid() {
+  if (typeof window === 'undefined') return
+  try {
+    localStorage.removeItem(CLIENT_UID_KEY)
+  } catch {
+    // ignore
+  }
 }
 
 // ---------------------------------------------------------------------------

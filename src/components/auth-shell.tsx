@@ -1,4 +1,7 @@
 import type { ReactNode } from 'react'
+import { useNavigate } from '@tanstack/react-router'
+
+import { BackButton } from '@/components/back-button'
 import { Brand } from '@/components/brand'
 import { ThemeToggle } from '@/components/theme-toggle'
 
@@ -11,12 +14,25 @@ export function AuthShell({
   subtitle: string
   children: ReactNode
 }) {
+  const navigate = useNavigate()
   return (
     <main className="relative grid min-h-svh place-items-center px-4 py-12">
       <div
         className="paper-grid pointer-events-none absolute inset-0 -z-10"
         aria-hidden
       />
+      <div className="absolute left-4 top-4">
+        <BackButton
+          onClick={() => {
+            if (typeof window !== 'undefined' && window.history.length > 1) {
+              window.history.back()
+            } else {
+              void navigate({ to: '/' })
+            }
+          }}
+          label="Back"
+        />
+      </div>
       <div className="absolute right-4 top-4">
         <ThemeToggle />
       </div>

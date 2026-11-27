@@ -1,28 +1,38 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { Link } from '@tanstack/react-router'
 import {
+  BookOpen,
   CalendarDays,
   CalendarPlus,
+  Check,
+  ChevronRight,
   Copy,
   Download,
   Film,
+  GraduationCap,
   KeyRound,
+  LogIn,
   MessageSquare,
-  Pencil,
-  Play,
-  Search,
-  SendHorizonal,
-  Sparkles,
-  Trash2,
-  Video,
-  VideoOff,
   Mic,
   MicOff,
-  ArrowLeft,
+  Pencil,
+  Play,
+  PlusSquare,
+  RefreshCw,
+  Search,
+  SendHorizonal,
+  SlidersHorizontal,
+  Sparkles,
+  Trash2,
+  UserRound,
+  Video,
+  VideoOff,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
+import type { AuthModalMode } from '@/components/auth-modal'
 import { AvatarBubble } from '@/components/avatar-bubble'
+import { BackButton } from '@/components/back-button'
 import { DeviceSettings } from '@/components/device-settings'
 import { displayName, useIdentity } from '@/components/identity-provider'
 import { MediaError } from '@/components/media-error'
@@ -51,13 +61,12 @@ import {
 } from '@/lib/meeting'
 import type { MeetingSummary } from '@/lib/meeting-types'
 import {
-  defaultPrefs,
-  loadPrefs,
-  loadPrefsCached,
+  patchStoredPrefs,
   savePrefs,
+  useJoinPrefs,
   type JoinPrefs,
 } from '@/lib/prefs'
-import { useClientValue } from '@/lib/use-client-value'
+import { statusMeta, useUserProfile } from '@/lib/profile'
 import { useAttachStream, useLocalMedia } from '@/lib/use-local-media'
 import { useMounted } from '@/lib/use-mounted'
 import { cn } from '@/lib/utils'
@@ -80,17 +89,40 @@ export type DashboardMeeting = MeetingSummary & { passcode: string | null }
 
 export function MeetingsTab({
   meetings,
+  onBack,
   onEdit,
   onDelete,
   onRefresh,
+  onStartWithPmi,
+  onOpenJoin,
+  onOpenAuth,
 }: {
   meetings: DashboardMeeting[]
+  onBack?: () => void
   onEdit: (m: DashboardMeeting) => void
   onDelete: (meetingId: string) => void
   onRefresh: () => void
+  onStartWithPmi?: () => void
+  onOpenJoin?: () => void
+  onOpenAuth?: (mode: AuthModalMode) => void
 }) {
+  const { user, authStatus, role } = useIdentity()
+  const profile = useUserProfile()
   const mounted = useMounted()
   const [search, setSearch] = useState('')
+  const [detailId, setDetailId] = useState<string | null>(null)
+  const [copiedPmi, setCopiedPmi] = useState(false)
+  const isTeacher = authStatus === 'authenticated' && role === 'teacher'
+  const teacherPmi = isTeacher ? user?.pmi || profile.pmi || '' : ''
+
+  function copyTeacherPmi() {
+    if (!teacherPmi) return
+    void navigator.clipboard.writeText(teacherPmi).then(() => {
+      setCopiedPmi(true)
+      toast.success(`Copied PMI: ${teacherPmi}`)
+      window.setTimeout(() => setCopiedPmi(false), 2000)
+    })
+  }
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
     if (!q) return meetings
@@ -101,19 +133,180 @@ export function MeetingsTab({
     )
   }, [meetings, search])
 
+  const selectedMeeting = detailId
+    ? (meetings.find((m) => m.meetingId === detailId) ?? null)
+    : null
+
   const upcoming = filtered.filter((m) => !m.endedAt)
   const past = filtered.filter((m) => m.endedAt)
+
+  if (selectedMeeting) {
+    const invite = [
+      `Join "${selectedMeeting.title}" on Lectern: ${meetingUrl(selectedMeeting.meetingId)}`,
+      `Meeting ID: ${selectedMeeting.meetingId}`,
+      selectedMeeting.passcode
+        ? `Passcode: ${selectedMeeting.passcode}`
+        : '',
+    ]
+      .filter(Boolean)
+      .join('\n')
+
+    return (
+      <div className="space-y-6">
+        <div className="flex items-center gap-3">
+          <BackButton
+            onClick={() => setDetailId(null)}
+            label="Meetings"
+          />
+          <h1 className="truncate font-display text-2xl font-semibold tracking-tight sm:text-3xl">
+            {selectedMeeting.title}
+          </h1>
+        </div>
+
+        <div className="rounded-2xl border bg-card p-5 shadow-sm sm:p-6">
+          <div className="flex flex-wrap items-center gap-2">
+            {selectedMeeting.startedAt && !selectedMeeting.endedAt && (
+              <Badge className="gap-1 bg-live text-white hover:bg-live">
+                <span className="size-1.5 rounded-full bg-white animate-pulse-dot" />{' '}
+                Live
+              </Badge>
+            )}
+            {selectedMeeting.endedAt && (
+              <Badge variant="outline">Ended</Badge>
+            )}
+            {selectedMeeting.waitingRoom && (
+              <Badge variant="secondary">Waiting room enabled</Badge>
+            )}
+          </div>
+
+          <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-2">
+            <div className="rounded-xl border bg-muted/40 p-3">
+              <dt className="text-xs font-medium text-muted-foreground">
+                Schedule
+              </dt>
+              <dd className="mt-1 font-medium text-foreground">
+                {mounted && selectedMeeting.scheduledAt
+                  ? new Date(selectedMeeting.scheduledAt).toLocaleString(
+                      undefined,
+                      {
+                        weekday: 'short',
+                        month: 'short',
+                        day: 'numeric',
+                        hour: 'numeric',
+                        minute: '2-digit',
+                      },
+                    )
+                  : 'Open class, no fixed time'}{' '}
+                · {selectedMeeting.durationMin} min
+              </dd>
+            </div>
+            <div className="rounded-xl border bg-muted/40 p-3">
+              <dt className="text-xs font-medium text-muted-foreground">
+                Meeting ID & Passcode
+              </dt>
+              <dd className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-sm font-medium text-foreground">
+                <span>{selectedMeeting.meetingId}</span>
+                {selectedMeeting.passcode && (
+                  <span className="inline-flex items-center gap-1 text-muted-foreground">
+                    <KeyRound className="size-3.5" /> {selectedMeeting.passcode}
+                  </span>
+                )}
+              </dd>
+            </div>
+          </dl>
+
+          <div className="mt-5 flex flex-wrap items-center gap-2">
+            {!selectedMeeting.endedAt && (
+              <Button asChild size="sm" className="gap-1.5">
+                <Link
+                  to="/join/$meetingId"
+                  params={{ meetingId: selectedMeeting.meetingId }}
+                >
+                  <Video className="size-4" /> Start class
+                </Link>
+              </Button>
+            )}
+            <Button
+              size="sm"
+              variant="outline"
+              className="gap-1.5"
+              onClick={() => {
+                void navigator.clipboard
+                  .writeText(invite)
+                  .then(() => toast.success('Invite copied'))
+              }}
+            >
+              <Copy className="size-3.5" /> Copy invite
+            </Button>
+            {!selectedMeeting.endedAt && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="gap-1.5"
+                onClick={() => onEdit(selectedMeeting)}
+              >
+                <Pencil className="size-3.5" /> Edit
+              </Button>
+            )}
+            {selectedMeeting.scheduledAt && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="gap-1.5"
+                onClick={() =>
+                  downloadTextFile(
+                    `${selectedMeeting.title.replace(/[^\w-]+/g, '_')}.ics`,
+                    buildIcs({
+                      title: selectedMeeting.title,
+                      startsAt: new Date(selectedMeeting.scheduledAt!),
+                      durationMin: selectedMeeting.durationMin,
+                      meetingId: selectedMeeting.meetingId,
+                      passcode: selectedMeeting.passcode ?? undefined,
+                    }),
+                    'text/calendar',
+                  )
+                }
+              >
+                <CalendarDays className="size-3.5" /> Export calendar
+              </Button>
+            )}
+            <Button
+              size="sm"
+              variant="ghost"
+              className="ml-auto gap-1.5 text-muted-foreground hover:text-destructive"
+              onClick={() => {
+                const id = selectedMeeting.meetingId
+                setDetailId(null)
+                onDelete(id)
+              }}
+            >
+              <Trash2 className="size-3.5" /> Delete
+            </Button>
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="space-y-8">
       <div className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <h1 className="font-display text-3xl font-semibold tracking-tight">
-            Meetings
-          </h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Manage your upcoming scheduled classes and past sessions.
-          </p>
+        <div className="flex items-start gap-3">
+          {onBack && (
+            <BackButton
+              onClick={onBack}
+              ariaLabel="Back"
+              className="mt-0.5 md:hidden"
+            />
+          )}
+          <div>
+            <h1 className="font-display text-3xl font-semibold tracking-tight">
+              Meetings
+            </h1>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Manage your upcoming scheduled classes and past sessions.
+            </p>
+          </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <div className="relative">
@@ -125,25 +318,108 @@ export function MeetingsTab({
               className="h-9 w-56 pl-9"
             />
           </div>
-          <ScheduleDialog
-            onSaved={onRefresh}
-            trigger={
-              <Button size="sm" className="gap-1.5">
-                <CalendarPlus className="size-4" /> Schedule a class
-              </Button>
-            }
-          />
+          {isTeacher ? (
+            <ScheduleDialog
+              onSaved={onRefresh}
+              trigger={
+                <Button size="sm" className="gap-1.5">
+                  <CalendarPlus className="size-4" /> Schedule a class
+                </Button>
+              }
+            />
+          ) : (
+            <Button
+              size="sm"
+              className="gap-1.5"
+              onClick={() => onOpenJoin?.()}
+            >
+              <PlusSquare className="size-4" /> Join a class
+            </Button>
+          )}
         </div>
       </div>
+
+      {/* Teacher Personal Meeting ID (PMI) Card */}
+      {isTeacher && teacherPmi && (
+        <section className="rounded-2xl border border-primary/20 bg-card p-5 shadow-sm">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <Badge
+                  variant="secondary"
+                  className="gap-1 rounded-full px-2.5 py-0.5 text-[11px]"
+                >
+                  <GraduationCap className="size-3 text-primary" /> Personal
+                  Meeting Room
+                </Badge>
+              </div>
+              <p className="mt-2 font-mono text-xl font-semibold tracking-wide text-foreground">
+                {teacherPmi}
+              </p>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                Share this permanent room ID with students for office hours or
+                recurring lessons.
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {onStartWithPmi && (
+                <Button
+                  size="sm"
+                  className="gap-1.5"
+                  onClick={onStartWithPmi}
+                >
+                  <Video className="size-4" /> Start with PMI
+                </Button>
+              )}
+              <Button
+                size="sm"
+                variant="outline"
+                className="gap-1.5"
+                onClick={copyTeacherPmi}
+              >
+                {copiedPmi ? (
+                  <>
+                    <Check className="size-3.5 text-primary" /> Copied
+                  </>
+                ) : (
+                  <>
+                    <Copy className="size-3.5" /> Copy PMI
+                  </>
+                )}
+              </Button>
+            </div>
+          </div>
+        </section>
+      )}
 
       <section className="space-y-3">
         <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
           Upcoming & Open ({upcoming.length})
         </h2>
-        {upcoming.length === 0 ? (
+        {authStatus === 'loggedOut' ? (
           <div className="rounded-2xl border border-dashed bg-card/50 p-10 text-center text-sm text-muted-foreground">
-            No upcoming classes match your filter. Schedule one to get a
-            permanent link.
+            <p>
+              Sign in as a Teacher to schedule and manage classes, or join any
+              live class with a meeting ID.
+            </p>
+            <div className="mt-4 flex flex-wrap justify-center gap-2">
+              <Button size="sm" onClick={() => onOpenAuth?.('signin')}>
+                Sign In
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => onOpenJoin?.()}
+              >
+                Join by Meeting ID
+              </Button>
+            </div>
+          </div>
+        ) : upcoming.length === 0 ? (
+          <div className="rounded-2xl border border-dashed bg-card/50 p-10 text-center text-sm text-muted-foreground">
+            {isTeacher
+              ? 'No upcoming classes match your filter. Schedule one to get a permanent link.'
+              : 'No classes listed yet. Use Join a class with your teacher’s link or meeting ID.'}
           </div>
         ) : (
           <ul className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -153,7 +429,13 @@ export function MeetingsTab({
                 className="flex flex-col rounded-2xl border bg-card p-4 shadow-sm"
               >
                 <div className="flex items-start justify-between gap-2">
-                  <h3 className="font-semibold leading-snug">{m.title}</h3>
+                  <button
+                    type="button"
+                    onClick={() => setDetailId(m.meetingId)}
+                    className="min-w-0 text-left font-semibold leading-snug hover:text-primary hover:underline underline-offset-4"
+                  >
+                    {m.title}
+                  </button>
                   {m.startedAt && !m.endedAt && (
                     <Badge className="shrink-0 gap-1 bg-live text-white hover:bg-live">
                       <span className="size-1.5 rounded-full bg-white animate-pulse-dot" />{' '}
@@ -307,11 +589,20 @@ export function MeetingsTab({
 // Chat Tab (Synced to Firestore meetings/{meetingId}/messages)
 // ---------------------------------------------------------------------------
 
-export function ChatTab({ meetings }: { meetings: DashboardMeeting[] }) {
+export function ChatTab({
+  meetings,
+  onBack,
+}: {
+  meetings: DashboardMeeting[]
+  onBack?: () => void
+}) {
   const { user, clientUid } = useIdentity()
+  const profile = useUserProfile()
+  const prefs = useJoinPrefs()
   const [selectedId, setSelectedId] = useState<string>(
     () => meetings[0]?.meetingId ?? '',
   )
+  const [mobileThreadOpen, setMobileThreadOpen] = useState(false)
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [draft, setDraft] = useState('')
   const activeId =
@@ -319,8 +610,23 @@ export function ChatTab({ meetings }: { meetings: DashboardMeeting[] }) {
       ? selectedId
       : (meetings[0]?.meetingId ?? '')
 
+  const resolvedAuthorName = user
+    ? user.name ||
+      profile.displayName.trim() ||
+      prefs.name.trim() ||
+      displayName(user) ||
+      'Guest'
+    : 'Guest'
+
+  const chatKey = `${activeId}:${clientUid ?? ''}`
+  const [seenChatKey, setSeenChatKey] = useState(chatKey)
+  if (chatKey !== seenChatKey) {
+    setSeenChatKey(chatKey)
+    setMessages([])
+  }
+
   useEffect(() => {
-    if (!activeId) return
+    if (!activeId || !clientUid) return
     return subscribeMeetingMessages(activeId, clientUid, setMessages)
   }, [activeId, clientUid])
 
@@ -329,12 +635,10 @@ export function ChatTab({ meetings }: { meetings: DashboardMeeting[] }) {
     const text = draft.trim()
     if (!text || !activeId) return
     setDraft('')
-    const authorName =
-      displayName(user) || loadPrefs().name || 'Teacher'
     await sendFirestoreMessage(activeId, {
       id: crypto.randomUUID(),
       authorId: clientUid || 'local',
-      authorName,
+      authorName: resolvedAuthorName,
       text,
       at: Date.now(),
       kind: 'message',
@@ -343,13 +647,27 @@ export function ChatTab({ meetings }: { meetings: DashboardMeeting[] }) {
 
   return (
     <div className="space-y-4">
-      <div>
-        <h1 className="font-display text-3xl font-semibold tracking-tight">
-          Class Chat
-        </h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Persistent chat channels synced live with your Lectern classes.
-        </p>
+      <div
+        className={cn(
+          'flex items-start gap-3',
+          mobileThreadOpen && 'hidden lg:flex',
+        )}
+      >
+        {onBack && (
+          <BackButton
+            onClick={onBack}
+            ariaLabel="Back"
+            className="mt-0.5 md:hidden"
+          />
+        )}
+        <div>
+          <h1 className="font-display text-3xl font-semibold tracking-tight">
+            Class Chat
+          </h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Persistent chat channels synced live with your Lectern classes.
+          </p>
+        </div>
       </div>
 
       {meetings.length === 0 ? (
@@ -358,8 +676,14 @@ export function ChatTab({ meetings }: { meetings: DashboardMeeting[] }) {
           Start or schedule a class to unlock its persistent chat channel.
         </div>
       ) : (
-        <div className="grid h-[68vh] min-h-[460px] overflow-hidden rounded-2xl border bg-card lg:grid-cols-[260px_1fr]">
-          <aside className="flex flex-col border-b lg:border-b-0 lg:border-r">
+        <div className="grid h-[70vh] min-h-[460px] overflow-hidden rounded-2xl border bg-card lg:grid-cols-[260px_1fr]">
+          {/* Channel list: full width on mobile when not in a thread, sidebar on desktop */}
+          <aside
+            className={cn(
+              'flex min-h-0 flex-col lg:border-r',
+              mobileThreadOpen ? 'hidden lg:flex' : 'flex',
+            )}
+          >
             <div className="border-b px-3 py-2.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               Classrooms ({meetings.length})
             </div>
@@ -368,37 +692,56 @@ export function ChatTab({ meetings }: { meetings: DashboardMeeting[] }) {
                 <li key={m.meetingId}>
                   <button
                     type="button"
-                    onClick={() => setSelectedId(m.meetingId)}
+                    onClick={() => {
+                      setSelectedId(m.meetingId)
+                      setMobileThreadOpen(true)
+                    }}
                     className={cn(
-                      'flex w-full flex-col items-start px-3 py-2.5 text-left transition-colors',
+                      'flex w-full items-center justify-between gap-2 px-3 py-3 text-left transition-colors',
                       activeId === m.meetingId
                         ? 'bg-primary/10 text-foreground'
                         : 'hover:bg-muted/60',
                     )}
                   >
-                    <span className="w-full truncate text-sm font-medium">
-                      {m.title}
-                    </span>
-                    <span className="font-mono text-[11px] text-muted-foreground">
-                      {m.meetingId}
-                    </span>
+                    <div className="min-w-0 flex-1">
+                      <span className="block w-full truncate text-sm font-medium">
+                        {m.title}
+                      </span>
+                      <span className="font-mono text-[11px] text-muted-foreground">
+                        {m.meetingId}
+                      </span>
+                    </div>
+                    <ChevronRight className="size-4 shrink-0 text-muted-foreground lg:hidden" />
                   </button>
                 </li>
               ))}
             </ul>
           </aside>
 
-          <div className="flex min-h-0 flex-col">
-            <div className="flex items-center justify-between border-b px-4 py-2.5">
-              <div>
-                <p className="font-semibold text-sm">
-                  {meetings.find((m) => m.meetingId === activeId)?.title}
-                </p>
-                <p className="font-mono text-xs text-muted-foreground">
-                  {activeId}
-                </p>
+          {/* Conversation thread: shown on mobile only when a thread is open, always on desktop */}
+          <div
+            className={cn(
+              'min-h-0 flex-col',
+              mobileThreadOpen ? 'flex' : 'hidden lg:flex',
+            )}
+          >
+            <div className="flex items-center justify-between gap-2 border-b px-3 py-2.5 sm:px-4">
+              <div className="flex min-w-0 items-center gap-2.5">
+                <BackButton
+                  onClick={() => setMobileThreadOpen(false)}
+                  ariaLabel="Back to classrooms"
+                  className="lg:hidden"
+                />
+                <div className="min-w-0">
+                  <p className="truncate font-semibold text-sm">
+                    {meetings.find((m) => m.meetingId === activeId)?.title}
+                  </p>
+                  <p className="font-mono text-xs text-muted-foreground">
+                    {activeId}
+                  </p>
+                </div>
               </div>
-              <Button asChild size="xs" variant="outline">
+              <Button asChild size="xs" variant="outline" className="shrink-0">
                 <Link
                   to="/join/$meetingId"
                   params={{ meetingId: activeId }}
@@ -413,30 +756,35 @@ export function ChatTab({ meetings }: { meetings: DashboardMeeting[] }) {
                   No messages in this class yet.
                 </p>
               ) : (
-                messages.map((m) => (
-                  <div key={m.id} className="flex items-start gap-2.5">
-                    <AvatarBubble
-                      name={m.authorName}
-                      seed={m.authorId}
-                      className="size-8 text-xs"
-                    />
-                    <div className="min-w-0 flex-1">
-                      <p className="text-xs text-muted-foreground">
-                        <span className="font-medium text-foreground">
-                          {m.authorName}
-                        </span>{' '}
-                        ·{' '}
-                        {new Date(m.at).toLocaleTimeString(undefined, {
-                          hour: 'numeric',
-                          minute: '2-digit',
-                        })}
-                      </p>
-                      <p className="mt-0.5 whitespace-pre-wrap break-words text-sm">
-                        {m.text}
-                      </p>
+                messages.map((m) => {
+                  const isMe = m.authorId === (clientUid || 'local')
+                  return (
+                    <div key={m.id} className="flex items-start gap-2.5">
+                      <AvatarBubble
+                        name={isMe ? resolvedAuthorName : m.authorName}
+                        seed={m.authorId}
+                        color={isMe ? profile.avatarColor : undefined}
+                        photo={isMe ? profile.avatarPhoto : undefined}
+                        className="size-8 text-xs"
+                      />
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs text-muted-foreground">
+                          <span className="font-medium text-foreground">
+                            {isMe ? resolvedAuthorName : m.authorName}
+                          </span>{' '}
+                          ·{' '}
+                          {new Date(m.at).toLocaleTimeString(undefined, {
+                            hour: 'numeric',
+                            minute: '2-digit',
+                          })}
+                        </p>
+                        <p className="mt-0.5 whitespace-pre-wrap break-words text-sm">
+                          {m.text}
+                        </p>
+                      </div>
                     </div>
-                  </div>
-                ))
+                  )
+                })
               )}
             </div>
             <form
@@ -448,7 +796,12 @@ export function ChatTab({ meetings }: { meetings: DashboardMeeting[] }) {
                 onChange={(e) => setDraft(e.target.value)}
                 placeholder="Post a message to this classroom…"
               />
-              <Button type="submit" size="icon" disabled={!draft.trim()} aria-label="Send message">
+              <Button
+                type="submit"
+                size="icon"
+                disabled={!draft.trim()}
+                aria-label="Send message"
+              >
                 <SendHorizonal className="size-4" />
               </Button>
             </form>
@@ -465,18 +818,30 @@ export function ChatTab({ meetings }: { meetings: DashboardMeeting[] }) {
 
 export function WhiteboardsTab({
   meetings,
+  onBack,
   onFullscreenChange,
 }: {
   meetings: DashboardMeeting[]
+  onBack?: () => void
   onFullscreenChange?: (fullscreen: boolean) => void
 }) {
-  const { user, clientUid } = useIdentity()
+  const { user, role, clientUid } = useIdentity()
+  const profile = useUserProfile()
+  const prefs = useJoinPrefs()
   const [activeBoard, setActiveBoard] = useState<{
     scope:
       | { kind: 'board'; boardId: string }
       | { kind: 'meeting'; meetingId: string }
     title: string
   } | null>(null)
+
+  const resolvedAuthorName = user
+    ? user.name ||
+      profile.displayName.trim() ||
+      prefs.name.trim() ||
+      displayName(user) ||
+      'Guest'
+    : 'Guest'
 
   useEffect(() => {
     onFullscreenChange?.(activeBoard !== null)
@@ -487,15 +852,12 @@ export function WhiteboardsTab({
     return (
       <div className="flex h-[calc(100svh-5rem)] min-h-[520px] flex-col gap-3">
         <div className="flex items-center justify-between gap-2">
-          <div className="flex items-center gap-2 min-w-0">
-            <Button
-              size="sm"
-              variant="outline"
-              className="gap-1.5 shrink-0"
+          <div className="flex min-w-0 items-center gap-2.5">
+            <BackButton
               onClick={() => setActiveBoard(null)}
-            >
-              <ArrowLeft className="size-4" /> All whiteboards
-            </Button>
+              label="Whiteboards"
+              className="shrink-0"
+            />
             <h1 className="truncate font-display text-lg font-semibold sm:text-xl">
               {activeBoard.title}
             </h1>
@@ -507,9 +869,9 @@ export function WhiteboardsTab({
         <div className="relative min-h-0 flex-1">
           <Whiteboard
             canDraw
-            isTeacher
-            author={clientUid || 'teacher'}
-            authorName={displayName(user) || 'Teacher'}
+            isTeacher={role === 'teacher'}
+            author={clientUid || 'guest'}
+            authorName={resolvedAuthorName}
             syncScope={activeBoard.scope}
             title={activeBoard.title}
           />
@@ -520,18 +882,27 @@ export function WhiteboardsTab({
 
   return (
     <div className="space-y-8">
-      <div>
-        <h1 className="font-display text-3xl font-semibold tracking-tight">
-          Infinite Whiteboards
-        </h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Infinite pan & zoom canvases that auto-save continuously and reopen
-          in any class.
-        </p>
+      <div className="flex items-start gap-3">
+        {onBack && (
+          <BackButton
+            onClick={onBack}
+            ariaLabel="Back"
+            className="mt-0.5 md:hidden"
+          />
+        )}
+        <div>
+          <h1 className="font-display text-3xl font-semibold tracking-tight">
+            Infinite Whiteboards
+          </h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Infinite pan & zoom canvases that auto-save continuously and reopen
+            in any class.
+          </p>
+        </div>
       </div>
 
       <WhiteboardGallery
-        createdByName={displayName(user) || undefined}
+        createdByName={resolvedAuthorName}
         onSelectBoard={(b) =>
           setActiveBoard({
             scope: { kind: 'board', boardId: b.id },
@@ -585,9 +956,14 @@ export function WhiteboardsTab({
 // Recordings Tab (IndexedDB Local MediaRecorder Library)
 // ---------------------------------------------------------------------------
 
-export function RecordingsTab() {
+export function RecordingsTab({ onBack }: { onBack?: () => void }) {
+  const { authStatus, clientUid, ready } = useIdentity()
+  const activeUid =
+    ready && (authStatus === 'authenticated' || authStatus === 'guest')
+      ? clientUid
+      : null
   const [items, setItems] = useState<StoredRecording[]>([])
-  const [loading, setLoading] = useState(true)
+  const [loading, setLoading] = useState(() => Boolean(activeUid))
   const [playing, setPlaying] = useState<{
     rec: StoredRecording
     url: string
@@ -595,12 +971,25 @@ export function RecordingsTab() {
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameVal, setRenameVal] = useState('')
 
+  const [seenRecUid, setSeenRecUid] = useState<string | null>(activeUid)
+  if (activeUid !== seenRecUid) {
+    setSeenRecUid(activeUid)
+    setItems([])
+    setLoading(Boolean(activeUid))
+  }
+
   useEffect(() => {
-    void listRecordings().then((r) => {
+    let active = true
+    if (!activeUid) return
+    void listRecordings(activeUid).then((r) => {
+      if (!active) return
       setItems(r)
       setLoading(false)
     })
-  }, [])
+    return () => {
+      active = false
+    }
+  }, [activeUid])
 
   function openPlayer(rec: StoredRecording) {
     const url = URL.createObjectURL(rec.blob)
@@ -613,14 +1002,14 @@ export function RecordingsTab() {
   }
 
   async function remove(id: string) {
-    await deleteRecording(id)
+    await deleteRecording(id, activeUid)
     setItems((prev) => prev.filter((r) => r.id !== id))
     toast.success('Recording deleted')
   }
 
   async function saveRename(id: string) {
     if (renameVal.trim()) {
-      await renameRecording(id, renameVal.trim())
+      await renameRecording(id, renameVal.trim(), activeUid)
       setItems((prev) =>
         prev.map((r) =>
           r.id === id ? { ...r, title: renameVal.trim() } : r,
@@ -641,14 +1030,23 @@ export function RecordingsTab() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="font-display text-3xl font-semibold tracking-tight">
-          Recordings
-        </h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Local class recordings captured via MediaRecorder and stored privately
-          in your browser.
-        </p>
+      <div className="flex items-start gap-3">
+        {onBack && (
+          <BackButton
+            onClick={onBack}
+            ariaLabel="Back"
+            className="mt-0.5 md:hidden"
+          />
+        )}
+        <div>
+          <h1 className="font-display text-3xl font-semibold tracking-tight">
+            Recordings
+          </h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Local class recordings captured via MediaRecorder and stored
+            privately in your browser.
+          </p>
+        </div>
       </div>
 
       {loading ? (
@@ -656,8 +1054,9 @@ export function RecordingsTab() {
       ) : items.length === 0 ? (
         <div className="rounded-2xl border border-dashed bg-card p-10 text-center text-sm text-muted-foreground">
           <Film className="mx-auto mb-2 size-8 opacity-40" />
-          No recordings yet. Inside any meeting, open <strong>More → Record locally</strong>{' '}
-          to save a class recording right here.
+          No recordings yet. Inside any meeting, open{' '}
+          <strong>More → Record locally</strong> to save a class recording right
+          here.
         </div>
       ) : (
         <ul className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -737,11 +1136,22 @@ export function RecordingsTab() {
       <Dialog open={!!playing} onOpenChange={(o) => !o && closePlayer()}>
         <DialogContent className="sm:max-w-2xl">
           <DialogHeader>
-            <DialogTitle>{playing?.rec.title}</DialogTitle>
-            <DialogDescription>
-              {playing &&
-                `${new Date(playing.rec.createdAt).toLocaleString()} · ${formatDuration(playing.rec.durationSec)}`}
-            </DialogDescription>
+            <div className="flex items-center gap-2.5 pr-6">
+              <BackButton
+                onClick={closePlayer}
+                ariaLabel="Back to recordings"
+                className="size-10"
+              />
+              <div className="min-w-0">
+                <DialogTitle className="truncate">
+                  {playing?.rec.title}
+                </DialogTitle>
+                <DialogDescription>
+                  {playing &&
+                    `${new Date(playing.rec.createdAt).toLocaleString()} · ${formatDuration(playing.rec.durationSec)}`}
+                </DialogDescription>
+              </div>
+            </div>
           </DialogHeader>
           {playing && (
             <video
@@ -761,18 +1171,58 @@ export function RecordingsTab() {
 // Settings Tab (Camera/Mic Preview, Device Defaults, Theme & Profile)
 // ---------------------------------------------------------------------------
 
-export function SettingsTab() {
-  const { user, clientUid } = useIdentity()
-  const stored = useClientValue(loadPrefsCached, defaultPrefs)
-  const [edits, setEdits] = useState<Partial<JoinPrefs>>({})
+type SettingsSection = 'media' | 'profile' | 'defaults'
+
+export function SettingsTab({
+  onBack,
+  onOpenAuth,
+}: {
+  onBack?: () => void
+  onOpenAuth?: (mode: AuthModalMode) => void
+}) {
+  const {
+    user,
+    authStatus,
+    role,
+    isGuest,
+    clientUid,
+    updateAccountProfile,
+    renameGuest,
+    regeneratePmi,
+  } = useIdentity()
+  const profile = useUserProfile()
+  const stored = useJoinPrefs()
+  const [nameDraft, setNameDraft] = useState<string | null>(null)
+  const [extraDraft, setExtraDraft] = useState<string | null>(null)
+  const [savingProfile, setSavingProfile] = useState(false)
+  const [copiedPmi, setCopiedPmi] = useState(false)
+  const [regeneratingPmi, setRegeneratingPmi] = useState(false)
+  const [mobileSection, setMobileSection] = useState<SettingsSection | null>(
+    null,
+  )
   const videoRef = useRef<HTMLVideoElement>(null)
+
+  const isTeacher = authStatus === 'authenticated' && role === 'teacher'
+  const isStudent = authStatus === 'authenticated' && role === 'student'
+  const teacherPmi = isTeacher ? user?.pmi || profile.pmi || '' : ''
+
+  const resolvedName =
+    nameDraft ??
+    (user
+      ? user.name || profile.displayName.trim() || stored.name || displayName(user)
+      : '')
+  const resolvedExtra =
+    extraDraft ??
+    (isStudent
+      ? (user?.classOrRollNo ?? profile.classOrRollNo ?? '')
+      : (user?.subjectOrInstitution ?? profile.subjectOrInstitution ?? ''))
 
   const prefs: JoinPrefs = {
     ...stored,
-    ...edits,
-    name: edits.name ?? (stored.name || displayName(user)),
+    name: resolvedName,
   }
   const blurOn = Boolean(prefs.blurOn)
+  const currentStatus = statusMeta(profile.status)
 
   const media = useLocalMedia({
     micOn: prefs.micOn,
@@ -784,164 +1234,531 @@ export function SettingsTab() {
   useAttachStream(videoRef, media.hasVideo ? media.stream : null)
 
   function patchPrefs(patch: Partial<JoinPrefs>) {
-    const next = { ...prefs, ...patch }
-    setEdits((e) => ({ ...e, ...patch }))
-    savePrefs(next)
+    patchStoredPrefs(patch)
   }
 
-  function saveName() {
-    savePrefs({ ...prefs, name: prefs.name.trim() })
-    toast.success('Default display name saved')
+  async function saveProfileFields() {
+    if (savingProfile) return
+    const clean = resolvedName.trim()
+    if (isGuest) {
+      renameGuest(clean || 'Guest')
+      setNameDraft(null)
+      toast.success('Guest display name updated')
+      return
+    }
+    setSavingProfile(true)
+    try {
+      await updateAccountProfile({
+        displayName: clean || (isStudent ? 'Student' : 'Teacher'),
+        ...(isStudent
+          ? { classOrRollNo: resolvedExtra.trim() || undefined }
+          : { subjectOrInstitution: resolvedExtra.trim() || undefined }),
+      })
+      savePrefs({ ...prefs, name: clean })
+      setNameDraft(null)
+      setExtraDraft(null)
+      toast.success('Profile saved')
+    } catch {
+      toast.error('Could not save profile right now.')
+    } finally {
+      setSavingProfile(false)
+    }
   }
 
-  return (
-    <div className="space-y-8">
-      <div>
-        <h1 className="font-display text-3xl font-semibold tracking-tight">
-          Settings
-        </h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Configure your camera, microphone, profile, and appearance.
-        </p>
+  function copyPmi() {
+    if (!teacherPmi) return
+    void navigator.clipboard.writeText(teacherPmi).then(() => {
+      setCopiedPmi(true)
+      toast.success('Personal Meeting ID copied')
+      window.setTimeout(() => setCopiedPmi(false), 2000)
+    })
+  }
+
+  async function handleRegeneratePmi() {
+    if (!isTeacher || regeneratingPmi) return
+    setRegeneratingPmi(true)
+    try {
+      const next = await regeneratePmi()
+      if (next) {
+        toast.success(`New Personal Meeting ID: ${next}`)
+      }
+    } catch {
+      toast.error('Could not regenerate Personal Meeting ID right now.')
+    } finally {
+      setRegeneratingPmi(false)
+    }
+  }
+
+  const mediaCard = (
+    <section className="space-y-4 rounded-2xl border bg-card p-5">
+      <h2 className="font-display text-lg font-semibold">
+        Audio & Video Preview
+      </h2>
+      <div className="relative aspect-video overflow-hidden rounded-xl bg-stage-tile">
+        {prefs.camOn && media.hasVideo ? (
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            muted
+            className={cn(
+              'h-full w-full -scale-x-100 object-cover transition-[filter]',
+              blurOn && 'blur-[6px] scale-[1.03]',
+            )}
+          />
+        ) : (
+          <div className="grid h-full w-full place-items-center">
+            <AvatarBubble
+              name={prefs.name || 'You'}
+              seed={clientUid || 'me'}
+              color={user ? profile.avatarColor : undefined}
+              photo={user ? profile.avatarPhoto : undefined}
+              className="size-20 text-2xl"
+            />
+          </div>
+        )}
+        <div className="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-2 rounded-xl bg-black/55 p-1.5 backdrop-blur">
+          <Button
+            type="button"
+            size="icon"
+            variant={prefs.micOn ? 'secondary' : 'destructive'}
+            className="size-9 rounded-lg"
+            onClick={() => patchPrefs({ micOn: !prefs.micOn })}
+            aria-label={
+              prefs.micOn ? 'Mute preview mic' : 'Unmute preview mic'
+            }
+          >
+            {prefs.micOn ? (
+              <Mic className="size-4" />
+            ) : (
+              <MicOff className="size-4" />
+            )}
+          </Button>
+          <Button
+            type="button"
+            size="icon"
+            variant={prefs.camOn ? 'secondary' : 'destructive'}
+            className="size-9 rounded-lg"
+            onClick={() => patchPrefs({ camOn: !prefs.camOn })}
+            aria-label={
+              prefs.camOn
+                ? 'Turn preview camera off'
+                : 'Turn preview camera on'
+            }
+          >
+            {prefs.camOn ? (
+              <Video className="size-4" />
+            ) : (
+              <VideoOff className="size-4" />
+            )}
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={blurOn ? 'default' : 'secondary'}
+            className="h-9 gap-1.5 rounded-lg"
+            onClick={() => patchPrefs({ blurOn: !blurOn })}
+          >
+            <Sparkles className="size-3.5" /> Blur
+          </Button>
+        </div>
       </div>
 
-      <div className="grid gap-6 lg:grid-cols-2">
-        {/* Camera & Audio Preview */}
-        <section className="space-y-4 rounded-2xl border bg-card p-5">
-          <h2 className="font-display text-lg font-semibold">
-            Audio & Video Preview
-          </h2>
-          <div className="relative aspect-video overflow-hidden rounded-xl bg-stage-tile">
-            {prefs.camOn && media.hasVideo ? (
-              <video
-                ref={videoRef}
-                autoPlay
-                playsInline
-                muted
-                className={cn(
-                  'h-full w-full -scale-x-100 object-cover transition-[filter]',
-                  blurOn && 'blur-[6px] scale-[1.03]',
-                )}
+      {media.error && <MediaError kind={media.error} />}
+
+      <DeviceSettings
+        devices={media.devices}
+        value={{
+          cameraId: prefs.cameraId,
+          micId: prefs.micId,
+          speakerId: prefs.speakerId,
+        }}
+        onChange={(next) =>
+          patchPrefs({
+            cameraId: next.cameraId,
+            micId: next.micId,
+            speakerId: next.speakerId,
+          })
+        }
+        idPrefix="settings"
+      />
+    </section>
+  )
+
+  const profileCard = (
+    <section className="space-y-4 rounded-2xl border bg-card p-5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="font-display text-lg font-semibold">
+          Profile & Appearance
+        </h2>
+        {isTeacher && (
+          <Badge variant="secondary" className="gap-1 rounded-full">
+            <GraduationCap className="size-3 text-primary" /> Teacher
+          </Badge>
+        )}
+        {isStudent && (
+          <Badge variant="secondary" className="gap-1 rounded-full">
+            <BookOpen className="size-3 text-primary" /> Student
+          </Badge>
+        )}
+        {isGuest && (
+          <Badge variant="outline" className="gap-1 rounded-full">
+            <UserRound className="size-3" /> Guest
+          </Badge>
+        )}
+      </div>
+
+      {authStatus === 'loggedOut' || !user ? (
+        <div className="rounded-xl border border-dashed bg-muted/30 p-4 text-sm">
+          <p className="font-medium text-foreground">You’re not signed in</p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Sign in with a Teacher or Student account to sync your profile and
+            classes, or continue as a Guest.
+          </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <Button
+              type="button"
+              size="xs"
+              className="gap-1.5"
+              onClick={() => onOpenAuth?.('signin')}
+            >
+              <LogIn className="size-3.5" /> Sign In
+            </Button>
+            <Button
+              type="button"
+              size="xs"
+              variant="outline"
+              onClick={() => onOpenAuth?.('teacher')}
+            >
+              Create Account
+            </Button>
+            <Button
+              type="button"
+              size="xs"
+              variant="ghost"
+              onClick={() => onOpenAuth?.('guest')}
+            >
+              Continue as Guest
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <>
+          <div className="space-y-1.5">
+            <Label htmlFor="pref-name">
+              {isGuest ? 'Guest display name' : 'Default display name'}
+            </Label>
+            <div className="flex gap-2">
+              <Input
+                id="pref-name"
+                value={prefs.name}
+                onChange={(e) => setNameDraft(e.target.value)}
+                placeholder="Your name in class"
+                maxLength={60}
               />
-            ) : (
-              <div className="grid h-full w-full place-items-center">
-                <AvatarBubble
-                  name={prefs.name || 'You'}
-                  seed={clientUid || 'me'}
-                  className="size-20 text-2xl"
-                />
-              </div>
-            )}
-            <div className="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-2 rounded-xl bg-black/55 p-1.5 backdrop-blur">
               <Button
                 type="button"
-                size="icon"
-                variant={prefs.micOn ? 'secondary' : 'destructive'}
-                className="size-9 rounded-lg"
-                onClick={() => patchPrefs({ micOn: !prefs.micOn })}
-                aria-label={
-                  prefs.micOn ? 'Mute preview mic' : 'Unmute preview mic'
-                }
+                variant="outline"
+                disabled={savingProfile}
+                onClick={() => void saveProfileFields()}
               >
-                {prefs.micOn ? (
-                  <Mic className="size-4" />
-                ) : (
-                  <MicOff className="size-4" />
-                )}
-              </Button>
-              <Button
-                type="button"
-                size="icon"
-                variant={prefs.camOn ? 'secondary' : 'destructive'}
-                className="size-9 rounded-lg"
-                onClick={() => patchPrefs({ camOn: !prefs.camOn })}
-                aria-label={
-                  prefs.camOn
-                    ? 'Turn preview camera off'
-                    : 'Turn preview camera on'
-                }
-              >
-                {prefs.camOn ? (
-                  <Video className="size-4" />
-                ) : (
-                  <VideoOff className="size-4" />
-                )}
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant={blurOn ? 'default' : 'secondary'}
-                className="h-9 gap-1.5 rounded-lg"
-                onClick={() => patchPrefs({ blurOn: !blurOn })}
-              >
-                <Sparkles className="size-3.5" /> Blur
+                {savingProfile ? 'Saving…' : 'Save'}
               </Button>
             </div>
           </div>
 
-          {media.error && <MediaError kind={media.error} />}
-
-          <DeviceSettings
-            devices={media.devices}
-            value={{
-              cameraId: prefs.cameraId,
-              micId: prefs.micId,
-              speakerId: prefs.speakerId,
-            }}
-            onChange={(next) =>
-              patchPrefs({
-                cameraId: next.cameraId,
-                micId: next.micId,
-                speakerId: next.speakerId,
-              })
-            }
-            idPrefix="settings"
-          />
-        </section>
-
-        {/* Profile & Appearance */}
-        <div className="space-y-6">
-          <section className="space-y-4 rounded-2xl border bg-card p-5">
-            <h2 className="font-display text-lg font-semibold">
-              Profile & Appearance
-            </h2>
+          {!isGuest && (
             <div className="space-y-1.5">
-              <Label htmlFor="pref-name">Default display name</Label>
+              <Label htmlFor="pref-extra">
+                {isStudent ? 'Class / Roll No.' : 'Subject / Institution'}
+              </Label>
               <div className="flex gap-2">
                 <Input
-                  id="pref-name"
-                  value={prefs.name}
-                  onChange={(e) => setEdits((p) => ({ ...p, name: e.target.value }))}
-                  placeholder="Your name in class"
+                  id="pref-extra"
+                  value={resolvedExtra}
+                  onChange={(e) => setExtraDraft(e.target.value)}
+                  placeholder={
+                    isStudent
+                      ? 'e.g. Grade 10-A · Roll 14'
+                      : 'e.g. Mathematics · St. Xavier’s'
+                  }
+                  maxLength={80}
                 />
-                <Button variant="outline" onClick={saveName}>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={savingProfile}
+                  onClick={() => void saveProfileFields()}
+                >
                   Save
                 </Button>
               </div>
             </div>
-            <div className="flex items-center justify-between rounded-xl border p-3">
-              <div>
-                <p className="text-sm font-medium">Theme</p>
-                <p className="text-xs text-muted-foreground">
-                  Switch between warm paper light and deep chalkboard dark mode.
+          )}
+
+          {isGuest && (
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border bg-muted/30 p-3 text-xs">
+              <span className="text-muted-foreground">
+                Want to host classes or save your profile across devices?
+              </span>
+              <Button
+                type="button"
+                size="xs"
+                variant="outline"
+                onClick={() => onOpenAuth?.('signin')}
+              >
+                Sign In / Create Account
+              </Button>
+            </div>
+          )}
+
+          {isTeacher && (
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border p-3">
+              <div className="min-w-0">
+                <p className="text-xs font-medium text-muted-foreground">
+                  Personal Meeting ID
+                </p>
+                <p className="font-mono text-sm font-semibold text-foreground">
+                  {teacherPmi || 'Generating…'}
                 </p>
               </div>
-              <ThemeToggle />
+              <div className="flex items-center gap-1.5">
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="outline"
+                  onClick={copyPmi}
+                  disabled={!teacherPmi}
+                  className="shrink-0 gap-1"
+                >
+                  {copiedPmi ? (
+                    <>
+                      <Check className="size-3 text-primary" /> Copied
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="size-3" /> Copy PMI
+                    </>
+                  )}
+                </Button>
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="ghost"
+                  onClick={() => void handleRegeneratePmi()}
+                  disabled={regeneratingPmi}
+                  aria-label="Regenerate Personal Meeting ID"
+                  className="shrink-0 gap-1"
+                >
+                  <RefreshCw
+                    className={cn('size-3', regeneratingPmi && 'animate-spin')}
+                  />
+                  Regenerate
+                </Button>
+              </div>
             </div>
-            <div className="flex items-center justify-between rounded-xl border p-3">
-              <div>
-                <Label htmlFor="pref-blur">Default background blur</Label>
-                <p className="text-xs text-muted-foreground">
-                  Start new classes with background blur enabled.
+          )}
+        </>
+      )}
+
+      <div className="flex items-center justify-between rounded-xl border p-3">
+        <div>
+          <p className="text-sm font-medium">Theme</p>
+          <p className="text-xs text-muted-foreground">
+            Switch between warm paper light and deep chalkboard dark mode.
+          </p>
+        </div>
+        <ThemeToggle />
+      </div>
+    </section>
+  )
+
+  const defaultsCard = (
+    <section className="space-y-3 rounded-2xl border bg-card p-5">
+      <h2 className="font-display text-lg font-semibold">
+        Default Join Preferences
+      </h2>
+      <div className="flex items-center justify-between rounded-xl border p-3">
+        <div>
+          <Label htmlFor="pref-mute-join">Mute mic on join</Label>
+          <p className="text-xs text-muted-foreground">
+            Enter new classrooms with your microphone muted.
+          </p>
+        </div>
+        <Switch
+          id="pref-mute-join"
+          checked={!prefs.micOn}
+          onCheckedChange={(muted) => patchPrefs({ micOn: !muted })}
+        />
+      </div>
+      <div className="flex items-center justify-between rounded-xl border p-3">
+        <div>
+          <Label htmlFor="pref-cam-join">Turn off camera on join</Label>
+          <p className="text-xs text-muted-foreground">
+            Enter new classrooms with your camera turned off.
+          </p>
+        </div>
+        <Switch
+          id="pref-cam-join"
+          checked={!prefs.camOn}
+          onCheckedChange={(off) => patchPrefs({ camOn: !off })}
+        />
+      </div>
+      <div className="flex items-center justify-between rounded-xl border p-3">
+        <div>
+          <Label htmlFor="pref-blur">Default background blur</Label>
+          <p className="text-xs text-muted-foreground">
+            Start new classes with background blur enabled.
+          </p>
+        </div>
+        <Switch
+          id="pref-blur"
+          checked={blurOn}
+          onCheckedChange={(v) => patchPrefs({ blurOn: v })}
+        />
+      </div>
+    </section>
+  )
+
+  const sectionLabels: Record<SettingsSection, string> = {
+    media: 'Audio & Video',
+    profile: 'Profile & Appearance',
+    defaults: 'Join Defaults',
+  }
+
+  return (
+    <div className="space-y-8">
+      {/* Header (on mobile sub-section, shows back arrow to Settings overview) */}
+      {mobileSection ? (
+        <div className="flex items-center gap-3 lg:hidden">
+          <BackButton
+            onClick={() => setMobileSection(null)}
+            label="Settings"
+          />
+          <h1 className="truncate font-display text-2xl font-semibold tracking-tight">
+            {sectionLabels[mobileSection]}
+          </h1>
+        </div>
+      ) : (
+        <div className="flex items-start gap-3">
+          {onBack && (
+            <BackButton
+              onClick={onBack}
+              ariaLabel="Back"
+              className="mt-0.5 md:hidden"
+            />
+          )}
+          <div>
+            <h1 className="font-display text-3xl font-semibold tracking-tight">
+              Settings
+            </h1>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Configure your camera, microphone, profile, and appearance.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Desktop heading when mobileSection was selected before resize */}
+      {mobileSection && (
+        <div className="hidden lg:block">
+          <h1 className="font-display text-3xl font-semibold tracking-tight">
+            Settings
+          </h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Configure your camera, microphone, profile, and appearance.
+          </p>
+        </div>
+      )}
+
+      {/* Mobile sub-section overview list (< 1024px) */}
+      {!mobileSection && (
+        <div className="space-y-2.5 lg:hidden">
+          <button
+            type="button"
+            onClick={() => setMobileSection('media')}
+            className="flex w-full items-center justify-between gap-3 rounded-2xl border bg-card p-4 text-left shadow-xs transition-colors hover:bg-muted/50"
+          >
+            <div className="flex min-w-0 items-center gap-3">
+              <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-primary/10 text-primary">
+                <Video className="size-5" />
+              </span>
+              <div className="min-w-0">
+                <p className="font-semibold text-sm text-foreground">
+                  Audio & Video
+                </p>
+                <p className="truncate text-xs text-muted-foreground">
+                  Camera preview, microphone, speaker & blur
                 </p>
               </div>
-              <Switch
-                id="pref-blur"
-                checked={blurOn}
-                onCheckedChange={(v) => patchPrefs({ blurOn: v })}
-              />
             </div>
-          </section>
+            <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setMobileSection('profile')}
+            className="flex w-full items-center justify-between gap-3 rounded-2xl border bg-card p-4 text-left shadow-xs transition-colors hover:bg-muted/50"
+          >
+            <div className="flex min-w-0 items-center gap-3">
+              <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-primary/10 text-primary">
+                <UserRound className="size-5" />
+              </span>
+              <div className="min-w-0">
+                <p className="font-semibold text-sm text-foreground">
+                  Profile & Appearance
+                </p>
+                <p className="truncate text-xs text-muted-foreground">
+                  {authStatus === 'loggedOut' || !user
+                    ? 'Not signed in · Theme'
+                    : isGuest
+                      ? `${user.name || 'Guest'} · Guest`
+                      : `${prefs.name || (isStudent ? 'Student' : 'Teacher')} · ${isStudent ? 'Student' : 'Teacher'} · ${currentStatus.label}`}
+                </p>
+              </div>
+            </div>
+            <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setMobileSection('defaults')}
+            className="flex w-full items-center justify-between gap-3 rounded-2xl border bg-card p-4 text-left shadow-xs transition-colors hover:bg-muted/50"
+          >
+            <div className="flex min-w-0 items-center gap-3">
+              <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-primary/10 text-primary">
+                <SlidersHorizontal className="size-5" />
+              </span>
+              <div className="min-w-0">
+                <p className="font-semibold text-sm text-foreground">
+                  Default Join Preferences
+                </p>
+                <p className="truncate text-xs text-muted-foreground">
+                  Mic {prefs.micOn ? 'on' : 'muted'} · Camera{' '}
+                  {prefs.camOn ? 'on' : 'off'} on join
+                </p>
+              </div>
+            </div>
+            <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
+          </button>
+        </div>
+      )}
+
+      {/* Mobile active sub-section (< 1024px) */}
+      {mobileSection && (
+        <div className="lg:hidden">
+          {mobileSection === 'media' && mediaCard}
+          {mobileSection === 'profile' && profileCard}
+          {mobileSection === 'defaults' && defaultsCard}
+        </div>
+      )}
+
+      {/* Desktop full 2-column grid (>= 1024px) */}
+      <div className="hidden gap-6 lg:grid lg:grid-cols-2">
+        {mediaCard}
+        <div className="space-y-6">
+          {profileCard}
+          {defaultsCard}
         </div>
       </div>
 

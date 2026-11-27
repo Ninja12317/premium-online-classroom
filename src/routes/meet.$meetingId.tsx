@@ -10,6 +10,7 @@ import {
   WifiOff,
 } from 'lucide-react'
 
+import { BackButton } from '@/components/back-button'
 import { Brand } from '@/components/brand'
 import { ThemeToggle } from '@/components/theme-toggle'
 import { AvatarBubble } from '@/components/avatar-bubble'
@@ -21,6 +22,7 @@ import {
   type LeaveReason,
 } from '@/components/meeting/meeting-room'
 import { useMeshAdapter } from '@/components/meeting/use-mesh-adapter'
+import { normalizeMeetingId } from '@/lib/meeting'
 import {
   getHostDetails,
   getMeeting,
@@ -42,8 +44,9 @@ import {
 
 export const Route = createFileRoute('/meet/$meetingId')({
   loader: async ({ params }) => {
+    const normalized = normalizeMeetingId(params.meetingId) ?? params.meetingId
     try {
-      return await getMeeting({ data: { meetingId: params.meetingId } })
+      return await getMeeting({ data: { meetingId: normalized } })
     } catch {
       return null
     }
@@ -60,7 +63,8 @@ type Phase =
   | { kind: 'left'; reason: LeaveReason; meeting: MeetingSummary }
 
 function MeetPage() {
-  const { meetingId } = Route.useParams()
+  const { meetingId: rawMeetingId } = Route.useParams()
+  const meetingId = normalizeMeetingId(rawMeetingId) ?? rawMeetingId
   const navigate = useNavigate()
   const [prefs, setPrefs] = useState<JoinPrefs | null>(null)
   const [phase, setPhase] = useState<Phase>({ kind: 'joining' })
@@ -566,13 +570,18 @@ function Screen({
   busy?: boolean
   children?: React.ReactNode
 }) {
+  const navigate = useNavigate()
   return (
     <main className="relative grid min-h-svh place-items-center px-4 py-12">
       <div
         className="paper-grid pointer-events-none absolute inset-0 -z-10"
         aria-hidden
       />
-      <div className="absolute left-4 top-4">
+      <div className="absolute left-4 top-4 flex items-center gap-2.5">
+        <BackButton
+          onClick={() => void navigate({ to: '/' })}
+          ariaLabel="Back to home"
+        />
         <Brand />
       </div>
       <div className="absolute right-4 top-4">

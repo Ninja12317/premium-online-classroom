@@ -1,28 +1,16 @@
-import { Link, useRouter } from '@tanstack/react-router'
 import {
   Calendar,
   Film,
   Home,
-  LogOut,
   MessageSquare,
   PenTool,
   Settings,
-  User as UserIcon,
 } from 'lucide-react'
-import { toast } from 'sonner'
 
 import { Brand } from '@/components/brand'
+import { useIdentity } from '@/components/identity-provider'
+import { ProfileMenu } from '@/components/profile-menu'
 import { ThemeToggle } from '@/components/theme-toggle'
-import { Button } from '@/components/ui/button'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu'
-import { displayName, useIdentity } from '@/components/identity-provider'
 import { cn } from '@/lib/utils'
 
 export type DashboardTab =
@@ -53,18 +41,7 @@ export function SiteHeader({
   activeTab?: DashboardTab
   onTabChange?: (tab: DashboardTab) => void
 }) {
-  const { user, ready, signOut: doSignOut } = useIdentity()
-  const router = useRouter()
-
-  async function handleSignOut() {
-    try {
-      await doSignOut()
-      await router.invalidate()
-      toast.success('Signed out')
-    } catch {
-      toast.error('Could not sign out. Try again.')
-    }
-  }
+  const { ready } = useIdentity()
 
   return (
     <header className="sticky top-0 z-30 border-b border-border/60 bg-background/85 backdrop-blur supports-[backdrop-filter]:bg-background/70">
@@ -103,43 +80,13 @@ export function SiteHeader({
         <nav className="flex items-center gap-1" aria-label="Account">
           <ThemeToggle />
           {!ready ? (
-            <span className="ml-1 h-8 w-20 animate-pulse rounded-md bg-muted" />
-          ) : user ? (
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button variant="outline" size="sm" className="ml-1 gap-2">
-                  <span className="grid size-5 place-items-center rounded-full bg-primary/15 text-[10px] font-semibold text-primary">
-                    {displayName(user).slice(0, 1).toUpperCase()}
-                  </span>
-                  <span className="max-w-28 truncate sm:max-w-32">
-                    {displayName(user)}
-                  </span>
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-56">
-                <DropdownMenuLabel className="truncate font-normal text-muted-foreground">
-                  {user.email}
-                </DropdownMenuLabel>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem asChild>
-                  <Link to="/">
-                    <UserIcon className="size-4" /> My classes
-                  </Link>
-                </DropdownMenuItem>
-                <DropdownMenuItem onSelect={() => void handleSignOut()}>
-                  <LogOut className="size-4" /> Sign out
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
+            <span className="ml-1 h-9 w-9 animate-pulse rounded-full bg-muted sm:w-24" />
           ) : (
-            <>
-              <Button asChild variant="ghost" size="sm" className="ml-1">
-                <Link to="/login">Sign in</Link>
-              </Button>
-              <Button asChild size="sm">
-                <Link to="/signup">Sign up</Link>
-              </Button>
-            </>
+            <ProfileMenu
+              onOpenSettings={
+                onTabChange ? () => onTabChange('settings') : undefined
+              }
+            />
           )}
         </nav>
       </div>

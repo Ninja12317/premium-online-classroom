@@ -55,6 +55,7 @@ export interface PresenterCameraState {
   zoom: number
   by: string
   at: number
+  force?: boolean
 }
 
 export interface BoardLaserState {
@@ -70,6 +71,7 @@ export interface MeetingSummary extends MeetingSettings {
   title: string
   hostName: string
   hostId?: string | null
+  memberIds?: string[]
   hasPasscode: boolean
   passcode?: string | null
   scheduledAt: string | null
@@ -86,6 +88,7 @@ export interface MeetingSummary extends MeetingSettings {
   muteAllAt?: number | null
   lastReaction?: MeetingReactionEvent | null
   screenAnnotations?: ScreenAnnStroke[]
+  presenterCamera?: PresenterCameraState | null
 }
 
 export interface PollOption {
@@ -109,6 +112,7 @@ export interface StandaloneBoardMeta {
   id: string
   title: string
   ownerId: string
+  memberIds?: string[]
   createdBy?: string
   createdByName?: string
   backgroundType?: 'dots' | 'grid' | 'lined' | 'blank'

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { auth } from '@/services/firebase'
 import { saveRecording } from '@/services/recordings-db'
 
 export interface RecorderMeta {
@@ -94,9 +95,10 @@ export function useTabRecorder(
         const title = metaRef.current?.title || 'Lectern class recording'
         const meetingId = metaRef.current?.meetingId || 'local'
 
-        // Save into IndexedDB so it appears in the Recordings dashboard tab
+        // Save into IndexedDB scoped strictly to the active Firebase UID
         void saveRecording({
           id: `rec-${now}-${Math.random().toString(36).slice(2, 6)}`,
+          ownerUid: auth.currentUser?.uid || undefined,
           meetingId,
           title,
           createdAt: now,

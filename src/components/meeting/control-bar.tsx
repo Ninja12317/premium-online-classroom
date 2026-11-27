@@ -61,6 +61,7 @@ import { cn } from '@/lib/utils'
 import type { PanelTab, ViewMode } from './types'
 
 export interface ControlBarProps {
+  meetingId?: string
   title: string
   duration: string
   participantCount: number
@@ -245,6 +246,17 @@ export const ControlBar = memo(function ControlBar(p: ControlBarProps) {
             </Tooltip>
             <DropdownMenuContent side="top" align="center" className="w-64">
               <DropdownMenuLabel>Security & Permissions</DropdownMenuLabel>
+              {p.meetingId && (
+                <>
+                  <DropdownMenuItem onSelect={p.onCopyLink}>
+                    <Copy />
+                    <span className="truncate font-mono text-xs">
+                      {p.meetingId}
+                    </span>
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                </>
+              )}
               <DropdownMenuItem onSelect={p.onToggleLock}>
                 {p.locked ? <LockOpen /> : <Lock />}
                 {p.locked ? 'Unlock meeting' : 'Lock meeting'}

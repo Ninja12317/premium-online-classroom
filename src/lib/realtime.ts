@@ -27,7 +27,7 @@ export type RealtimeMessage =
       boardTitle?: string | null
     }
   | { t: 'wb-laser'; x: number; y: number }
-  | { t: 'wb-camera'; cx: number; cy: number; zoom: number }
+  | { t: 'wb-camera'; cx: number; cy: number; zoom: number; force?: boolean }
   | { t: 'screen-ann'; op: 'add'; stroke: ScreenAnnStroke }
   | { t: 'screen-ann'; op: 'undo' }
   | { t: 'screen-ann'; op: 'clear' }

@@ -1,11 +1,14 @@
 /**
- * Local IndexedDB storage for class recordings captured via MediaRecorder.
- * Keeps large WebM blobs out of Firestore/localStorage while surfacing them
- * immediately inside the Dashboard Recordings tab with playback and download.
+ * Local IndexedDB storage for class recordings captured via MediaRecorder,
+ * strictly isolated per Firebase UID (`ownerUid`) so switching accounts or
+ * entering a fresh Guest session never leaks another profile's recordings.
  */
+
+import { getActiveStorageUid } from '@/lib/storage-scope'
 
 export interface StoredRecording {
   id: string
+  ownerUid: string
   meetingId: string
   title: string
   createdAt: number
@@ -39,18 +42,27 @@ function openDb(): Promise<IDBDatabase> {
   })
 }
 
-export async function saveRecording(rec: StoredRecording): Promise<void> {
+export async function saveRecording(
+  rec: Omit<StoredRecording, 'ownerUid'> & { ownerUid?: string },
+): Promise<void> {
+  const ownerUid = rec.ownerUid || getActiveStorageUid() || ''
+  if (!ownerUid) return
   const db = await openDb()
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readwrite')
-    tx.objectStore(STORE_NAME).put(rec)
+    tx.objectStore(STORE_NAME).put({ ...rec, ownerUid })
     tx.oncomplete = () => resolve()
     tx.onerror = () => reject(tx.error ?? new Error('Failed to save recording'))
   })
   db.close()
 }
 
-export async function listRecordings(): Promise<StoredRecording[]> {
+/** Lists only recordings belonging strictly to `ownerUid` (returns [] when logged out). */
+export async function listRecordings(
+  ownerUid?: string | null,
+): Promise<StoredRecording[]> {
+  const uid = ownerUid !== undefined ? ownerUid : getActiveStorageUid()
+  if (!uid) return []
   try {
     const db = await openDb()
     const rows = await new Promise<StoredRecording[]>((resolve, reject) => {
@@ -60,13 +72,21 @@ export async function listRecordings(): Promise<StoredRecording[]> {
       req.onerror = () => reject(req.error)
     })
     db.close()
-    return rows.sort((a, b) => b.createdAt - a.createdAt)
+    return rows
+      .filter((r) => Boolean(r.ownerUid) && r.ownerUid === uid)
+      .sort((a, b) => b.createdAt - a.createdAt)
   } catch {
     return []
   }
 }
 
-export async function renameRecording(id: string, title: string): Promise<void> {
+export async function renameRecording(
+  id: string,
+  title: string,
+  ownerUid?: string | null,
+): Promise<void> {
+  const uid = ownerUid !== undefined ? ownerUid : getActiveStorageUid()
+  if (!uid) return
   const db = await openDb()
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readwrite')
@@ -74,7 +94,7 @@ export async function renameRecording(id: string, title: string): Promise<void> 
     const getReq = store.get(id)
     getReq.onsuccess = () => {
       const row = getReq.result as StoredRecording | undefined
-      if (row) {
+      if (row && row.ownerUid === uid) {
         row.title = title
         store.put(row)
       }
@@ -85,11 +105,23 @@ export async function renameRecording(id: string, title: string): Promise<void> 
   db.close()
 }
 
-export async function deleteRecording(id: string): Promise<void> {
+export async function deleteRecording(
+  id: string,
+  ownerUid?: string | null,
+): Promise<void> {
+  const uid = ownerUid !== undefined ? ownerUid : getActiveStorageUid()
+  if (!uid) return
   const db = await openDb()
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readwrite')
-    tx.objectStore(STORE_NAME).delete(id)
+    const store = tx.objectStore(STORE_NAME)
+    const getReq = store.get(id)
+    getReq.onsuccess = () => {
+      const row = getReq.result as StoredRecording | undefined
+      if (!row || row.ownerUid === uid) {
+        store.delete(id)
+      }
+    }
     tx.oncomplete = () => resolve()
     tx.onerror = () => reject(tx.error)
   })

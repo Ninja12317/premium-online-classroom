@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   Check,
   Clock,
@@ -18,6 +18,7 @@ import {
 } from 'lucide-react'
 import { toast } from 'sonner'
 
+import { useIdentity } from '@/components/identity-provider'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -34,8 +35,8 @@ import {
   createStandaloneBoard,
   deleteStandaloneBoard,
   duplicateStandaloneBoard,
-  listStandaloneBoards,
   renameStandaloneBoard,
+  subscribeUserWhiteboards,
 } from '@/services/firestore-meetings'
 import type { TemplateKind } from './infinite-engine'
 
@@ -111,25 +112,35 @@ export function WhiteboardGallery({
   compact = false,
   openLabel = 'Open',
 }: WhiteboardGalleryProps) {
+  const { authStatus, clientUid, ready } = useIdentity()
+  const activeUid =
+    ready && (authStatus === 'authenticated' || authStatus === 'guest')
+      ? clientUid
+      : null
   const [boards, setBoards] = useState<StandaloneBoardMeta[]>([])
-  const [loading, setLoading] = useState(true)
+  const [loading, setLoading] = useState(() => Boolean(activeUid))
   const [creating, setCreating] = useState<string | null>(null)
   const [search, setSearch] = useState('')
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameVal, setRenameVal] = useState('')
 
-  const reload = useCallback(async () => {
-    try {
-      const list = await listStandaloneBoards()
-      setBoards(list)
-    } finally {
-      setLoading(false)
-    }
-  }, [])
+  const [seenUid, setSeenUid] = useState<string | null>(activeUid)
+  if (activeUid !== seenUid) {
+    setSeenUid(activeUid)
+    setBoards([])
+    setLoading(Boolean(activeUid))
+  }
 
   useEffect(() => {
-    void reload()
-  }, [reload])
+    if (!ready || !activeUid) return
+    const unsub = subscribeUserWhiteboards(activeUid, (list) => {
+      setBoards(list)
+      setLoading(false)
+    })
+    return () => {
+      unsub()
+    }
+  }, [ready, activeUid])
 
   const filteredBoards = useMemo(() => {
     const q = search.trim().toLowerCase()

@@ -1,22 +1,40 @@
-import { useCallback, useState } from 'react'
-import { useClientValue } from '@/lib/use-client-value'
+import { useCallback, useSyncExternalStore } from 'react'
 
 export type Theme = 'light' | 'dark'
 
 const STORAGE_KEY = 'lectern-theme'
+const EVENT_NAME = 'lectern-theme-change'
 
 function readTheme(): Theme {
+  if (typeof document === 'undefined') return 'light'
   return document.documentElement.classList.contains('dark') ? 'dark' : 'light'
 }
 
+function subscribeTheme(callback: () => void) {
+  if (typeof window === 'undefined') return () => {}
+  const onEvent = () => callback()
+  const onStorage = (e: StorageEvent) => {
+    if (e.key === STORAGE_KEY) callback()
+  }
+  window.addEventListener(EVENT_NAME, onEvent)
+  window.addEventListener('storage', onStorage)
+  return () => {
+    window.removeEventListener(EVENT_NAME, onEvent)
+    window.removeEventListener('storage', onStorage)
+  }
+}
+
 /**
- * Reads the theme applied by the inline <head> script and lets the UI toggle it.
- * `theme` is null until mounted so server and client render the same markup.
+ * Reads the theme applied by the inline <head> script and lets any UI toggle
+ * stay in sync across the header, profile dropdown, and settings.
+ * `theme` is null until hydrated so server and client render identical markup.
  */
 export function useTheme() {
-  const initial = useClientValue<Theme | null>(readTheme, null)
-  const [override, setOverride] = useState<Theme | null>(null)
-  const theme = override ?? initial
+  const theme = useSyncExternalStore<Theme | null>(
+    subscribeTheme,
+    readTheme,
+    () => null,
+  )
 
   const apply = useCallback((next: Theme) => {
     document.documentElement.classList.toggle('dark', next === 'dark')
@@ -25,12 +43,12 @@ export function useTheme() {
     } catch {
       // Storage can be unavailable in private sessions; the class still applies.
     }
-    setOverride(next)
+    window.dispatchEvent(new Event(EVENT_NAME))
   }, [])
 
   const toggle = useCallback(() => {
-    apply(theme === 'dark' ? 'light' : 'dark')
-  }, [apply, theme])
+    apply(readTheme() === 'dark' ? 'light' : 'dark')
+  }, [apply])
 
   return { theme, setTheme: apply, toggle }
 }

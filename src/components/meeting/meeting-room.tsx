@@ -47,6 +47,7 @@ import type { RealtimeMessage } from '@/lib/realtime'
 import { useHotkeys } from '@/lib/use-hotkeys'
 import { useTabRecorder } from '@/lib/use-tab-recorder'
 import {
+  joinWhiteboardMembership,
   sendFirestoreMessage,
   subscribeMeetingDoc,
   subscribeMeetingMessages,
@@ -135,6 +136,7 @@ export function MeetingRoom({
     cy: number
     zoom: number
     at: number
+    force?: boolean
   } | null>(null)
   const [screenAnnotations, setScreenAnnotations] = useState<ScreenAnnStroke[]>(
     meeting.screenAnnotations ?? [],
@@ -234,6 +236,18 @@ export function MeetingRoom({
       }
       if (m.activeWhiteboardTitle !== undefined) {
         setActiveWhiteboardTitle(m.activeWhiteboardTitle ?? null)
+      }
+      if (
+        m.presenterCamera &&
+        m.presenterCamera.by !== identity
+      ) {
+        setRemotePresenterCamera({
+          cx: m.presenterCamera.cx,
+          cy: m.presenterCamera.cy,
+          zoom: m.presenterCamera.zoom,
+          at: m.presenterCamera.at,
+          force: m.presenterCamera.force,
+        })
       }
       if (m.screenAnnotations !== undefined) {
         setScreenAnnotations(m.screenAnnotations)
@@ -405,6 +419,7 @@ export function MeetingRoom({
               cy: msg.cy,
               zoom: msg.zoom,
               at: Date.now(),
+              force: msg.force,
             })
           }
           return
@@ -963,12 +978,31 @@ export function MeetingRoom({
     ),
   )
 
+  // Record membership when opening a shared standalone whiteboard in this class
+  useEffect(() => {
+    if (whiteboardOpen && activeWhiteboardId) {
+      void joinWhiteboardMembership(activeWhiteboardId)
+    }
+  }, [whiteboardOpen, activeWhiteboardId])
+
   // ---- presentation ---------------------------------------------------------
   const broadcastCamera = useCallback(
-    (cx: number, cy: number, zoom: number) => {
-      adapter.send({ t: 'wb-camera', cx, cy, zoom })
+    (cx: number, cy: number, zoom: number, force?: boolean) => {
+      adapter.send({ t: 'wb-camera', cx, cy, zoom, force })
+      if (force) {
+        void updateMeetingMeta(meeting.meetingId, {
+          presenterCamera: {
+            cx,
+            cy,
+            zoom,
+            by: identity,
+            at: Date.now(),
+            force: true,
+          },
+        })
+      }
     },
-    [adapter],
+    [adapter, meeting.meetingId, identity],
   )
 
   const presentation = useMemo<Presentation | null>(() => {
@@ -1237,6 +1271,7 @@ export function MeetingRoom({
       )}
 
       <ControlBar
+        meetingId={meeting.meetingId}
         title={meeting.title}
         duration={duration}
         participantCount={adapter.tiles.length}
