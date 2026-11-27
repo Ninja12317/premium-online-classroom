@@ -1,9 +1,7 @@
 import { createServerFn } from '@tanstack/react-start'
-import { and, eq, gt, inArray, isNotNull, lt, ne } from 'drizzle-orm'
 import { z } from 'zod'
 
-import { db } from '../../db/index.js'
-import { meetings, participants, signals } from '../../db/schema.js'
+import { memoryStore, type SignalRow } from '../../db/index.js'
 import { sha256 } from '@/lib/server/crypto'
 import { isValidMeetingId } from '@/lib/meeting'
 import {
@@ -50,57 +48,49 @@ const syncInput = z.object({
 export const syncRoom = createServerFn({ method: 'POST' })
   .validator(syncInput)
   .handler(async ({ data }): Promise<SyncResult> => {
-    const [meeting] = await db
-      .select()
-      .from(meetings)
-      .where(eq(meetings.meetingId, data.meetingId))
-      .limit(1)
+    const meeting = memoryStore.meetings.find(
+      (m) => m.meetingId === data.meetingId,
+    )
     if (!meeting) return { status: 'not-found' }
     if (meeting.endedAt) return { status: 'ended' }
 
-    const [me] = await db
-      .select()
-      .from(participants)
-      .where(
-        and(
-          eq(participants.meetingId, meeting.meetingId),
-          eq(participants.identity, data.identity),
-          eq(participants.keyHash, sha256(data.participantKey)),
-        ),
-      )
-      .limit(1)
+    const keyHash = sha256(data.participantKey)
+    const me = memoryStore.participants.find(
+      (p) =>
+        p.meetingId === meeting.meetingId &&
+        p.identity === data.identity &&
+        p.keyHash === keyHash,
+    )
     if (!me) return { status: 'not-found' }
     if (me.status !== 'admitted') {
       return { status: me.status as 'removed' | 'rejected' | 'waiting' }
     }
 
     const now = new Date()
-    const since = new Date(now.getTime() - PRESENCE_WINDOW_MS)
+    const sinceMs = now.getTime() - PRESENCE_WINDOW_MS
     const role = me.role as Role
 
     // Presence heartbeat.
-    await db
-      .update(participants)
-      .set({ sessionId: data.sessionId, lastSeenAt: now })
-      .where(eq(participants.id, me.id))
+    me.sessionId = data.sessionId
+    me.lastSeenAt = now
 
     // Outgoing signals, restricted to people actually in this meeting.
     if (data.outbox.length > 0) {
-      const targets = Array.from(new Set(data.outbox.map((s) => s.to)))
-      const known = await db
-        .select({ identity: participants.identity })
-        .from(participants)
-        .where(
-          and(
-            eq(participants.meetingId, meeting.meetingId),
-            inArray(participants.identity, targets),
-            eq(participants.status, 'admitted'),
-          ),
-        )
-      const allowed = new Set(known.map((k) => k.identity))
-      const rows = data.outbox
-        .filter((s) => allowed.has(s.to))
-        .map((s) => ({
+      const targets = new Set(data.outbox.map((s) => s.to))
+      const allowed = new Set(
+        memoryStore.participants
+          .filter(
+            (p) =>
+              p.meetingId === meeting.meetingId &&
+              p.status === 'admitted' &&
+              targets.has(p.identity),
+          )
+          .map((p) => p.identity),
+      )
+      for (const s of data.outbox) {
+        if (!allowed.has(s.to)) continue
+        memoryStore.signals.push({
+          id: memoryStore.nextSignalId++,
           meetingId: meeting.meetingId,
           fromIdentity: me.identity,
           fromSession: data.sessionId,
@@ -108,58 +98,44 @@ export const syncRoom = createServerFn({ method: 'POST' })
           toSession: s.toSession,
           kind: s.kind,
           payload: s.payload,
-        }))
-      if (rows.length > 0) await db.insert(signals).values(rows)
+          createdAt: now,
+        })
+      }
     }
 
-    // Drain the inbox atomically so nothing is delivered twice.
-    const inboxRows = await db
-      .delete(signals)
-      .where(
-        and(
-          eq(signals.meetingId, meeting.meetingId),
-          eq(signals.toIdentity, me.identity),
-          eq(signals.toSession, data.sessionId),
-        ),
-      )
-      .returning()
+    // Drain the inbox atomically and sweep abandoned signals in one pass.
+    const cutoffMs = now.getTime() - SIGNAL_TTL_MS
+    const inboxRows: SignalRow[] = []
+    const remaining: SignalRow[] = []
+    for (const s of memoryStore.signals) {
+      if (
+        s.meetingId === meeting.meetingId &&
+        s.toIdentity === me.identity &&
+        s.toSession === data.sessionId
+      ) {
+        inboxRows.push(s)
+      } else if (s.createdAt.getTime() >= cutoffMs) {
+        remaining.push(s)
+      }
+    }
+    memoryStore.signals = remaining
     inboxRows.sort((a, b) => a.id - b.id)
 
-    // Sweep abandoned signals (cheap, keeps the table tiny).
-    await db
-      .delete(signals)
-      .where(lt(signals.createdAt, new Date(now.getTime() - SIGNAL_TTL_MS)))
-
-    const online = await db
-      .select({
-        identity: participants.identity,
-        sessionId: participants.sessionId,
-        name: participants.name,
-        role: participants.role,
-      })
-      .from(participants)
-      .where(
-        and(
-          eq(participants.meetingId, meeting.meetingId),
-          eq(participants.status, 'admitted'),
-          ne(participants.identity, me.identity),
-          isNotNull(participants.sessionId),
-          gt(participants.lastSeenAt, since),
-        ),
-      )
+    const online = memoryStore.participants.filter(
+      (p) =>
+        p.meetingId === meeting.meetingId &&
+        p.status === 'admitted' &&
+        p.identity !== me.identity &&
+        p.sessionId !== null &&
+        p.lastSeenAt !== null &&
+        p.lastSeenAt.getTime() > sinceMs,
+    )
 
     let waiting: WaitingParticipant[] | null = null
     if (isModerator(role)) {
-      const rows = await db
-        .select()
-        .from(participants)
-        .where(
-          and(
-            eq(participants.meetingId, meeting.meetingId),
-            eq(participants.status, 'waiting'),
-          ),
-        )
-        .orderBy(participants.createdAt)
+      const rows = memoryStore.participants
+        .filter((p) => p.meetingId === meeting.meetingId && p.status === 'waiting')
+        .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
       waiting = rows.map((r) => ({
         identity: r.identity,
         name: r.name,
@@ -207,15 +183,16 @@ export const leaveRoom = createServerFn({ method: 'POST' })
     }),
   )
   .handler(async ({ data }) => {
-    await db
-      .update(participants)
-      .set({ sessionId: null, lastSeenAt: null })
-      .where(
-        and(
-          eq(participants.meetingId, data.meetingId),
-          eq(participants.identity, data.identity),
-          eq(participants.keyHash, sha256(data.participantKey)),
-        ),
-      )
+    const keyHash = sha256(data.participantKey)
+    for (const p of memoryStore.participants) {
+      if (
+        p.meetingId === data.meetingId &&
+        p.identity === data.identity &&
+        p.keyHash === keyHash
+      ) {
+        p.sessionId = null
+        p.lastSeenAt = null
+      }
+    }
     return { ok: true }
   })

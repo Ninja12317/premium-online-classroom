@@ -1,10 +1,12 @@
 import { createServerFn } from '@tanstack/react-start'
-import { and, desc, eq, inArray } from 'drizzle-orm'
 import { getUser } from '@netlify/identity'
 import { z } from 'zod'
 
-import { db } from '../../db/index.js'
-import { meetings, participants, signals } from '../../db/schema.js'
+import {
+  memoryStore,
+  type MeetingRow,
+  type ParticipantRow,
+} from '../../db/index.js'
 import { sha256, randomSecret } from '@/lib/server/crypto'
 import { iceServers } from '@/lib/server/ice'
 import {
@@ -19,9 +21,6 @@ import type {
   Role,
   WaitingParticipant,
 } from '@/lib/meeting-types'
-
-type MeetingRow = typeof meetings.$inferSelect
-type ParticipantRow = typeof participants.$inferSelect
 
 const meetingIdSchema = z
   .string()
@@ -56,13 +55,8 @@ function summaryOf(row: MeetingRow): MeetingSummary {
   }
 }
 
-async function findMeeting(meetingId: string) {
-  const [row] = await db
-    .select()
-    .from(meetings)
-    .where(eq(meetings.meetingId, meetingId))
-    .limit(1)
-  return row ?? null
+function findMeeting(meetingId: string): MeetingRow | null {
+  return memoryStore.meetings.find((m) => m.meetingId === meetingId) ?? null
 }
 
 async function currentUser() {
@@ -77,25 +71,20 @@ async function currentUser() {
  * Resolves who is acting: the host (by host key) or a co-host (by participant
  * key). Throws for anyone else so moderation can never be spoofed.
  */
-async function authorizeModerator(meetingId: string, actorKey: string) {
-  const meeting = await findMeeting(meetingId)
+function authorizeModerator(meetingId: string, actorKey: string) {
+  const meeting = findMeeting(meetingId)
   if (!meeting) throw new Error('This meeting no longer exists.')
   const hash = sha256(actorKey)
   if (hash === meeting.hostKeyHash) {
     return { meeting, role: 'host' as Role }
   }
-  const [row] = await db
-    .select()
-    .from(participants)
-    .where(
-      and(
-        eq(participants.meetingId, meetingId),
-        eq(participants.keyHash, hash),
-        inArray(participants.role, ['host', 'cohost']),
-        eq(participants.status, 'admitted'),
-      ),
-    )
-    .limit(1)
+  const row = memoryStore.participants.find(
+    (p) =>
+      p.meetingId === meetingId &&
+      p.keyHash === hash &&
+      (p.role === 'host' || p.role === 'cohost') &&
+      p.status === 'admitted',
+  )
   if (row) return { meeting, role: row.role as Role }
   throw new Error('Only the teacher or a co-host can do that.')
 }
@@ -122,19 +111,28 @@ export const createMeeting = createServerFn({ method: 'POST' })
     const hostKey = randomSecret()
     const passcode = data.passcode ? generatePasscode() : null
     let meetingId = generateMeetingId()
-    for (let i = 0; i < 5 && (await findMeeting(meetingId)); i++) {
+    for (let i = 0; i < 5 && findMeeting(meetingId); i++) {
       meetingId = generateMeetingId()
     }
-    await db.insert(meetings).values({
+    memoryStore.meetings.push({
+      id: memoryStore.nextMeetingId++,
       meetingId,
       title: data.title || 'Live class',
       hostName,
       hostUserId: user?.id ?? null,
       hostKeyHash: sha256(hostKey),
       passcode,
-      waitingRoom: data.waitingRoom ?? true,
       scheduledAt: data.scheduledAt ? new Date(data.scheduledAt) : null,
       durationMin: data.durationMin ?? 60,
+      waitingRoom: data.waitingRoom ?? true,
+      locked: false,
+      allowStudentScreenShare: false,
+      allowStudentDraw: false,
+      allowChat: true,
+      allowPrivateChat: true,
+      startedAt: null,
+      endedAt: null,
+      createdAt: new Date(),
     })
     return { meetingId, hostKey, passcode }
   })
@@ -145,7 +143,7 @@ export const getMeeting = createServerFn({ method: 'GET' })
     async ({
       data,
     }): Promise<(MeetingSummary & { youAreHost: boolean }) | null> => {
-      const row = await findMeeting(data.meetingId)
+      const row = findMeeting(data.meetingId)
       if (!row) return null
       let youAreHost = false
       if (row.hostUserId) {
@@ -161,12 +159,10 @@ export const listMyMeetings = createServerFn({ method: 'GET' }).handler(
   async () => {
     const user = await currentUser()
     if (!user) return null
-    const rows = await db
-      .select()
-      .from(meetings)
-      .where(eq(meetings.hostUserId, user.id))
-      .orderBy(desc(meetings.createdAt))
-      .limit(50)
+    const rows = memoryStore.meetings
+      .filter((m) => m.hostUserId === user.id)
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+      .slice(0, 50)
     return rows.map((row) => ({ ...summaryOf(row), passcode: row.passcode }))
   },
 )
@@ -175,7 +171,7 @@ export const listMyMeetings = createServerFn({ method: 'GET' }).handler(
 export const getHostDetails = createServerFn({ method: 'POST' })
   .validator(z.object({ meetingId: meetingIdSchema, hostKey: keySchema }))
   .handler(async ({ data }) => {
-    const { meeting } = await authorizeModerator(data.meetingId, data.hostKey)
+    const { meeting } = authorizeModerator(data.meetingId, data.hostKey)
     return { ...summaryOf(meeting), passcode: meeting.passcode }
   })
 
@@ -184,15 +180,17 @@ export const deleteMeeting = createServerFn({ method: 'POST' })
   .handler(async ({ data }) => {
     const user = await currentUser()
     if (!user) throw new Error('Sign in to manage your classes.')
-    const row = await findMeeting(data.meetingId)
+    const row = findMeeting(data.meetingId)
     if (!row || row.hostUserId !== user.id) {
       throw new Error('That class is not yours to delete.')
     }
-    await db.delete(signals).where(eq(signals.meetingId, row.meetingId))
-    await db
-      .delete(participants)
-      .where(eq(participants.meetingId, row.meetingId))
-    await db.delete(meetings).where(eq(meetings.id, row.id))
+    memoryStore.signals = memoryStore.signals.filter(
+      (s) => s.meetingId !== row.meetingId,
+    )
+    memoryStore.participants = memoryStore.participants.filter(
+      (p) => p.meetingId !== row.meetingId,
+    )
+    memoryStore.meetings = memoryStore.meetings.filter((m) => m.id !== row.id)
     return { ok: true }
   })
 
@@ -250,7 +248,7 @@ function joinedResult(
 export const joinMeeting = createServerFn({ method: 'POST' })
   .validator(joinInput)
   .handler(async ({ data }): Promise<JoinResult> => {
-    const meeting = await findMeeting(data.meetingId)
+    const meeting = findMeeting(data.meetingId)
     if (!meeting) return { status: 'not-found' }
     const summary = summaryOf(meeting)
     if (meeting.endedAt) return { status: 'ended', meeting: summary }
@@ -265,63 +263,45 @@ export const joinMeeting = createServerFn({ method: 'POST' })
     }
     if (byKey || byAccount) {
       const hostSecret = byKey ? data.hostKey! : randomSecret()
-      let [row] = await db
-        .select()
-        .from(participants)
-        .where(
-          and(
-            eq(participants.meetingId, meeting.meetingId),
-            eq(participants.role, 'host'),
-          ),
-        )
-        .limit(1)
+      let row = memoryStore.participants.find(
+        (p) => p.meetingId === meeting.meetingId && p.role === 'host',
+      )
       if (!row) {
-        ;[row] = await db
-          .insert(participants)
-          .values({
-            meetingId: meeting.meetingId,
-            identity: `host-${randomSecret(6)}`,
-            name: data.name,
-            role: 'host',
-            status: 'admitted',
-            keyHash: sha256(hostSecret),
-          })
-          .returning()
+        const now = new Date()
+        row = {
+          id: memoryStore.nextParticipantId++,
+          meetingId: meeting.meetingId,
+          identity: `host-${randomSecret(6)}`,
+          name: data.name,
+          role: 'host',
+          status: 'admitted',
+          keyHash: sha256(hostSecret),
+          sessionId: null,
+          lastSeenAt: null,
+          createdAt: now,
+          updatedAt: now,
+        }
+        memoryStore.participants.push(row)
       } else {
-        ;[row] = await db
-          .update(participants)
-          .set({
-            name: data.name,
-            keyHash: sha256(hostSecret),
-            updatedAt: new Date(),
-          })
-          .where(eq(participants.id, row.id))
-          .returning()
+        row.name = data.name
+        row.keyHash = sha256(hostSecret)
+        row.updatedAt = new Date()
       }
-      let fresh = meeting
       if (!meeting.startedAt) {
-        ;[fresh] = await db
-          .update(meetings)
-          .set({ startedAt: new Date() })
-          .where(eq(meetings.id, meeting.id))
-          .returning()
+        meeting.startedAt = new Date()
       }
-      return joinedResult(fresh, row, hostSecret)
+      return joinedResult(meeting, row, hostSecret)
     }
 
     // Returning participant (page refresh, reconnect, or waiting-room poll).
     if (data.identity && data.participantKey) {
-      const [row] = await db
-        .select()
-        .from(participants)
-        .where(
-          and(
-            eq(participants.identity, data.identity),
-            eq(participants.meetingId, meeting.meetingId),
-            eq(participants.keyHash, sha256(data.participantKey)),
-          ),
-        )
-        .limit(1)
+      const keyHash = sha256(data.participantKey)
+      const row = memoryStore.participants.find(
+        (p) =>
+          p.identity === data.identity &&
+          p.meetingId === meeting.meetingId &&
+          p.keyHash === keyHash,
+      )
       if (row) {
         if (row.status === 'admitted') {
           return joinedResult(meeting, row, data.participantKey)
@@ -353,17 +333,21 @@ export const joinMeeting = createServerFn({ method: 'POST' })
     if (meeting.locked) return { status: 'locked', meeting: summary }
 
     const participantKey = randomSecret()
-    const [row] = await db
-      .insert(participants)
-      .values({
-        meetingId: meeting.meetingId,
-        identity: `p-${randomSecret(6)}`,
-        name: data.name,
-        role: 'student',
-        status: meeting.waitingRoom ? 'waiting' : 'admitted',
-        keyHash: sha256(participantKey),
-      })
-      .returning()
+    const now = new Date()
+    const row: ParticipantRow = {
+      id: memoryStore.nextParticipantId++,
+      meetingId: meeting.meetingId,
+      identity: `p-${randomSecret(6)}`,
+      name: data.name,
+      role: 'student',
+      status: meeting.waitingRoom ? 'waiting' : 'admitted',
+      keyHash: sha256(participantKey),
+      sessionId: null,
+      lastSeenAt: null,
+      createdAt: now,
+      updatedAt: now,
+    }
+    memoryStore.participants.push(row)
     if (row.status === 'waiting') {
       return {
         status: 'waiting',
@@ -383,17 +367,10 @@ const moderatorInput = z.object({
 export const listWaiting = createServerFn({ method: 'POST' })
   .validator(moderatorInput)
   .handler(async ({ data }): Promise<WaitingParticipant[]> => {
-    await authorizeModerator(data.meetingId, data.actorKey)
-    const rows = await db
-      .select()
-      .from(participants)
-      .where(
-        and(
-          eq(participants.meetingId, data.meetingId),
-          eq(participants.status, 'waiting'),
-        ),
-      )
-      .orderBy(participants.createdAt)
+    authorizeModerator(data.meetingId, data.actorKey)
+    const rows = memoryStore.participants
+      .filter((p) => p.meetingId === data.meetingId && p.status === 'waiting')
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
     return rows.map((r) => ({
       identity: r.identity,
       name: r.name,
@@ -409,36 +386,31 @@ export const decideAdmission = createServerFn({ method: 'POST' })
     }),
   )
   .handler(async ({ data }) => {
-    await authorizeModerator(data.meetingId, data.actorKey)
-    await db
-      .update(participants)
-      .set({
-        status: data.admit ? 'admitted' : 'rejected',
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(participants.meetingId, data.meetingId),
-          eq(participants.identity, data.identity),
-          eq(participants.status, 'waiting'),
-        ),
-      )
+    authorizeModerator(data.meetingId, data.actorKey)
+    for (const p of memoryStore.participants) {
+      if (
+        p.meetingId === data.meetingId &&
+        p.identity === data.identity &&
+        p.status === 'waiting'
+      ) {
+        p.status = data.admit ? 'admitted' : 'rejected'
+        p.updatedAt = new Date()
+      }
+    }
     return { ok: true }
   })
 
 export const admitAll = createServerFn({ method: 'POST' })
   .validator(moderatorInput)
   .handler(async ({ data }) => {
-    await authorizeModerator(data.meetingId, data.actorKey)
-    await db
-      .update(participants)
-      .set({ status: 'admitted', updatedAt: new Date() })
-      .where(
-        and(
-          eq(participants.meetingId, data.meetingId),
-          eq(participants.status, 'waiting'),
-        ),
-      )
+    authorizeModerator(data.meetingId, data.actorKey)
+    const now = new Date()
+    for (const p of memoryStore.participants) {
+      if (p.meetingId === data.meetingId && p.status === 'waiting') {
+        p.status = 'admitted'
+        p.updatedAt = now
+      }
+    }
     return { ok: true }
   })
 
@@ -458,15 +430,21 @@ const settingsPatch = z.object({
 export const updateSettings = createServerFn({ method: 'POST' })
   .validator(moderatorInput.extend({ patch: settingsPatch }))
   .handler(async ({ data }): Promise<MeetingSettings> => {
-    const { meeting } = await authorizeModerator(data.meetingId, data.actorKey)
-    const [updated] = await db
-      .update(meetings)
-      .set(data.patch)
-      .where(eq(meetings.id, meeting.id))
-      .returning()
+    const { meeting } = authorizeModerator(data.meetingId, data.actorKey)
+    if (data.patch.locked !== undefined) meeting.locked = data.patch.locked
+    if (data.patch.waitingRoom !== undefined)
+      meeting.waitingRoom = data.patch.waitingRoom
+    if (data.patch.allowStudentScreenShare !== undefined)
+      meeting.allowStudentScreenShare = data.patch.allowStudentScreenShare
+    if (data.patch.allowStudentDraw !== undefined)
+      meeting.allowStudentDraw = data.patch.allowStudentDraw
+    if (data.patch.allowChat !== undefined)
+      meeting.allowChat = data.patch.allowChat
+    if (data.patch.allowPrivateChat !== undefined)
+      meeting.allowPrivateChat = data.patch.allowPrivateChat
     // Peers pick the change up on their next sync; the moderator also
     // broadcasts it over the data channel for immediacy.
-    return settingsOf(updated)
+    return settingsOf(meeting)
   })
 
 /**
@@ -483,20 +461,10 @@ const moderateInput = moderatorInput.extend({
 export const moderate = createServerFn({ method: 'POST' })
   .validator(moderateInput)
   .handler(async ({ data }) => {
-    const { meeting, role } = await authorizeModerator(
-      data.meetingId,
-      data.actorKey,
+    const { meeting, role } = authorizeModerator(data.meetingId, data.actorKey)
+    const target = memoryStore.participants.find(
+      (p) => p.meetingId === meeting.meetingId && p.identity === data.identity,
     )
-    const [target] = await db
-      .select()
-      .from(participants)
-      .where(
-        and(
-          eq(participants.meetingId, meeting.meetingId),
-          eq(participants.identity, data.identity),
-        ),
-      )
-      .limit(1)
     if (!target) throw new Error('That participant has already left.')
     if (target.role === 'host')
       throw new Error('The teacher cannot be moderated.')
@@ -509,25 +477,18 @@ export const moderate = createServerFn({ method: 'POST' })
 
     switch (data.action) {
       case 'remove': {
-        await db
-          .update(participants)
-          .set({
-            status: 'removed',
-            sessionId: null,
-            lastSeenAt: null,
-            updatedAt: new Date(),
-          })
-          .where(eq(participants.id, target.id))
+        target.status = 'removed'
+        target.sessionId = null
+        target.lastSeenAt = null
+        target.updatedAt = new Date()
         return { ok: true }
       }
       case 'make-cohost':
       case 'revoke-cohost': {
         const nextRole: Role =
           data.action === 'make-cohost' ? 'cohost' : 'student'
-        await db
-          .update(participants)
-          .set({ role: nextRole, updatedAt: new Date() })
-          .where(eq(participants.id, target.id))
+        target.role = nextRole
+        target.updatedAt = new Date()
         return { ok: true }
       }
     }
@@ -536,15 +497,11 @@ export const moderate = createServerFn({ method: 'POST' })
 export const endMeeting = createServerFn({ method: 'POST' })
   .validator(moderatorInput)
   .handler(async ({ data }) => {
-    const { meeting, role } = await authorizeModerator(
-      data.meetingId,
-      data.actorKey,
-    )
+    const { meeting, role } = authorizeModerator(data.meetingId, data.actorKey)
     if (role !== 'host') throw new Error('Only the teacher can end the class.')
-    await db
-      .update(meetings)
-      .set({ endedAt: new Date() })
-      .where(eq(meetings.id, meeting.id))
-    await db.delete(signals).where(eq(signals.meetingId, meeting.meetingId))
+    meeting.endedAt = new Date()
+    memoryStore.signals = memoryStore.signals.filter(
+      (s) => s.meetingId !== meeting.meetingId,
+    )
     return { ok: true }
   })
