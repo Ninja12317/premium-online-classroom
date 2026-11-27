@@ -14,7 +14,7 @@ import { FirestoreNoticeBanner } from '@/components/firestore-banner'
 
 import '../styles.css'
 
-const siteName = 'Lectern — live online classroom'
+const siteName = 'Lectern — Live Classroom & Meetings'
 const siteDescription =
   'Lectern is a live video classroom for teachers: start a class in one click, students join from a link, teach with video, screen share, whiteboard and chat.'
 
@@ -35,9 +35,11 @@ export const Route = createRootRoute({
       { property: 'og:description', content: siteDescription },
       { property: 'og:type', content: 'website' },
       { name: 'twitter:card', content: 'summary_large_image' },
-      { name: 'theme-color', content: '#f8f7f3' },
+      { name: 'theme-color', content: '#115E46' },
     ],
     links: [
+      { rel: 'icon', type: 'image/svg+xml', href: '/favicon.svg?v=3' },
+      { rel: 'apple-touch-icon', href: '/favicon.svg?v=3' },
       { rel: 'preconnect', href: 'https://fonts.googleapis.com' },
       {
         rel: 'preconnect',

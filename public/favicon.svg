@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="lectern-bg" x1="32" y1="0" x2="32" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#115E46" />
+      <stop offset="100%" stop-color="#0B3D2E" />
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded emerald badge with subtle inner rim for dark/light tab contrast -->
+  <rect width="64" height="64" rx="14" fill="url(#lectern-bg)" />
+  <rect
+    x="1.5"
+    y="1.5"
+    width="61"
+    height="61"
+    rx="12.5"
+    stroke="#FAF9F5"
+    stroke-opacity="0.14"
+    stroke-width="1.5"
+  />
+
+  <!-- Bold geometric "L" styled as a minimal lectern / board frame -->
+  <path
+    d="M17 17.5C17 15.567 18.567 14 20.5 14H24.5C26.433 14 28 15.567 28 17.5V38H44.5C46.433 38 48 39.567 48 41.5V45.5C48 47.433 46.433 49 44.5 49H20.5C18.567 49 17 47.433 17 45.5V17.5Z"
+    fill="#FAF9F5"
+  />
+
+  <!-- Mint-sage live indicator dot -->
+  <circle cx="46" cy="18" r="6" fill="#52C99E" />
+</svg>
