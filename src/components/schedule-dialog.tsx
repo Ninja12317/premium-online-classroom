@@ -151,6 +151,7 @@ export function ScheduleDialog({
             hostName: resolvedHostName,
             passcode,
             waitingRoom,
+            meetingType: 'scheduled',
             scheduledAt: startsAt.toISOString(),
             durationMin: Number(duration),
           },

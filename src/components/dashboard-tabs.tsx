@@ -59,7 +59,10 @@ import {
   formatDuration,
   meetingUrl,
 } from '@/lib/meeting'
-import type { MeetingSummary } from '@/lib/meeting-types'
+import {
+  isUpcomingScheduledMeeting,
+  type MeetingSummary,
+} from '@/lib/meeting-types'
 import {
   patchStoredPrefs,
   savePrefs,
@@ -137,8 +140,14 @@ export function MeetingsTab({
     ? (meetings.find((m) => m.meetingId === detailId) ?? null)
     : null
 
-  const upcoming = filtered.filter((m) => !m.endedAt)
-  const past = filtered.filter((m) => m.endedAt)
+  const upcoming = filtered
+    .filter((m) => isUpcomingScheduledMeeting(m))
+    .sort((a, b) => {
+      const ta = a.scheduledAt ? Date.parse(a.scheduledAt) : Infinity
+      const tb = b.scheduledAt ? Date.parse(b.scheduledAt) : Infinity
+      return ta - tb
+    })
+  const past = filtered.filter((m) => m.status === 'ended' || Boolean(m.endedAt))
 
   if (selectedMeeting) {
     const invite = [
@@ -394,7 +403,7 @@ export function MeetingsTab({
 
       <section className="space-y-3">
         <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-          Upcoming & Open ({upcoming.length})
+          Upcoming meetings ({upcoming.length})
         </h2>
         {authStatus === 'loggedOut' ? (
           <div className="rounded-2xl border border-dashed bg-card/50 p-10 text-center text-sm text-muted-foreground">

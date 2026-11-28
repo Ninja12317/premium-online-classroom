@@ -48,6 +48,7 @@ import {
   type MeetingReactionEvent,
   type MeetingSettings,
   type MeetingSummary,
+  type MeetingType,
   type OutgoingSignal,
   type ParticipantStatus,
   type PeerInfo,
@@ -98,6 +99,7 @@ interface MeetingDoc {
   allowChat: boolean
   allowPrivateChat: boolean
   status: 'scheduled' | 'live' | 'ended'
+  meetingType: MeetingType
   scheduledAt: string | null
   durationMin: number
   startedAt: string | null
@@ -251,6 +253,16 @@ function normalizeMeetingDoc(
     : []
   const memberIds =
     hostId && !rawMembers.includes(hostId) ? [hostId, ...rawMembers] : rawMembers
+  const scheduledAt =
+    typeof raw.scheduledAt === 'string' && raw.scheduledAt.trim().length > 0
+      ? raw.scheduledAt
+      : null
+  const meetingType: MeetingType =
+    raw.meetingType === 'scheduled' || raw.meetingType === 'instant'
+      ? raw.meetingType
+      : scheduledAt
+        ? 'scheduled'
+        : 'instant'
   const createdAt = typeof raw.createdAt === 'number' ? raw.createdAt : Date.now()
   return {
     meetingId,
@@ -276,7 +288,8 @@ function normalizeMeetingDoc(
     allowPrivateChat:
       raw.allowPrivateChat === undefined ? true : Boolean(raw.allowPrivateChat),
     status,
-    scheduledAt: typeof raw.scheduledAt === 'string' ? raw.scheduledAt : null,
+    meetingType,
+    scheduledAt,
     durationMin: typeof raw.durationMin === 'number' ? raw.durationMin : 60,
     startedAt,
     endedAt,
@@ -333,6 +346,7 @@ export function summaryOf(row: MeetingDoc): MeetingSummary {
     startedAt: row.startedAt,
     endedAt: row.endedAt,
     status: row.status,
+    meetingType: row.meetingType,
     spotlightId: row.spotlightId,
     breakout: row.breakout,
     notes: row.notes,
@@ -427,6 +441,7 @@ export interface CreateMeetingInput {
   waitingRoom?: boolean
   scheduledAt?: string
   durationMin?: number
+  meetingType?: MeetingType
 }
 
 export async function createMeetingRecord(input: CreateMeetingInput) {
@@ -444,6 +459,10 @@ export async function createMeetingRecord(input: CreateMeetingInput) {
   const meetingId = customId && isValidMeetingId(customId) ? customId : generateMeetingId()
   const title = input.title?.trim() || 'Live class'
   const waitingRoom = input.waitingRoom ?? true
+  const meetingType: MeetingType =
+    input.meetingType ?? (input.scheduledAt ? 'scheduled' : 'instant')
+  const scheduledAt =
+    meetingType === 'scheduled' ? (input.scheduledAt ?? null) : null
   const now = Date.now()
   const record: MeetingDoc = {
     meetingId,
@@ -463,8 +482,9 @@ export async function createMeetingRecord(input: CreateMeetingInput) {
     allowParticipantAnnotate: false,
     allowChat: true,
     allowPrivateChat: true,
-    status: input.scheduledAt ? 'scheduled' : 'live',
-    scheduledAt: input.scheduledAt ?? null,
+    status: meetingType === 'scheduled' ? 'scheduled' : 'live',
+    meetingType,
+    scheduledAt,
     durationMin: input.durationMin ?? 60,
     startedAt: null,
     endedAt: null,
@@ -524,11 +544,20 @@ export async function updateMeetingDetails(
     waitingRoomEnabled:
       patch.waitingRoom !== undefined ? patch.waitingRoom : existing.waitingRoom,
     passcode: patch.passcode !== undefined ? patch.passcode : existing.passcode,
+    meetingType:
+      patch.scheduledAt !== undefined
+        ? patch.scheduledAt
+          ? 'scheduled'
+          : existing.meetingType
+        : existing.meetingType,
+    updatedAt: Date.now(),
   }
   saveLocalMeeting(next)
   if (await requireAuth()) {
     try {
-      await setDoc(doc(db, 'meetings', meetingId), next, { merge: true })
+      await setDoc(doc(db, 'meetings', meetingId), stripUndefinedDeep(next), {
+        merge: true,
+      })
     } catch (err) {
       handleFsError(`meetings/${meetingId}`, err)
     }
@@ -1135,18 +1164,22 @@ export async function moderateParticipantRecord(
 export async function endMeetingRecord(meetingId: string, actorKey: string) {
   const { meeting, role } = await authorizeModerator(meetingId, actorKey)
   if (role !== 'host') throw new Error('Only the teacher can end the class.')
-  const endedAt = new Date().toISOString()
+  const now = Date.now()
+  const endedAt = new Date(now).toISOString()
   meeting.endedAt = endedAt
   meeting.status = 'ended'
+  meeting.updatedAt = now
   saveLocalMeeting(meeting)
-  try {
-    await setDoc(
-      doc(db, 'meetings', meetingId),
-      { endedAt, status: 'ended' },
-      { merge: true },
-    )
-  } catch (err) {
-    handleFsError(`meetings/${meetingId}`, err)
+  if (await requireAuth()) {
+    try {
+      await setDoc(
+        doc(db, 'meetings', meetingId),
+        { endedAt, status: 'ended', updatedAt: now },
+        { merge: true },
+      )
+    } catch (err) {
+      handleFsError(`meetings/${meetingId}`, err)
+    }
   }
   return { ok: true }
 }

@@ -67,6 +67,7 @@ import {
   deleteMeeting,
   listMyMeetings,
 } from '@/lib/meetings.functions'
+import { isUpcomingScheduledMeeting } from '@/lib/meeting-types'
 import { useJoinPrefs } from '@/lib/prefs'
 import { useUserProfile } from '@/lib/profile'
 import { useMounted } from '@/lib/use-mounted'
@@ -88,7 +89,6 @@ function HomeDashboard() {
   const [meetings, setMeetings] = useState<DashboardMeeting[]>([])
   const [loadingMeetings, setLoadingMeetings] = useState(false)
   const [starting, setStarting] = useState(false)
-  const [sharingStart, setSharingStart] = useState(false)
   const [joinOpen, setJoinOpen] = useState(false)
   const [joinValue, setJoinValue] = useState('')
   const [joinError, setJoinError] = useState<string | null>(null)
@@ -207,26 +207,21 @@ function HomeDashboard() {
     }
   }, [ready, activeProfileUid])
 
-  async function startNewMeeting(mode: 'instant' | 'share' | 'pmi' = 'instant') {
+  async function startNewMeeting(mode: 'instant' | 'pmi' = 'instant') {
     if (isStudent) {
       toast.info('Switch to a Teacher account to host a live class.')
       openAuthModal('teacher')
       return
     }
-    if (starting || sharingStart) return
-    if (mode === 'share') setSharingStart(true)
-    else setStarting(true)
+    if (starting) return
+    setStarting(true)
     try {
       const result = await createMeeting({
         data: {
-          title:
-            mode === 'share'
-              ? 'Screen share session'
-              : mode === 'pmi'
-                ? 'Personal Meeting Room'
-                : 'Live class',
+          title: mode === 'pmi' ? 'Personal Meeting Room' : 'Live class',
           hostName: resolvedHostName,
-          waitingRoom: mode !== 'share',
+          waitingRoom: true,
+          meetingType: 'instant',
           customMeetingId:
             mode === 'pmi' && teacherPmi ? teacherPmi : undefined,
         },
@@ -239,7 +234,6 @@ function HomeDashboard() {
     } catch {
       toast.error('Could not start a class right now. Please try again.')
       setStarting(false)
-      setSharingStart(false)
     }
   }
 
@@ -290,7 +284,7 @@ function HomeDashboard() {
   const upcoming = useMemo(
     () =>
       meetings
-        .filter((m) => !m.endedAt)
+        .filter((m) => isUpcomingScheduledMeeting(m))
         .sort((a, b) => {
           const ta = a.scheduledAt ? Date.parse(a.scheduledAt) : Infinity
           const tb = b.scheduledAt ? Date.parse(b.scheduledAt) : Infinity
@@ -395,28 +389,30 @@ function HomeDashboard() {
 
                 {/* Zoom-ergonomics Dashboard Grid styled 100% with Lectern tokens */}
                 <div className="grid gap-6 lg:grid-cols-[1.05fr_0.95fr] lg:items-start">
-                  {/* Left: 4 Role-Aware Quick-Action Tiles */}
+                  {/* Left: Role-Aware Quick-Action Tiles */}
                   <div className="space-y-6">
                     {!isStudent ? (
                       <div className="grid grid-cols-2 gap-3.5 sm:gap-4">
-                        {/* New Meeting primary card (with PMI dropdown caret for signed-in Teachers) */}
-                        <div className="relative flex flex-col justify-between rounded-2xl border border-primary/20 bg-primary text-primary-foreground shadow-md shadow-primary/15 transition-all hover:bg-primary/95">
+                        {/* New Meeting primary hero card spanning full width so Join + Schedule pair cleanly below */}
+                        <div className="relative col-span-2 flex flex-col justify-between rounded-2xl border border-primary/20 bg-primary text-primary-foreground shadow-md shadow-primary/15 transition-all hover:bg-primary/95">
                           <button
                             type="button"
                             disabled={starting}
                             onClick={() => void startNewMeeting('instant')}
-                            className="flex flex-1 flex-col items-start justify-between rounded-2xl p-5 text-left disabled:opacity-60"
+                            className="flex flex-1 flex-col items-start justify-between gap-4 rounded-2xl p-5 text-left disabled:opacity-60 sm:flex-row sm:items-center sm:p-6"
                           >
-                            <span className="mb-4 grid size-11 place-items-center rounded-xl bg-primary-foreground/15 text-primary-foreground">
-                              <Video className="size-5" />
-                            </span>
-                            <div className={isTeacher ? 'pr-7' : undefined}>
-                              <span className="block font-display text-lg font-semibold leading-tight">
-                                {starting ? 'Preparing room…' : 'New Meeting'}
+                            <div className="flex items-start gap-4 sm:items-center">
+                              <span className="grid size-12 shrink-0 place-items-center rounded-xl bg-primary-foreground/15 text-primary-foreground">
+                                <Video className="size-5" />
                               </span>
-                              <span className="mt-1 block text-xs text-primary-foreground/80">
-                                Start an instant live class right now
-                              </span>
+                              <div className={isTeacher ? 'pr-8 sm:pr-10' : undefined}>
+                                <span className="block font-display text-lg font-semibold leading-tight sm:text-xl">
+                                  {starting ? 'Preparing room…' : 'New Meeting'}
+                                </span>
+                                <span className="mt-1 block text-xs text-primary-foreground/80 sm:text-sm">
+                                  Start an instant live class right now
+                                </span>
+                              </div>
                             </div>
                           </button>
                           {isTeacher && (
@@ -425,7 +421,7 @@ function HomeDashboard() {
                                 <button
                                   type="button"
                                   aria-label="New meeting options and Personal Meeting ID"
-                                  className="absolute right-3 top-3 grid size-8 place-items-center rounded-lg bg-primary-foreground/15 text-primary-foreground transition-colors hover:bg-primary-foreground/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-foreground"
+                                  className="absolute right-3.5 top-3.5 grid size-8 place-items-center rounded-lg bg-primary-foreground/15 text-primary-foreground transition-colors hover:bg-primary-foreground/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-foreground sm:right-4 sm:top-1/2 sm:-translate-y-1/2"
                                 >
                                   <ChevronDown className="size-4" />
                                 </button>
@@ -482,13 +478,6 @@ function HomeDashboard() {
                           title="Schedule"
                           description="Plan a class with permanent link & passcode"
                           onClick={handleOpenSchedule}
-                        />
-                        <QuickActionCard
-                          icon={MonitorUp}
-                          title={sharingStart ? 'Starting…' : 'Share Screen'}
-                          description="Open a room ready to present immediately"
-                          disabled={sharingStart}
-                          onClick={() => void startNewMeeting('share')}
                         />
                       </div>
                     ) : (

@@ -7,6 +7,7 @@ import {
   normalizeMeetingId,
   parseMeetingInput,
 } from './meeting'
+import { isUpcomingScheduledMeeting } from './meeting-types'
 
 describe('meeting ID generation and normalization', () => {
   it('generates branded LEC-XXXX-XXXX IDs without confusing characters', () => {
@@ -52,5 +53,81 @@ describe('meeting ID generation and normalization', () => {
     expect(parseMeetingInput('')).toBeNull()
     expect(parseMeetingInput('hello')).toBeNull()
     expect(parseMeetingInput('LEC-123')).toBeNull()
+  })
+})
+
+describe('isUpcomingScheduledMeeting', () => {
+  it('includes scheduled meetings that have not ended', () => {
+    expect(
+      isUpcomingScheduledMeeting({
+        meetingType: 'scheduled',
+        scheduledAt: '2027-02-10T10:00:00.000Z',
+        status: 'scheduled',
+        endedAt: null,
+      }),
+    ).toBe(true)
+    expect(
+      isUpcomingScheduledMeeting({
+        meetingType: 'scheduled',
+        scheduledAt: '2027-02-10T10:00:00.000Z',
+        status: 'live',
+        endedAt: null,
+      }),
+    ).toBe(true)
+  })
+
+  it('excludes instant meetings even when live or unended', () => {
+    expect(
+      isUpcomingScheduledMeeting({
+        meetingType: 'instant',
+        scheduledAt: null,
+        status: 'live',
+        endedAt: null,
+      }),
+    ).toBe(false)
+    expect(
+      isUpcomingScheduledMeeting({
+        meetingType: 'instant',
+        scheduledAt: '2027-02-10T10:00:00.000Z',
+        status: 'scheduled',
+        endedAt: null,
+      }),
+    ).toBe(false)
+  })
+
+  it('includes legacy docs with scheduledAt and excludes legacy instant docs without scheduledAt', () => {
+    expect(
+      isUpcomingScheduledMeeting({
+        scheduledAt: '2027-02-10T10:00:00.000Z',
+        status: 'scheduled',
+        endedAt: null,
+      }),
+    ).toBe(true)
+    expect(
+      isUpcomingScheduledMeeting({
+        scheduledAt: null,
+        status: 'live',
+        endedAt: null,
+      }),
+    ).toBe(false)
+  })
+
+  it('excludes ended scheduled meetings', () => {
+    expect(
+      isUpcomingScheduledMeeting({
+        meetingType: 'scheduled',
+        scheduledAt: '2027-02-10T10:00:00.000Z',
+        status: 'ended',
+        endedAt: null,
+      }),
+    ).toBe(false)
+    expect(
+      isUpcomingScheduledMeeting({
+        meetingType: 'scheduled',
+        scheduledAt: '2027-02-10T10:00:00.000Z',
+        status: 'scheduled',
+        endedAt: '2027-02-10T11:00:00.000Z',
+      }),
+    ).toBe(false)
   })
 })

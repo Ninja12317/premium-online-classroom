@@ -1,6 +1,7 @@
 /** Types shared by Firestore services, WebRTC mesh, and the meeting UI. */
 
 export type Role = 'host' | 'cohost' | 'student'
+export type MeetingType = 'scheduled' | 'instant'
 export type ParticipantStatus =
   | 'waiting'
   | 'admitted'
@@ -99,6 +100,7 @@ export interface MeetingSummary extends MeetingSettings {
   startedAt: string | null
   endedAt: string | null
   status?: 'scheduled' | 'live' | 'ended'
+  meetingType?: MeetingType
   spotlightId?: string | null
   breakout?: BreakoutState | null
   notes?: string
@@ -212,4 +214,18 @@ export const defaultSettings: MeetingSettings = {
 
 export function isModerator(role: Role) {
   return role === 'host' || role === 'cohost'
+}
+
+/**
+ * Returns true only for non-ended scheduled meetings (explicitly tagged
+ * `meetingType: "scheduled"`, or legacy docs that have a `scheduledAt`
+ * timestamp without `meetingType: "instant"`). Instant "New Meeting" rooms
+ * are always excluded from "Upcoming meetings".
+ */
+export function isUpcomingScheduledMeeting(
+  m: Pick<MeetingSummary, 'meetingType' | 'scheduledAt' | 'status' | 'endedAt'>,
+): boolean {
+  if (m.status === 'ended' || Boolean(m.endedAt)) return false
+  if (m.meetingType === 'instant') return false
+  return m.meetingType === 'scheduled' || Boolean(m.scheduledAt)
 }
