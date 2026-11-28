@@ -43,8 +43,11 @@ import {
 } from '@/services/firestore-meetings'
 
 export const Route = createFileRoute('/meet/$meetingId')({
-  head: ({ params }) => ({
-    meta: [{ title: `${params.meetingId} · Lectern` }],
+  // Non-blocking route entry: do not stall navigation on an extra sequential
+  // Firestore round-trip before MeetPage runs parallel auth + join.
+  loader: () => null,
+  head: () => ({
+    meta: [{ title: 'Class · Lectern' }],
   }),
   component: MeetPage,
 })
@@ -72,8 +75,6 @@ function MeetPage() {
       const stored = loadParticipant(meetingId)
       const hostKey = hostKeyRef.current
       try {
-        // Warm auth + run join cleanly without blocking on camera/mic hardware.
-        await ensureAuth().catch(() => {})
         const result = await joinMeeting({
           data: {
             meetingId,
@@ -85,6 +86,9 @@ function MeetPage() {
           },
         })
         if (result.status === 'joined') {
+          if (typeof document !== 'undefined' && result.meeting.title) {
+            document.title = `${result.meeting.title} · Lectern`
+          }
           joinedIdentityRef.current = result.identity
           saveParticipant(meetingId, {
             activeMeetingId: meetingId,
@@ -125,7 +129,7 @@ function MeetPage() {
     [meetingId],
   )
 
-  // Stable one-time boot keyed ONLY on [meetingId].
+  // Stable one-time parallel boot keyed ONLY on [meetingId].
   useEffect(() => {
     const loadedPrefs = loadPrefsCached()
     const stored = loadParticipant(meetingId)
@@ -150,7 +154,10 @@ function MeetPage() {
     }
     void Promise.resolve().then(() => {
       setPrefs(effectivePrefs)
-      return executeJoin(effectivePrefs, code)
+      return Promise.allSettled([
+        ensureAuth(),
+        executeJoin(effectivePrefs, code),
+      ])
     })
   }, [meetingId, navigate, executeJoin])
 

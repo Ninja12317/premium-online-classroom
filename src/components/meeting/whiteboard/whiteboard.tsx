@@ -181,6 +181,8 @@ export interface WhiteboardProps {
     cy: number,
     zoom: number,
     force?: boolean,
+    panX?: number,
+    panY?: number,
   ) => void
   remotePresenterCamera?: {
     cx: number
@@ -408,6 +410,16 @@ export function Whiteboard({
   const lastCamBroadcastRef = useRef(0)
   const lastFsLaserEmitRef = useRef(0)
   const lastFsLaserAtRef = useRef(0)
+  const lastPresenceAtByUidRef = useRef<Map<string, number>>(new Map())
+  const lastTextSyncRef = useRef(0)
+  const liveTextMetaRef = useRef<{
+    id: string
+    isNew: boolean
+    zIndex: number
+    createdAt: number
+    deckId?: string
+    deckPage?: number
+  } | null>(null)
   const activeEditingIdsRef = useRef<Set<string>>(new Set())
 
   // Alignment guides & connector anchor hover indicators drawn on canvas
@@ -498,6 +510,11 @@ export function Whiteboard({
 
   useEffect(() => {
     if (!syncScope) return
+    const triggerInstantRepaint = () => {
+      if (typeof window !== 'undefined') {
+        window.requestAnimationFrame(() => setRenderTick((t) => t + 1))
+      }
+    }
     const unsubEls = subscribeWhiteboardElements<BoardElement>(
       syncScope,
       (remote) => {
@@ -506,23 +523,16 @@ export function Whiteboard({
         if (activeIds.size === 0 && !draftId) {
           elementsRef.current = remote
           setElements(remote)
-          window.requestAnimationFrame(() => paintCanvasRef.current())
+          triggerInstantRepaint()
           return
         }
         const localById = new Map(elementsRef.current.map((e) => [e.id, e]))
         const merged = remote
           .filter((e) => e.id !== draftId)
           .map((e) => (activeIds.has(e.id) ? (localById.get(e.id) ?? e) : e))
-        // Preserve newly-typed live text/sticky elements that aren't in the remote snapshot yet
-        for (const activeId of activeIds) {
-          if (activeId !== draftId && !merged.some((e) => e.id === activeId)) {
-            const localEl = localById.get(activeId)
-            if (localEl) merged.push(localEl)
-          }
-        }
         elementsRef.current = merged
         setElements(merged)
-        window.requestAnimationFrame(() => paintCanvasRef.current())
+        triggerInstantRepaint()
       },
     )
     const unsubMeta =
@@ -539,51 +549,60 @@ export function Whiteboard({
                 force: meta.presenterCamera.force,
               })
             }
+            if (
+              meta.laser &&
+              meta.laser.id !== author &&
+              meta.laser.at > lastFsLaserAtRef.current &&
+              Date.now() - meta.laser.at < 2000
+            ) {
+              lastFsLaserAtRef.current = meta.laser.at
+              const l = meta.laser
+              setFsLasers((prev) => {
+                const nowTs = Date.now()
+                const others = prev.filter((x) => x.id !== l.id)
+                const cur = prev.find((x) => x.id === l.id)
+                const pts = [
+                  ...(cur?.points.filter((pt) => nowTs - pt.at < 1500) ?? []),
+                  { x: l.x, y: l.y, at: nowTs },
+                ]
+                return [...others, { id: l.id, name: l.name, points: pts }]
+              })
+            }
+            triggerInstantRepaint()
           })
         : () => {}
     const unsubPresence =
       syncScope.kind === 'board'
-        ? subscribeWhiteboardPresence(syncScope.boardId, (entries) => {
+        ? subscribeWhiteboardPresence(syncScope.boardId, (docs) => {
             const nowTs = Date.now()
+            let changed = false
             setFsLasers((prev) => {
-              const byId = new Map(prev.map((l) => [l.id, l]))
-              let changed = false
-              for (const entry of entries) {
-                if (entry.uid === author) continue
-                if (!entry.active || nowTs - entry.at > 2000) {
-                  if (byId.has(entry.uid)) {
-                    byId.delete(entry.uid)
-                    changed = true
-                  }
-                  continue
-                }
-                const cur = byId.get(entry.uid)
-                const lastPt = cur?.points[cur.points.length - 1]
+              let next = prev
+              for (const p of docs) {
+                if (p.uid === author) continue
+                const prevAt = lastPresenceAtByUidRef.current.get(p.uid) ?? 0
                 if (
-                  lastPt &&
-                  lastPt.x === entry.x &&
-                  lastPt.y === entry.y &&
-                  entry.at <= lastFsLaserAtRef.current
+                  !p.active ||
+                  p.laserX === null ||
+                  p.laserY === null ||
+                  nowTs - p.at > 2500
                 ) {
                   continue
                 }
-                lastFsLaserAtRef.current = Math.max(
-                  lastFsLaserAtRef.current,
-                  entry.at,
-                )
+                if (p.at <= prevAt) continue
+                lastPresenceAtByUidRef.current.set(p.uid, p.at)
+                changed = true
+                const others = next.filter((x) => x.id !== p.uid)
+                const cur = next.find((x) => x.id === p.uid)
                 const pts = [
                   ...(cur?.points.filter((pt) => nowTs - pt.at < 1500) ?? []),
-                  { x: entry.x, y: entry.y, at: nowTs },
+                  { x: p.laserX, y: p.laserY, at: nowTs },
                 ]
-                byId.set(entry.uid, {
-                  id: entry.uid,
-                  name: entry.name,
-                  points: pts,
-                })
-                changed = true
+                next = [...others, { id: p.uid, name: p.name, points: pts }]
               }
-              return changed ? Array.from(byId.values()) : prev
+              return changed ? next : prev
             })
+            if (changed) triggerInstantRepaint()
           })
         : () => {}
     return () => {
@@ -652,7 +671,7 @@ export function Whiteboard({
     lastCamBroadcastRef.current = now
     const cx = (rect.width / 2 - camera.panX) / camera.zoom
     const cy = (rect.height / 2 - camera.panY) / camera.zoom
-    onCameraBroadcast?.(cx, cy, camera.zoom, false)
+    onCameraBroadcast?.(cx, cy, camera.zoom, false, camera.panX, camera.panY)
     if (syncScope?.kind === 'board') {
       void updateWhiteboardMeta(syncScope.boardId, {
         presenterCamera: {
@@ -675,7 +694,7 @@ export function Whiteboard({
     const cx = (rect.width / 2 - cam.panX) / cam.zoom
     const cy = (rect.height / 2 - cam.panY) / cam.zoom
     const now = Date.now()
-    onCameraBroadcast?.(cx, cy, cam.zoom, true)
+    onCameraBroadcast?.(cx, cy, cam.zoom, true, cam.panX, cam.panY)
     if (syncScope?.kind === 'board') {
       void updateWhiteboardMeta(syncScope.boardId, {
         presenterCamera: {
@@ -2049,14 +2068,10 @@ export function Whiteboard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canDraw, onOp, pushHistory, syncKey])
 
-  // ---- Rich Inline Text Live Streaming & Commit ----------------------------
-  const liveTextStreamIdRef = useRef<string | null>(null)
-  const lastTextStreamRef = useRef(0)
-
-  const buildTextElementFromDraft = useCallback(
+  // ---- Rich Inline Text Live Stream & Commit -------------------------------
+  const buildElementFromTextDraft = useCallback(
     (
       draft: RichTextDraft,
-      id: string,
       existing?: BoardElement,
     ): BoardElement => {
       const trimmed = draft.value.trimEnd()
@@ -2078,7 +2093,7 @@ export function Whiteboard({
                   36,
                   (trimmed || ' ').split('\n').length * draft.fontSize * 1.38,
                 )
-              : draft.h,
+              : existing.h,
           text: trimmed,
           fontFamily: draft.fontFamily,
           fontSize: draft.fontSize,
@@ -2091,9 +2106,16 @@ export function Whiteboard({
             existing.kind === 'text' ? draft.color : existing.strokeColor,
         }
       }
-      const prev = elementsRef.current
-      const maxZ = prev.reduce((m, e) => Math.max(m, e.zIndex), 0)
-      const deck = findEnclosingPdfDeck(draft.wx, draft.wy)
+      const meta = liveTextMetaRef.current
+      const id = draft.elementId || meta?.id || makeElementId()
+      const zIndex =
+        meta?.zIndex ??
+        elementsRef.current.reduce((m, e) => Math.max(m, e.zIndex), 0) + 1
+      const createdAt = meta?.createdAt ?? Date.now()
+      const deck =
+        meta?.deckId !== undefined
+          ? { id: meta.deckId, pdfPageIndex: meta.deckPage ?? 0 }
+          : findEnclosingPdfDeck(draft.wx, draft.wy)
       if (draft.kind === 'sticky') {
         return {
           id,
@@ -2117,9 +2139,9 @@ export function Whiteboard({
           stickyBg: draft.stickyBg || stickyColor,
           pdfDeckId: deck?.id,
           pdfDeckPage: deck ? (deck.pdfPageIndex ?? 0) : undefined,
-          zIndex: maxZ + 1,
+          zIndex,
           author,
-          createdAt: Date.now(),
+          createdAt,
         }
       }
       return {
@@ -2148,63 +2170,57 @@ export function Whiteboard({
         textBg: draft.textBg,
         pdfDeckId: deck?.id,
         pdfDeckPage: deck ? (deck.pdfPageIndex ?? 0) : undefined,
-        zIndex: maxZ + 1,
+        zIndex,
         author,
-        createdAt: Date.now(),
+        createdAt,
       }
     },
     [author, findEnclosingPdfDeck, opacity, stickyColor, strokeWidth],
   )
 
+  // Stream live typing/formatting edits to Firestore every ~70ms so remote
+  // participants see the teacher write in real time.
   const handleTextEditChange = useCallback(
     (nextDraft: RichTextDraft) => {
       setTextEdit(nextDraft)
-      if (!syncScope) return
       const now = Date.now()
-      if (now - lastTextStreamRef.current < 75) return
-      lastTextStreamRef.current = now
-
-      const targetId =
-        nextDraft.elementId ??
-        liveTextStreamIdRef.current ??
-        (liveTextStreamIdRef.current = makeElementId())
-      activeEditingIdsRef.current.add(targetId)
-      const existing = elementsRef.current.find((e) => e.id === targetId)
-      const liveEl = buildTextElementFromDraft(nextDraft, targetId, existing)
-      if (!liveEl.text && liveEl.kind === 'text') return
+      if (now - lastTextSyncRef.current < 70) return
+      lastTextSyncRef.current = now
+      const existing = nextDraft.elementId
+        ? elementsRef.current.find((e) => e.id === nextDraft.elementId)
+        : undefined
+      if (!existing && nextDraft.kind === 'text' && !nextDraft.value.trim()) {
+        return
+      }
+      const liveEl = buildElementFromTextDraft(nextDraft, existing)
       syncUpsert(liveEl)
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [syncKey, buildTextElementFromDraft, syncUpsert],
+    [buildElementFromTextDraft, syncUpsert],
   )
 
   const cancelTextEdit = useCallback(() => {
-    const streamedId = liveTextStreamIdRef.current
-    liveTextStreamIdRef.current = null
-    if (streamedId) {
-      activeEditingIdsRef.current.delete(streamedId)
-      // Remove temporary unsaved text doc if it wasn't committed locally
-      if (!elementsRef.current.some((e) => e.id === streamedId)) {
-        syncDelete([streamedId])
+    const meta = liveTextMetaRef.current
+    liveTextMetaRef.current = null
+    if (meta?.id) {
+      activeEditingIdsRef.current.delete(meta.id)
+      if (meta.isNew) {
+        syncDelete([meta.id])
       }
     }
-    if (textEdit?.elementId) {
-      activeEditingIdsRef.current.delete(textEdit.elementId)
-    }
     setTextEdit(null)
-  }, [syncDelete, textEdit])
+  }, [syncDelete])
 
   const commitTextEdit = useCallback(
     (draft: RichTextDraft) => {
-      const streamedId = liveTextStreamIdRef.current
-      liveTextStreamIdRef.current = null
-      if (streamedId) activeEditingIdsRef.current.delete(streamedId)
+      const meta = liveTextMetaRef.current
+      liveTextMetaRef.current = null
       if (draft.elementId) activeEditingIdsRef.current.delete(draft.elementId)
+      if (meta?.id) activeEditingIdsRef.current.delete(meta.id)
       setTextEdit(null)
       const trimmed = draft.value.trimEnd()
       const prev = elementsRef.current
 
-      if (draft.elementId) {
+      if (draft.elementId && !meta?.isNew) {
         const existing = prev.find((e) => e.id === draft.elementId)
         if (!existing) return
         if (!trimmed && existing.kind === 'text') {
@@ -2215,11 +2231,7 @@ export function Whiteboard({
           syncDelete([draft.elementId])
           return
         }
-        const updated = buildTextElementFromDraft(
-          draft,
-          draft.elementId,
-          existing,
-        )
+        const updated = buildElementFromTextDraft(draft, existing)
         pushHistory(prev)
         const next = prev.map((e) => (e.id === draft.elementId ? updated : e))
         elementsRef.current = next
@@ -2229,19 +2241,19 @@ export function Whiteboard({
       }
 
       if (!trimmed && draft.kind === 'text') {
-        if (streamedId) syncDelete([streamedId])
+        const dropId = draft.elementId || meta?.id
+        if (dropId) syncDelete([dropId])
         return
       }
-      const id = streamedId ?? makeElementId()
-      const created = buildTextElementFromDraft(draft, id)
+      const created = buildElementFromTextDraft(draft)
       pushHistory(prev)
-      const next = [...prev.filter((e) => e.id !== id), created]
+      const next = [...prev.filter((e) => e.id !== created.id), created]
       elementsRef.current = next
       setElements(next)
       setSelectedIds([created.id])
       syncUpsert(created)
     },
-    [buildTextElementFromDraft, pushHistory, syncDelete, syncUpsert],
+    [buildElementFromTextDraft, pushHistory, syncDelete, syncUpsert],
   )
 
   // ---- Pointer Events ------------------------------------------------------
@@ -2341,6 +2353,7 @@ export function Whiteboard({
     if (!canDraw || e.button !== 0) return
 
     if (tool === 'laser') {
+      const now = Date.now()
       interactionRef.current = {
         mode: 'laser',
         pointerId: e.pointerId,
@@ -2350,15 +2363,16 @@ export function Whiteboard({
         startWy: wy,
         startCamera: { ...cameraRef.current },
       }
-      localLaserRef.current.push({ x: wx, y: wy, at: Date.now() })
+      localLaserRef.current.push({ x: wx, y: wy, at: now })
+      lastFsLaserEmitRef.current = now
       onLaser?.(wx, wy)
       if (syncScope?.kind === 'board') {
         void updateWhiteboardPresence(syncScope.boardId, author, {
           name: authorName || 'Presenter',
-          x: wx,
-          y: wy,
-          at: Date.now(),
+          laserX: wx,
+          laserY: wy,
           active: true,
+          at: now,
         })
       }
       setRenderTick((t) => t + 1)
@@ -2367,8 +2381,24 @@ export function Whiteboard({
 
     if (tool === 'text') {
       e.preventDefault()
+      const newId = makeElementId()
+      const maxZ = elementsRef.current.reduce(
+        (m, el) => Math.max(m, el.zIndex),
+        0,
+      )
+      const deck = findEnclosingPdfDeck(wx, wy)
+      liveTextMetaRef.current = {
+        id: newId,
+        isNew: true,
+        zIndex: maxZ + 1,
+        createdAt: Date.now(),
+        deckId: deck?.id,
+        deckPage: deck ? (deck.pdfPageIndex ?? 0) : undefined,
+      }
+      activeEditingIdsRef.current.add(newId)
+      lastTextSyncRef.current = 0
       setTextEdit({
-        elementId: null,
+        elementId: newId,
         kind: 'text',
         wx,
         wy,
@@ -2389,8 +2419,24 @@ export function Whiteboard({
     }
 
     if (tool === 'sticky') {
-      setTextEdit({
-        elementId: null,
+      const newId = makeElementId()
+      const maxZ = elementsRef.current.reduce(
+        (m, el) => Math.max(m, el.zIndex),
+        0,
+      )
+      const deck = findEnclosingPdfDeck(wx - 95, wy - 75)
+      liveTextMetaRef.current = {
+        id: newId,
+        isNew: true,
+        zIndex: maxZ + 1,
+        createdAt: Date.now(),
+        deckId: deck?.id,
+        deckPage: deck ? (deck.pdfPageIndex ?? 0) : undefined,
+      }
+      activeEditingIdsRef.current.add(newId)
+      lastTextSyncRef.current = 0
+      const initialDraft: RichTextDraft = {
+        elementId: newId,
         kind: 'sticky',
         wx: wx - 95,
         wy: wy - 75,
@@ -2407,7 +2453,9 @@ export function Whiteboard({
         color: '#1f2924',
         textBg: 'transparent',
         textAlign: 'left',
-      })
+      }
+      setTextEdit(initialDraft)
+      syncUpsert(buildElementFromTextDraft(initialDraft))
       return
     }
 
@@ -2579,6 +2627,7 @@ export function Whiteboard({
       createdAt: Date.now(),
     }
     draftRef.current = draft
+    lastStreamSyncRef.current = 0
     lastDrawSampleRef.current = { x: startX, y: startY, t: Date.now() }
     interactionRef.current = {
       mode: 'draw',
@@ -2655,15 +2704,15 @@ export function Whiteboard({
       }
       if (
         syncScope?.kind === 'board' &&
-        now - lastFsLaserEmitRef.current > 60
+        now - lastFsLaserEmitRef.current >= 60
       ) {
         lastFsLaserEmitRef.current = now
         void updateWhiteboardPresence(syncScope.boardId, author, {
           name: authorName || 'Presenter',
-          x: wx,
-          y: wy,
-          at: now,
+          laserX: wx,
+          laserY: wy,
           active: true,
+          at: now,
         })
       }
       setRenderTick((t) => t + 1)
@@ -2725,7 +2774,7 @@ export function Whiteboard({
       elementsRef.current = next
       setElements(next)
       const now = Date.now()
-      if (movedEls.length > 0 && now - lastStreamSyncRef.current > 65) {
+      if (movedEls.length > 0 && now - lastStreamSyncRef.current >= 65) {
         lastStreamSyncRef.current = now
         syncBatch([...movedEls, ...updatedConnectors])
       }
@@ -2770,7 +2819,7 @@ export function Whiteboard({
       elementsRef.current = next
       setElements(next)
       const now = Date.now()
-      if (now - lastStreamSyncRef.current > 65) {
+      if (now - lastStreamSyncRef.current >= 65) {
         lastStreamSyncRef.current = now
         syncBatch([resized, ...updatedConnectors])
       }
@@ -2797,7 +2846,7 @@ export function Whiteboard({
       elementsRef.current = next
       setElements(next)
       const now = Date.now()
-      if (now - lastStreamSyncRef.current > 65) {
+      if (now - lastStreamSyncRef.current >= 65) {
         lastStreamSyncRef.current = now
         syncUpsert(rotated)
       }
@@ -2849,7 +2898,7 @@ export function Whiteboard({
       }
       paintCanvas()
       const now = Date.now()
-      if (now - lastStreamSyncRef.current > 65) {
+      if (now - lastStreamSyncRef.current >= 65) {
         lastStreamSyncRef.current = now
         syncUpsert({
           ...d,
@@ -2873,13 +2922,12 @@ export function Whiteboard({
 
     if (inter.mode === 'laser') {
       if (syncScope?.kind === 'board') {
-        const last = localLaserRef.current[localLaserRef.current.length - 1]
         void updateWhiteboardPresence(syncScope.boardId, author, {
           name: authorName || 'Presenter',
-          x: last?.x ?? inter.startWx,
-          y: last?.y ?? inter.startWy,
-          at: Date.now(),
+          laserX: null,
+          laserY: null,
           active: false,
+          at: Date.now(),
         })
       }
       return
@@ -3002,6 +3050,16 @@ export function Whiteboard({
     ) {
       const b = getElementBounds(hit)
       const dec = hit.textDecoration ?? 'none'
+      liveTextMetaRef.current = {
+        id: hit.id,
+        isNew: false,
+        zIndex: hit.zIndex,
+        createdAt: hit.createdAt,
+        deckId: hit.pdfDeckId,
+        deckPage: hit.pdfDeckPage,
+      }
+      activeEditingIdsRef.current.add(hit.id)
+      lastTextSyncRef.current = 0
       setTextEdit({
         elementId: hit.id,
         kind:

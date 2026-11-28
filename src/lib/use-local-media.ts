@@ -17,6 +17,42 @@ export interface LocalMediaOptions {
 }
 
 const emptyDevices: DeviceLists = { cameras: [], microphones: [], speakers: [] }
+const MEDIA_TIMEOUT_MS = 4000
+
+function getUserMediaWithTimeout(
+  constraints: MediaStreamConstraints,
+  timeoutMs = MEDIA_TIMEOUT_MS,
+): Promise<MediaStream> {
+  return new Promise<MediaStream>((resolve, reject) => {
+    let settled = false
+    const timer = window.setTimeout(() => {
+      if (settled) return
+      settled = true
+      const err = new Error('Camera or microphone timed out')
+      err.name = 'AbortError'
+      reject(err)
+    }, timeoutMs)
+
+    navigator.mediaDevices
+      .getUserMedia(constraints)
+      .then((stream) => {
+        window.clearTimeout(timer)
+        if (settled) {
+          // Released after timeout — stop tracks immediately so no hardware stays active.
+          for (const t of stream.getTracks()) t.stop()
+          return
+        }
+        settled = true
+        resolve(stream)
+      })
+      .catch((err) => {
+        window.clearTimeout(timer)
+        if (settled) return
+        settled = true
+        reject(err)
+      })
+  })
+}
 
 export function classifyMediaError(err: unknown): MediaErrorKind {
   const name = (err as { name?: string })?.name ?? ''
@@ -27,46 +63,11 @@ export function classifyMediaError(err: unknown): MediaErrorKind {
   return 'unknown'
 }
 
-const MEDIA_TIMEOUT_MS = 4000
-
-function getUserMediaWithTimeout(
-  constraints: MediaStreamConstraints,
-  ms = MEDIA_TIMEOUT_MS,
-): Promise<MediaStream> {
-  return new Promise<MediaStream>((resolve, reject) => {
-    let settled = false
-    const timer = window.setTimeout(() => {
-      if (settled) return
-      settled = true
-      const err = new Error('Camera or microphone timed out')
-      err.name = 'AbortError'
-      reject(err)
-    }, ms)
-    navigator.mediaDevices
-      .getUserMedia(constraints)
-      .then((stream) => {
-        if (settled) {
-          // Stop late-arriving hardware tracks if we already timed out.
-          for (const t of stream.getTracks()) t.stop()
-          return
-        }
-        settled = true
-        window.clearTimeout(timer)
-        resolve(stream)
-      })
-      .catch((err) => {
-        if (settled) return
-        settled = true
-        window.clearTimeout(timer)
-        reject(err)
-      })
-  })
-}
-
 /**
  * Owns the local camera and microphone for a screen. Camera off releases the
  * video track so the hardware light turns off; mic off disables the track so
- * unmuting is instant. All tracks stop on unmount.
+ * unmuting is instant. All tracks stop on unmount. Hardware acquisition never
+ * hangs longer than 4 seconds.
  */
 export function useLocalMedia(options: LocalMediaOptions) {
   const { micOn, camOn, cameraId, micId } = options
@@ -74,7 +75,7 @@ export function useLocalMedia(options: LocalMediaOptions) {
   const [stream, setStream] = useState<MediaStream | null>(null)
   const [devices, setDevices] = useState<DeviceLists>(emptyDevices)
   const [error, setError] = useState<MediaErrorKind | null>(null)
-  const [pending, setPending] = useState(true)
+  const [pending, setPending] = useState(camOn)
   const [supported, setSupported] = useState(true)
   const [hasVideo, setHasVideo] = useState(false)
 
@@ -138,18 +139,20 @@ export function useLocalMedia(options: LocalMediaOptions) {
       try {
         const fresh = await getUserMediaWithTimeout(
           kind === 'video' ? { video: constraint } : { audio: constraint },
+          MEDIA_TIMEOUT_MS,
         )
         stopKind(kind)
         const target = ensureStream()
         for (const track of fresh.getTracks()) target.addTrack(track)
         setError(null)
-        await refreshDevices()
+        void refreshDevices()
       } catch (err) {
         if (deviceId) {
           // Fall back to any device of that kind when the chosen one is gone.
           try {
             const fallback = await getUserMediaWithTimeout(
               kind === 'video' ? { video: true } : { audio: true },
+              2500,
             )
             stopKind(kind)
             const target = ensureStream()
@@ -171,8 +174,8 @@ export function useLocalMedia(options: LocalMediaOptions) {
   useEffect(() => {
     let cancelled = false
     const run = async () => {
-      setPending(true)
       if (camOn) {
+        setPending(true)
         await acquire('video', cameraId)
       } else {
         stopKind('video')

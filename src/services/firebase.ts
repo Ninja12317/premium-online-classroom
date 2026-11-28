@@ -10,9 +10,18 @@ import {
 
 function readEnv(key: keyof ImportMetaEnv): string | undefined {
   const value = import.meta.env?.[key]
-  return typeof value === 'string' && value.trim().length > 0
-    ? value.trim()
-    : undefined
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  if (
+    trimmed.length === 0 ||
+    /^your_/i.test(trimmed) ||
+    /^replace_/i.test(trimmed) ||
+    /^<.*>$/.test(trimmed) ||
+    trimmed.toLowerCase().includes('placeholder')
+  ) {
+    return undefined
+  }
+  return trimmed
 }
 
 const firebaseConfig = {
@@ -72,10 +81,10 @@ export function resetAuthInit() {
 }
 
 /**
- * Waits for Firebase Auth to restore any persisted session via
- * `onAuthStateChanged(auth, ...)` and, if `user` is null, awaits
- * `signInAnonymously(auth)`. All Firestore operations gate on this helper
- * so ZERO requests ever fire with `request.auth == null`.
+ * Single cached auth gate: resolves ONLY after `auth.currentUser` is confirmed
+ * non-null (automatically calling `signInAnonymously(auth)` if no user is
+ * signed in). Every Firestore read, write, and onSnapshot listener awaits this
+ * so ZERO requests ever fire while `auth.currentUser === null`.
  */
 export function ensureAuth(): Promise<User> {
   if (typeof window === 'undefined') {
@@ -87,40 +96,46 @@ export function ensureAuth(): Promise<User> {
     return Promise.resolve(auth.currentUser)
   }
   if (!authInitPromise) {
-    authInitPromise = new Promise<User>((resolve, reject) => {
-      let settled = false
-      const unsub = onAuthStateChanged(
-        auth,
-        (user) => {
-          if (settled) return
-          settled = true
-          unsub()
-          if (user) {
-            resolve(user)
-            return
-          }
-          signInAnonymously(auth)
-            .then((cred) => {
-              resolve(cred.user)
-            })
-            .catch((err) => {
-              authInitPromise = null
-              reject(err)
-            })
-        },
-        (err) => {
-          if (settled) return
-          settled = true
-          unsub()
-          authInitPromise = null
-          reject(err)
-        },
-      )
-    }).finally(() => {
-      // If sign-out happened after resolving, allow next call to re-authenticate cleanly.
+    authInitPromise = (async (): Promise<User> => {
+      try {
+        if (typeof auth.authStateReady === 'function') {
+          await auth.authStateReady()
+        } else {
+          await new Promise<void>((resolve, reject) => {
+            let settled = false
+            const unsub = onAuthStateChanged(
+              auth,
+              () => {
+                if (settled) return
+                settled = true
+                unsub()
+                resolve()
+              },
+              (err) => {
+                if (settled) return
+                settled = true
+                unsub()
+                reject(err)
+              },
+            )
+          })
+        }
+        if (auth.currentUser) {
+          return auth.currentUser
+        }
+        const cred = await signInAnonymously(auth)
+        // Wait until auth.currentUser is visibly populated if needed
+        return auth.currentUser ?? cred.user
+      } catch (err) {
+        authInitPromise = null
+        throw err
+      }
+    })().then((user) => {
+      // Clear cached promise once settled so a future signOut re-triggers auth
       if (!auth.currentUser) {
         authInitPromise = null
       }
+      return user
     })
   }
   return authInitPromise

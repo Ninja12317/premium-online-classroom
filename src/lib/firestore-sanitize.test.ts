@@ -1,73 +1,67 @@
 import { describe, expect, it } from 'vitest'
-import { arrayUnion } from 'firebase/firestore'
-import { stripUndefined } from './firestore-sanitize'
+import { stripUndefinedDeep } from './firestore-sanitize'
 
-describe('stripUndefined', () => {
-  it('removes top-level and nested undefined keys while preserving null, zero, false, and empty strings', () => {
+class FakeFieldValue {
+  readonly kind = 'arrayUnion'
+  constructor(public readonly values: string[]) {}
+}
+
+describe('stripUndefinedDeep', () => {
+  it('removes top-level and nested undefined keys while preserving null and primitives', () => {
     const input = {
       id: 'el-1',
       kind: 'pen',
-      x: 0,
-      y: 0,
-      locked: false,
-      text: '',
-      nullable: null,
-      points: [10, 20, 30, 40],
+      points: [1, 2, 3, 4],
       pointWidths: undefined,
       penPreset: undefined,
-      startAnchor: {
-        elementId: 'shape-1',
-        side: 'top',
-        extra: undefined,
+      startAnchor: undefined,
+      nested: {
+        a: 1,
+        b: undefined,
+        c: null,
+        d: '',
+        e: false,
       },
-      pdfDeckId: undefined,
-      pdfDeckPage: undefined,
     }
-
-    const result = stripUndefined(input) as Record<string, unknown>
+    const result = stripUndefinedDeep(input)
     expect(result).toEqual({
       id: 'el-1',
       kind: 'pen',
-      x: 0,
-      y: 0,
-      locked: false,
-      text: '',
-      nullable: null,
-      points: [10, 20, 30, 40],
-      startAnchor: {
-        elementId: 'shape-1',
-        side: 'top',
+      points: [1, 2, 3, 4],
+      nested: {
+        a: 1,
+        c: null,
+        d: '',
+        e: false,
       },
     })
     expect('pointWidths' in result).toBe(false)
-    expect('penPreset' in result).toBe(false)
-    expect('pdfDeckId' in result).toBe(false)
-    expect('pdfDeckPage' in result).toBe(false)
+    expect('b' in result.nested).toBe(false)
   })
 
-  it('strips undefined values from arrays and objects inside arrays', () => {
+  it('filters undefined array items and cleans objects inside arrays', () => {
     const input = {
       items: [
-        { id: 'a', note: undefined },
+        { id: '1', label: undefined },
         undefined,
-        { id: 'b', note: 'kept' },
+        { id: '2', label: 'ok' },
       ],
     }
-    expect(stripUndefined(input)).toEqual({
-      items: [{ id: 'a' }, { id: 'b', note: 'kept' }],
+    expect(stripUndefinedDeep(input)).toEqual({
+      items: [{ id: '1' }, { id: '2', label: 'ok' }],
     })
   })
 
-  it('preserves Firestore FieldValue sentinels like arrayUnion and Date instances', () => {
-    const union = arrayUnion('uid-123')
-    const now = new Date('2026-01-01T00:00:00Z')
+  it('preserves non-plain class instances like Firestore FieldValue sentinels and Date', () => {
+    const sentinel = new FakeFieldValue(['uid-1'])
+    const now = new Date('2026-11-27T00:00:00.000Z')
     const input = {
-      memberIds: union,
+      memberIds: sentinel,
       createdAt: now,
       ignored: undefined,
     }
-    const result = stripUndefined(input)
-    expect(result.memberIds).toBe(union)
+    const result = stripUndefinedDeep(input)
+    expect(result.memberIds).toBe(sentinel)
     expect(result.createdAt).toBe(now)
     expect('ignored' in result).toBe(false)
   })

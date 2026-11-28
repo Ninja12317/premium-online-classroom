@@ -24,8 +24,8 @@ import {
   isPermissionDeniedError,
   reportFirestorePermissionError,
 } from '@/services/firebase'
+import { stripUndefinedDeep } from '@/lib/firestore-sanitize'
 import { randomToken, sha256Hex } from '@/lib/hash'
-import { stripUndefined } from '@/lib/firestore-sanitize'
 import { getIceServers } from '@/lib/ice-client'
 import {
   getActiveStorageUid,
@@ -59,7 +59,7 @@ import {
   type StandaloneBoardMeta,
   type SyncResult,
   type WaitingParticipant,
-  type WhiteboardPresenceEntry,
+  type WhiteboardPresenceDoc,
 } from '@/lib/meeting-types'
 import type { ChatMessage } from '@/components/meeting/types'
 import {
@@ -110,7 +110,7 @@ interface MeetingDoc {
   whiteboardOpen: boolean
   activeWhiteboardId: string | null
   activeWhiteboardTitle: string | null
-  allowParticipantAnnotate?: boolean
+  allowParticipantAnnotate: boolean
   muteAllAt: number | null
   lastReaction: MeetingReactionEvent | null
   screenAnnotations: ScreenAnnStroke[]
@@ -339,8 +339,7 @@ export function summaryOf(row: MeetingDoc): MeetingSummary {
     whiteboardOpen: row.whiteboardOpen,
     activeWhiteboardId: row.activeWhiteboardId,
     activeWhiteboardTitle: row.activeWhiteboardTitle,
-    allowParticipantAnnotate:
-      row.allowParticipantAnnotate ?? row.allowStudentDraw,
+    allowParticipantAnnotate: row.allowParticipantAnnotate,
     muteAllAt: row.muteAllAt,
     lastReaction: row.lastReaction,
     screenAnnotations: row.screenAnnotations,
@@ -461,6 +460,7 @@ export async function createMeetingRecord(input: CreateMeetingInput) {
     locked: false,
     allowStudentScreenShare: false,
     allowStudentDraw: false,
+    allowParticipantAnnotate: false,
     allowChat: true,
     allowPrivateChat: true,
     status: input.scheduledAt ? 'scheduled' : 'live',
@@ -476,7 +476,6 @@ export async function createMeetingRecord(input: CreateMeetingInput) {
     whiteboardOpen: false,
     activeWhiteboardId: null,
     activeWhiteboardTitle: null,
-    allowParticipantAnnotate: false,
     muteAllAt: null,
     lastReaction: null,
     screenAnnotations: [],
@@ -486,7 +485,13 @@ export async function createMeetingRecord(input: CreateMeetingInput) {
   saveLocalMeeting(record)
   if (await requireAuth()) {
     try {
-      await setDoc(doc(db, 'meetings', meetingId), stripUndefined(record))
+      await setDoc(
+        doc(db, 'meetings', meetingId),
+        stripUndefinedDeep({
+          ...record,
+          memberIds: arrayUnion(uid),
+        }),
+      )
     } catch (err) {
       handleFsError(`meetings/${meetingId}`, err)
     }
@@ -523,9 +528,7 @@ export async function updateMeetingDetails(
   saveLocalMeeting(next)
   if (await requireAuth()) {
     try {
-      await setDoc(doc(db, 'meetings', meetingId), stripUndefined(next), {
-        merge: true,
-      })
+      await setDoc(doc(db, 'meetings', meetingId), next, { merge: true })
     } catch (err) {
       handleFsError(`meetings/${meetingId}`, err)
     }
@@ -762,32 +765,12 @@ function joinedPayload(
   }
 }
 
-async function cleanupStaleSignals(meetingId: string, identity: string) {
-  if (!(await requireAuth())) return
-  try {
-    const q = query(
-      collection(db, 'meetings', meetingId, 'signals'),
-      where('toIdentity', '==', identity),
-    )
-    const snap = await getDocs(q)
-    if (snap.empty) return
-    const batch = writeBatch(db)
-    for (const d of snap.docs) {
-      batch.delete(d.ref)
-    }
-    await batch.commit()
-  } catch {
-    // Best-effort stale signal cleanup
-  }
-}
-
 export async function joinMeetingRecord(
   input: JoinMeetingInput,
 ): Promise<JoinResult> {
+  const uid = await ensureClientUid()
   const meetingId = normalizeMeetingId(input.meetingId)
   if (!meetingId) return { status: 'not-found' }
-
-  const uid = await ensureClientUid()
   const meeting = await fetchMeetingDoc(meetingId)
   if (!meeting) return { status: 'not-found' }
   const summary = summaryOf(meeting)
@@ -804,13 +787,20 @@ export async function joinMeetingRecord(
     }
     if (!(await requireAuth())) return
     try {
-      await setDoc(
-        doc(db, 'meetings', meetingId),
-        { memberIds: arrayUnion(uid), updatedAt: now },
-        { merge: true },
-      )
-    } catch (err) {
-      handleFsError(`meetings/${meetingId}`, err)
+      await updateDoc(doc(db, 'meetings', meetingId), {
+        memberIds: arrayUnion(uid),
+        updatedAt: now,
+      })
+    } catch {
+      try {
+        await setDoc(
+          doc(db, 'meetings', meetingId),
+          { memberIds: arrayUnion(uid), updatedAt: now },
+          { merge: true },
+        )
+      } catch (err) {
+        handleFsError(`meetings/${meetingId}`, err)
+      }
     }
     if (meeting.activeWhiteboardId) {
       void joinWhiteboardMembership(meeting.activeWhiteboardId)
@@ -856,7 +846,7 @@ export async function joinMeetingRecord(
       await Promise.allSettled([
         setDoc(
           doc(db, 'meetings', meetingId, 'participants', identity),
-          stripUndefined(participant),
+          stripUndefinedDeep(participant),
           { merge: true },
         ).catch((err) =>
           handleFsError(`meetings/${meetingId}/participants/${identity}`, err),
@@ -871,11 +861,10 @@ export async function joinMeetingRecord(
           },
           { merge: true },
         ).catch((err) => handleFsError(`meetings/${meetingId}`, err)),
-        cleanupStaleSignals(meetingId, identity),
-        meeting.activeWhiteboardId
-          ? joinWhiteboardMembership(meeting.activeWhiteboardId)
-          : Promise.resolve(),
       ])
+    }
+    if (meeting.activeWhiteboardId) {
+      void joinWhiteboardMembership(meeting.activeWhiteboardId)
     }
     return joinedPayload(meeting, participant, hostSecret)
   }
@@ -890,30 +879,21 @@ export async function joinMeetingRecord(
         existing.lastSeen = Date.now()
         existing.updatedAt = Date.now()
         getLocalParticipantsMap(meetingId).set(existing.identity, existing)
-        await Promise.allSettled([
-          requireAuth().then((ok) =>
-            ok
-              ? setDoc(
-                  doc(
-                    db,
-                    'meetings',
-                    meetingId,
-                    'participants',
-                    existing.identity,
-                  ),
-                  stripUndefined(existing),
-                  { merge: true },
-                ).catch((err) =>
-                  handleFsError(
-                    `meetings/${meetingId}/participants/${existing.identity}`,
-                    err,
-                  ),
-                )
-              : undefined,
-          ),
-          ensureMembership(),
-          cleanupStaleSignals(meetingId, existing.identity),
-        ])
+        if (await requireAuth()) {
+          await Promise.allSettled([
+            setDoc(
+              doc(db, 'meetings', meetingId, 'participants', existing.identity),
+              stripUndefinedDeep(existing),
+              { merge: true },
+            ).catch((err) =>
+              handleFsError(
+                `meetings/${meetingId}/participants/${existing.identity}`,
+                err,
+              ),
+            ),
+            ensureMembership(),
+          ])
+        }
         return joinedPayload(meeting, existing, input.participantKey)
       }
       if (existing.status === 'waiting') {
@@ -961,19 +941,18 @@ export async function joinMeetingRecord(
     updatedAt: now,
   }
   getLocalParticipantsMap(meetingId).set(identity, participant)
-  await Promise.allSettled([
-    requireAuth().then((ok) =>
-      ok
-        ? setDoc(
-            doc(db, 'meetings', meetingId, 'participants', identity),
-            stripUndefined(participant),
-          ).catch((err) =>
-            handleFsError(`meetings/${meetingId}/participants/${identity}`, err),
-          )
-        : undefined,
-    ),
-    ensureMembership(),
-  ])
+  if (await requireAuth()) {
+    await Promise.allSettled([
+      setDoc(
+        doc(db, 'meetings', meetingId, 'participants', identity),
+        stripUndefinedDeep(participant),
+      ).catch((err) =>
+        handleFsError(`meetings/${meetingId}/participants/${identity}`, err),
+      ),
+      // Append uid to meeting.memberIds in parallel so room & chat appear immediately
+      ensureMembership(),
+    ])
+  }
 
   if (status === 'waiting') {
     return {
@@ -1073,31 +1052,35 @@ export async function updateMeetingSettingsRecord(
   patch: Partial<MeetingSettings>,
 ): Promise<MeetingSettings> {
   const { meeting } = await authorizeModerator(meetingId, actorKey)
+  const allowAnnotate =
+    patch.allowStudentDraw !== undefined
+      ? patch.allowStudentDraw
+      : meeting.allowStudentDraw
   const next: MeetingDoc = {
     ...meeting,
     ...patch,
+    allowParticipantAnnotate: allowAnnotate,
     isLocked: patch.locked !== undefined ? patch.locked : meeting.locked,
     waitingRoomEnabled:
       patch.waitingRoom !== undefined ? patch.waitingRoom : meeting.waitingRoom,
-    allowParticipantAnnotate:
-      patch.allowStudentDraw !== undefined
-        ? patch.allowStudentDraw
-        : meeting.allowParticipantAnnotate ?? meeting.allowStudentDraw,
   }
   saveLocalMeeting(next)
-  try {
-    await setDoc(
-      doc(db, 'meetings', meetingId),
-      stripUndefined({
-        ...patch,
-        isLocked: next.locked,
-        waitingRoomEnabled: next.waitingRoom,
-        allowParticipantAnnotate: next.allowStudentDraw,
-      }),
-      { merge: true },
-    )
-  } catch (err) {
-    handleFsError(`meetings/${meetingId}`, err)
+  if (await requireAuth()) {
+    try {
+      await setDoc(
+        doc(db, 'meetings', meetingId),
+        stripUndefinedDeep({
+          ...patch,
+          allowParticipantAnnotate: allowAnnotate,
+          isLocked: next.locked,
+          waitingRoomEnabled: next.waitingRoom,
+          updatedAt: Date.now(),
+        }),
+        { merge: true },
+      )
+    } catch (err) {
+      handleFsError(`meetings/${meetingId}`, err)
+    }
   }
   return settingsOf(next)
 }
@@ -1192,13 +1175,15 @@ export async function updateMeetingMeta(
 ) {
   const existing = getLocalMeeting(meetingId)
   if (existing) {
-    saveLocalMeeting({ ...existing, ...patch })
+    saveLocalMeeting({ ...existing, ...patch, updatedAt: Date.now() })
   }
   if (!(await requireAuth())) return
   try {
-    await setDoc(doc(db, 'meetings', meetingId), stripUndefined(patch), {
-      merge: true,
-    })
+    await setDoc(
+      doc(db, 'meetings', meetingId),
+      stripUndefinedDeep({ ...patch, updatedAt: Date.now() }),
+      { merge: true },
+    )
   } catch (err) {
     handleFsError(`meetings/${meetingId}`, err)
   }
@@ -1222,7 +1207,11 @@ export async function updateParticipantState(
   try {
     await setDoc(
       doc(db, 'meetings', meetingId, 'participants', identity),
-      stripUndefined({ ...patch, lastSeen: Date.now(), updatedAt: Date.now() }),
+      stripUndefinedDeep({
+        ...patch,
+        lastSeen: Date.now(),
+        updatedAt: Date.now(),
+      }),
       { merge: true },
     )
   } catch (err) {
@@ -1292,58 +1281,6 @@ export function subscribeParticipantDoc(
 const PRESENCE_WINDOW_MS = 20_000
 const SIGNAL_TTL_MS = 120_000
 
-/**
- * Real-time signal push listener: nudges MeshRoom immediately (<150ms) whenever
- * an offer, answer, or ICE candidate arrives for `identity`.
- */
-export function subscribeMeetingSignals(
-  meetingId: string,
-  identity: string,
-  onSignal: () => void,
-): Unsubscribe {
-  return subscribeAfterAuth(`meetings/${meetingId}/signals`, () => {
-    const q = query(
-      collection(db, 'meetings', meetingId, 'signals'),
-      where('toIdentity', '==', identity),
-    )
-    return onSnapshot(
-      q,
-      (snap) => {
-        if (!snap.empty) onSignal()
-      },
-      (err) => {
-        handleFsError(`meetings/${meetingId}/signals`, err)
-      },
-    )
-  })
-}
-
-/**
- * Real-time participant presence listener: nudges MeshRoom immediately whenever
- * another participant joins, leaves, or refreshes their WebRTC session.
- */
-export function subscribeMeetingParticipants(
-  meetingId: string,
-  onChange: () => void,
-): Unsubscribe {
-  return subscribeAfterAuth(`meetings/${meetingId}/participants`, () => {
-    let initial = true
-    return onSnapshot(
-      collection(db, 'meetings', meetingId, 'participants'),
-      () => {
-        if (initial) {
-          initial = false
-          return
-        }
-        onChange()
-      },
-      (err) => {
-        handleFsError(`meetings/${meetingId}/participants`, err)
-      },
-    )
-  })
-}
-
 export async function syncRoomFirestore(input: {
   meetingId: string
   identity: string
@@ -1357,20 +1294,21 @@ export async function syncRoomFirestore(input: {
 
   await requireAuth()
 
-  // Run meeting + self participant lookup in parallel
-  const [meeting, fetchedMe] = await Promise.all([
-    fetchMeetingDoc(meetingId),
-    fetchParticipantDoc(meetingId, identity),
-  ])
+  const meeting = await fetchMeetingDoc(meetingId)
   if (!meeting) {
+    // Never falsely kick if we are locally cached — return ok with local state if known
     return { status: 'not-found' }
   }
   if (meeting.endedAt || meeting.status === 'ended') {
     return { status: 'ended' }
   }
 
-  let me = fetchedMe
-  if (!me || me.keyHash !== keyHash) {
+  let me = await fetchParticipantDoc(meetingId, identity)
+  if (!me) {
+    // Re-create if somehow missing on transient cache miss? Only if keyHash matches local
+    return { status: 'not-found' }
+  }
+  if (me.keyHash !== keyHash) {
     return { status: 'not-found' }
   }
   if (me.status === 'removed' || me.status === 'rejected') {
@@ -1385,35 +1323,37 @@ export async function syncRoomFirestore(input: {
   getLocalParticipantsMap(meetingId).set(identity, me)
 
   try {
-    const sigCol = collection(db, 'meetings', meetingId, 'signals')
-    const inboxQ = query(sigCol, where('toIdentity', '==', identity))
+    await setDoc(
+      doc(db, 'meetings', meetingId, 'participants', identity),
+      { sessionId, lastSeen: now, updatedAt: now, status: 'admitted' },
+      { merge: true },
+    )
 
-    // Run heartbeat write, outbox signal writes, inbox read, and participants read IN PARALLEL
-    const [, , inboxSnap, partSnap] = await Promise.all([
-      setDoc(
-        doc(db, 'meetings', meetingId, 'participants', identity),
-        { sessionId, lastSeen: now, updatedAt: now, status: 'admitted' },
-        { merge: true },
-      ),
-      outbox.length > 0
-        ? Promise.all(
-            outbox.map((s) =>
-              addDoc(sigCol, {
-                fromIdentity: identity,
-                fromSession: sessionId,
-                toIdentity: s.to,
-                toSession: s.toSession,
-                kind: s.kind,
-                payload: s.payload,
-                createdAt: now,
-              }),
-            ),
-          )
-        : Promise.resolve([]),
-      getDocs(inboxQ),
-      getDocs(collection(db, 'meetings', meetingId, 'participants')),
-    ])
+    // Write outgoing signals
+    if (outbox.length > 0) {
+      const sigCol = collection(db, 'meetings', meetingId, 'signals')
+      await Promise.all(
+        outbox.map((s) =>
+          addDoc(sigCol, {
+            fromIdentity: identity,
+            fromSession: sessionId,
+            toIdentity: s.to,
+            toSession: s.toSession,
+            kind: s.kind,
+            payload: s.payload,
+            createdAt: now,
+          }),
+        ),
+      )
+    }
 
+    // Drain inbox for this participant — single-field `where` + client-side
+    // session filtering & timestamp sorting (zero composite index required).
+    const inboxQ = query(
+      collection(db, 'meetings', meetingId, 'signals'),
+      where('toIdentity', '==', identity),
+    )
+    const inboxSnap = await getDocs(inboxQ)
     const inbox: IncomingSignal[] = []
     if (!inboxSnap.empty) {
       const batch = writeBatch(db)
@@ -1447,6 +1387,10 @@ export async function syncRoomFirestore(input: {
       if (batchHasDeletes) await batch.commit()
     }
 
+    // Fetch participants for online peers + waiting queue
+    const partSnap = await getDocs(
+      collection(db, 'meetings', meetingId, 'participants'),
+    )
     const peers: PeerInfo[] = []
     const waiting: WaitingParticipant[] = []
     for (const d of partSnap.docs) {
@@ -1528,6 +1472,207 @@ export async function leaveRoomFirestore(input: {
     )
   }
   return { ok: true }
+}
+
+/**
+ * Trickle ICE / SDP fast path: immediately writes a single WebRTC signal
+ * document to `meetings/{meetingId}/signals` without waiting for a heartbeat.
+ */
+export async function sendSignalFirestore(
+  meetingId: string,
+  fromIdentity: string,
+  fromSession: string,
+  signal: OutgoingSignal,
+) {
+  if (!(await requireAuth())) return
+  try {
+    await addDoc(
+      collection(db, 'meetings', meetingId, 'signals'),
+      stripUndefinedDeep({
+        fromIdentity,
+        fromSession,
+        toIdentity: signal.to,
+        toSession: signal.toSession,
+        kind: signal.kind,
+        payload: signal.payload,
+        createdAt: Date.now(),
+      }),
+    )
+  } catch (err) {
+    handleFsError(`meetings/${meetingId}/signals`, err)
+  }
+}
+
+/**
+ * Deletes stale signals from prior sessions on join so rejoining peers never
+ * receive outdated offers/answers/ICE candidates and connect instantaneously.
+ */
+export async function cleanupStaleSignals(
+  meetingId: string,
+  identity: string,
+  currentSessionId: string,
+) {
+  if (!(await requireAuth())) return
+  try {
+    const colRef = collection(db, 'meetings', meetingId, 'signals')
+    const [toSnap, fromSnap] = await Promise.all([
+      getDocs(query(colRef, where('toIdentity', '==', identity))),
+      getDocs(query(colRef, where('fromIdentity', '==', identity))),
+    ])
+    const refsToDelete = new Map<string, (typeof toSnap.docs)[number]['ref']>()
+    for (const d of toSnap.docs) {
+      const data = d.data()
+      if (String(data.toSession ?? '') !== currentSessionId) {
+        refsToDelete.set(d.id, d.ref)
+      }
+    }
+    for (const d of fromSnap.docs) {
+      const data = d.data()
+      if (String(data.fromSession ?? '') !== currentSessionId) {
+        refsToDelete.set(d.id, d.ref)
+      }
+    }
+    const refs = Array.from(refsToDelete.values())
+    for (let i = 0; i < refs.length; i += 450) {
+      const batch = writeBatch(db)
+      for (const ref of refs.slice(i, i + 450)) batch.delete(ref)
+      await batch.commit()
+    }
+  } catch (err) {
+    handleFsError(`meetings/${meetingId}/signals`, err)
+  }
+}
+
+/**
+ * Real-time `onSnapshot` listener for incoming WebRTC signals addressed to
+ * `identity` + `sessionId`. Delivers offers/answers/ICE in <100ms instead of
+ * waiting on a 1–4 second poll loop, and cleans up consumed docs immediately.
+ */
+export function subscribeRoomSignals(
+  meetingId: string,
+  identity: string,
+  sessionId: string,
+  onSignals: (signals: IncomingSignal[]) => void,
+): Unsubscribe {
+  const seenIds = new Set<string>()
+  return subscribeAfterAuth(`meetings/${meetingId}/signals`, () => {
+    const q = query(
+      collection(db, 'meetings', meetingId, 'signals'),
+      where('toIdentity', '==', identity),
+    )
+    return onSnapshot(
+      q,
+      (snap) => {
+        if (snap.empty) return
+        const now = Date.now()
+        const incoming: IncomingSignal[] = []
+        const toDelete: (typeof snap.docs)[number]['ref'][] = []
+        const sorted = [...snap.docs].sort(
+          (a, b) =>
+            ((a.data().createdAt as number) ?? 0) -
+            ((b.data().createdAt as number) ?? 0),
+        )
+        for (const d of sorted) {
+          if (seenIds.has(d.id)) continue
+          const data = d.data()
+          const createdAt = (data.createdAt as number) ?? 0
+          const expired = now - createdAt > SIGNAL_TTL_MS
+          if (String(data.toSession ?? '') === sessionId) {
+            seenIds.add(d.id)
+            if (!expired) {
+              incoming.push({
+                id: d.id,
+                kind: data.kind as 'offer' | 'answer' | 'ice',
+                from: String(data.fromIdentity),
+                fromSession: String(data.fromSession),
+                payload: String(data.payload),
+              })
+            }
+            toDelete.push(d.ref)
+          } else if (expired) {
+            toDelete.push(d.ref)
+          }
+        }
+        if (incoming.length > 0) {
+          onSignals(incoming)
+        }
+        if (toDelete.length > 0) {
+          const batch = writeBatch(db)
+          for (const ref of toDelete.slice(0, 450)) batch.delete(ref)
+          void batch.commit().catch(() => {})
+        }
+      },
+      (err) => {
+        handleFsError(`meetings/${meetingId}/signals`, err)
+      },
+    )
+  })
+}
+
+/**
+ * Real-time `onSnapshot` listener for `meetings/{meetingId}/participants`.
+ * Immediately notifies MeshRoom when a peer joins, reloads, leaves, or enters
+ * the waiting room so WebRTC handshakes begin within ~100ms of joining.
+ */
+export function subscribeRoomParticipants(
+  meetingId: string,
+  identity: string,
+  onUpdate: (data: {
+    peers: PeerInfo[]
+    waiting: WaitingParticipant[]
+    leftIds: string[]
+  }) => void,
+): Unsubscribe {
+  return subscribeAfterAuth(`meetings/${meetingId}/participants`, () =>
+    onSnapshot(
+      collection(db, 'meetings', meetingId, 'participants'),
+      (snap) => {
+        const now = Date.now()
+        const peers: PeerInfo[] = []
+        const waiting: WaitingParticipant[] = []
+        const leftIds: string[] = []
+        for (const d of snap.docs) {
+          const p = d.data() as ParticipantDoc
+          if (p.status === 'waiting') {
+            waiting.push({
+              identity: p.identity,
+              name: p.name,
+              requestedAt: new Date(p.createdAt || now).toISOString(),
+            })
+          } else if (
+            p.identity !== identity &&
+            (p.status === 'left' ||
+              p.status === 'removed' ||
+              p.status === 'rejected' ||
+              !p.sessionId)
+          ) {
+            leftIds.push(p.identity)
+          } else if (
+            p.status === 'admitted' &&
+            p.identity !== identity &&
+            p.sessionId &&
+            now - (p.lastSeen || 0) <= PRESENCE_WINDOW_MS
+          ) {
+            peers.push({
+              identity: p.identity,
+              session: p.sessionId,
+              name: p.name,
+              role: p.role,
+              micOn: p.micOn,
+              camOn: p.camOn,
+              handRaised: p.handRaised,
+              breakoutRoomId: p.breakoutRoomId ?? null,
+            })
+          }
+        }
+        waiting.sort((a, b) => a.requestedAt.localeCompare(b.requestedAt))
+        onUpdate({ peers, waiting, leftIds })
+      },
+      (err) => {
+        handleFsError(`meetings/${meetingId}/participants`, err)
+      },
+    ),
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -1770,7 +1915,7 @@ export async function upsertWhiteboardElement<T extends { id: string }>(
   element: T,
 ) {
   const now = Date.now()
-  const cleanElement = stripUndefined(element)
+  const cleanElement = stripUndefinedDeep(element)
   const cached = loadLocalWbElements<T>(scope)
   const idx = cached.findIndex((e) => e.id === cleanElement.id)
   const nextCached =
@@ -1789,7 +1934,7 @@ export async function upsertWhiteboardElement<T extends { id: string }>(
   try {
     await setDoc(
       doc(db, path[0], path[1], path[2], cleanElement.id),
-      stripUndefined({
+      stripUndefinedDeep({
         ...cleanElement,
         updatedAt: now,
       }),
@@ -1805,10 +1950,10 @@ export async function upsertWhiteboardElementsBatch<T extends { id: string }>(
 ) {
   if (elements.length === 0) return
   const now = Date.now()
-  const cleaned = elements.map((el) => stripUndefined(el))
+  const cleanElements = elements.map((el) => stripUndefinedDeep(el))
   const map = new Map<string, T>()
   for (const el of loadLocalWbElements<T>(scope)) map.set(el.id, el)
-  for (const el of cleaned) map.set(el.id, el)
+  for (const el of cleanElements) map.set(el.id, el)
   const merged = Array.from(map.values())
   saveLocalWbElements(scope, merged)
   if (scope.kind === 'board') {
@@ -1820,17 +1965,19 @@ export async function upsertWhiteboardElementsBatch<T extends { id: string }>(
   if (!(await requireAuth())) return
   const path = whiteboardCollectionPath(scope)
   try {
-    const batch = writeBatch(db)
-    for (const el of cleaned) {
-      batch.set(
-        doc(db, path[0], path[1], path[2], el.id),
-        stripUndefined({
-          ...el,
-          updatedAt: now,
-        }),
-      )
+    for (let i = 0; i < cleanElements.length; i += 450) {
+      const batch = writeBatch(db)
+      for (const el of cleanElements.slice(i, i + 450)) {
+        batch.set(
+          doc(db, path[0], path[1], path[2], el.id),
+          stripUndefinedDeep({
+            ...el,
+            updatedAt: now,
+          }),
+        )
+      }
+      await batch.commit()
     }
-    await batch.commit()
     if (scope.kind === 'board') {
       void setDoc(
         doc(db, 'whiteboards', scope.boardId),
@@ -1863,11 +2010,13 @@ export async function deleteWhiteboardElements(
   if (!(await requireAuth())) return
   const path = whiteboardCollectionPath(scope)
   try {
-    const batch = writeBatch(db)
-    for (const id of ids) {
-      batch.delete(doc(db, path[0], path[1], path[2], id))
+    for (let i = 0; i < ids.length; i += 450) {
+      const batch = writeBatch(db)
+      for (const id of ids.slice(i, i + 450)) {
+        batch.delete(doc(db, path[0], path[1], path[2], id))
+      }
+      await batch.commit()
     }
-    await batch.commit()
     if (scope.kind === 'board') {
       void setDoc(
         doc(db, 'whiteboards', scope.boardId),
@@ -1891,11 +2040,13 @@ export async function clearWhiteboardCollection(scope: WhiteboardScope) {
   try {
     const snap = await getDocs(collection(db, path[0], path[1], path[2]))
     if (!snap.empty) {
-      const batch = writeBatch(db)
-      for (const d of snap.docs) {
-        batch.delete(d.ref)
+      for (let i = 0; i < snap.docs.length; i += 450) {
+        const batch = writeBatch(db)
+        for (const d of snap.docs.slice(i, i + 450)) {
+          batch.delete(d.ref)
+        }
+        await batch.commit()
       }
-      await batch.commit()
     }
     if (scope.kind === 'board') {
       void setDoc(
@@ -1943,6 +2094,115 @@ export function subscribeWhiteboardElements<T extends { id: string }>(
 }
 
 // ---------------------------------------------------------------------------
+// Live Whiteboard Laser Presence (`whiteboards/{boardId}/presence/{uid}`)
+// ---------------------------------------------------------------------------
+
+export async function updateWhiteboardPresence(
+  boardId: string,
+  uid: string,
+  data: Omit<WhiteboardPresenceDoc, 'uid'>,
+) {
+  if (!boardId || !uid) return
+  if (!(await requireAuth())) return
+  try {
+    await setDoc(
+      doc(db, 'whiteboards', boardId, 'presence', uid),
+      stripUndefinedDeep({ uid, ...data }),
+      { merge: true },
+    )
+  } catch (err) {
+    handleFsError(`whiteboards/${boardId}/presence/${uid}`, err)
+  }
+}
+
+export function subscribeWhiteboardPresence(
+  boardId: string,
+  onPresence: (docs: WhiteboardPresenceDoc[]) => void,
+): Unsubscribe {
+  if (!boardId) return () => {}
+  return subscribeAfterAuth(`whiteboards/${boardId}/presence`, () =>
+    onSnapshot(
+      collection(db, 'whiteboards', boardId, 'presence'),
+      (snap) => {
+        const list = snap.docs.map((d) => {
+          const raw = d.data() as Partial<WhiteboardPresenceDoc>
+          return {
+            uid: String(raw.uid ?? d.id),
+            name: String(raw.name ?? 'Presenter'),
+            laserX: typeof raw.laserX === 'number' ? raw.laserX : null,
+            laserY: typeof raw.laserY === 'number' ? raw.laserY : null,
+            active: Boolean(raw.active),
+            at: typeof raw.at === 'number' ? raw.at : 0,
+          }
+        })
+        onPresence(list)
+      },
+      (err) => {
+        handleFsError(`whiteboards/${boardId}/presence`, err)
+      },
+    ),
+  )
+}
+
+/**
+ * Ensures a meeting has a single canonical whiteboard document at
+ * `whiteboards/{boardId}` with `memberIds: arrayUnion(uid)` so BOTH Host and
+ * Joiners ALWAYS sync to `whiteboards/{activeWhiteboardId}/elements`.
+ */
+export async function ensureMeetingWhiteboard(
+  meetingId: string,
+  meetingTitle: string,
+  createdByName?: string,
+): Promise<StandaloneBoardMeta> {
+  const uid = await ensureClientUid()
+  const boardId = `wb-meet-${meetingId}`
+  const title = `${meetingTitle} Whiteboard`
+  const now = Date.now()
+  const board: StandaloneBoardMeta = {
+    id: boardId,
+    title,
+    ownerId: uid,
+    memberIds: [uid],
+    createdBy: uid,
+    createdByName,
+    backgroundType: 'dots',
+    boardTheme: 'light',
+    createdAt: now,
+    updatedAt: now,
+    elementCount: 0,
+  }
+  const existingLocal = loadLocalBoards()
+  if (!existingLocal.some((b) => b.id === boardId)) {
+    saveLocalBoards([board, ...existingLocal])
+  }
+  if (await requireAuth()) {
+    try {
+      const ref = doc(db, 'whiteboards', boardId)
+      const snap = await getDoc(ref)
+      if (snap.exists()) {
+        await setDoc(
+          ref,
+          { memberIds: arrayUnion(uid), updatedAt: now },
+          { merge: true },
+        )
+        const data = snap.data() as StandaloneBoardMeta
+        return { ...data, id: data.id || boardId }
+      }
+      await setDoc(
+        ref,
+        stripUndefinedDeep({
+          ...board,
+          memberIds: arrayUnion(uid),
+        }),
+      )
+    } catch (err) {
+      handleFsError(`whiteboards/${boardId}`, err)
+    }
+  }
+  return board
+}
+
+// ---------------------------------------------------------------------------
 // Standalone Whiteboards metadata (`whiteboards/{boardId}`)
 // ---------------------------------------------------------------------------
 
@@ -1976,130 +2236,14 @@ export async function joinWhiteboardMembership(boardId: string) {
   const uid = auth.currentUser?.uid
   if (!uid) return
   try {
-    await updateDoc(doc(db, 'whiteboards', boardId), {
-      memberIds: arrayUnion(uid),
-    })
-  } catch {
-    try {
-      await setDoc(
-        doc(db, 'whiteboards', boardId),
-        { memberIds: arrayUnion(uid), updatedAt: Date.now() },
-        { merge: true },
-      )
-    } catch {
-      // Ignore if offline
-    }
-  }
-}
-
-/**
- * Ensures the unified default board `whiteboards/meeting-${meetingId}` exists
- * with the caller in `memberIds` and updates `meetings/{meetingId}` so all
- * participants read & write the EXACT same `whiteboards/{boardId}/elements` path.
- */
-export async function ensureMeetingWhiteboard(
-  meetingId: string,
-  title: string,
-  createdByName?: string,
-): Promise<StandaloneBoardMeta> {
-  const boardId = `meeting-${meetingId}`
-  const uid = await ensureClientUid()
-  const now = Date.now()
-  const fallbackMeta: StandaloneBoardMeta = {
-    id: boardId,
-    title: title.trim() || 'Class Whiteboard',
-    ownerId: uid,
-    memberIds: [uid],
-    createdBy: uid,
-    createdByName,
-    backgroundType: 'dots',
-    boardTheme: 'light',
-    createdAt: now,
-    updatedAt: now,
-    elementCount: 0,
-  }
-  if (await requireAuth()) {
-    try {
-      const ref = doc(db, 'whiteboards', boardId)
-      const snap = await getDoc(ref)
-      if (snap.exists()) {
-        const existing = snap.data() as StandaloneBoardMeta
-        await setDoc(
-          ref,
-          { memberIds: arrayUnion(uid), updatedAt: now },
-          { merge: true },
-        )
-        return { ...fallbackMeta, ...existing, id: boardId }
-      }
-      await setDoc(
-        ref,
-        stripUndefined({
-          ...fallbackMeta,
-          memberIds: arrayUnion(uid),
-        }),
-        { merge: true },
-      )
-    } catch (err) {
-      handleFsError(`whiteboards/${boardId}`, err)
-    }
-  }
-  return fallbackMeta
-}
-
-/**
- * Streams live Laser Pointer presence into `whiteboards/{boardId}/presence/{uid}`.
- */
-export async function updateWhiteboardPresence(
-  boardId: string,
-  uid: string,
-  data: { name: string; x: number; y: number; at: number; active: boolean },
-) {
-  if (!boardId || !uid) return
-  if (!(await requireAuth())) return
-  try {
     await setDoc(
-      doc(db, 'whiteboards', boardId, 'presence', uid),
-      stripUndefined({ uid, ...data }),
+      doc(db, 'whiteboards', boardId),
+      { memberIds: arrayUnion(uid) },
       { merge: true },
     )
   } catch (err) {
-    handleFsError(`whiteboards/${boardId}/presence/${uid}`, err)
+    handleFsError(`whiteboards/${boardId}`, err)
   }
-}
-
-/**
- * Subscribes to all remote participants' live Laser Pointer positions on a board.
- */
-export function subscribeWhiteboardPresence(
-  boardId: string,
-  onPresence: (entries: WhiteboardPresenceEntry[]) => void,
-): Unsubscribe {
-  if (!boardId) return () => {}
-  return subscribeAfterAuth(`whiteboards/${boardId}/presence`, () =>
-    onSnapshot(
-      collection(db, 'whiteboards', boardId, 'presence'),
-      (snap) => {
-        const list: WhiteboardPresenceEntry[] = []
-        for (const d of snap.docs) {
-          const raw = d.data() as Partial<WhiteboardPresenceEntry>
-          if (typeof raw.x === 'number' && typeof raw.y === 'number') {
-            list.push({
-              uid: raw.uid || d.id,
-              name: raw.name || 'Participant',
-              x: raw.x,
-              y: raw.y,
-              at: typeof raw.at === 'number' ? raw.at : Date.now(),
-              active: Boolean(raw.active),
-            })
-          }
-        }
-        onPresence(list)
-      },
-      (err) => {
-        handleFsError(`whiteboards/${boardId}/presence`, err)
-      },
-    ),
-  )
 }
 
 export async function listStandaloneBoards(
@@ -2211,7 +2355,13 @@ export async function createStandaloneBoard(
   }
   if (await requireAuth()) {
     try {
-      await setDoc(doc(db, 'whiteboards', board.id), stripUndefined(board))
+      await setDoc(
+        doc(db, 'whiteboards', board.id),
+        stripUndefinedDeep({
+          ...board,
+          memberIds: arrayUnion(uid),
+        }),
+      )
       if (initialElements.length > 0) {
         await upsertWhiteboardElementsBatch(
           { kind: 'board', boardId: board.id },
@@ -2237,7 +2387,7 @@ export async function updateWhiteboardMeta(
     laser: BoardLaserState | null
   }>,
 ) {
-  const payload = stripUndefined({
+  const payload = stripUndefinedDeep({
     ...patch,
     updatedAt: patch.updatedAt ?? Date.now(),
   })
@@ -2317,7 +2467,13 @@ export async function duplicateStandaloneBoard(
   saveLocalWbElements({ kind: 'board', boardId: newBoard.id }, elements)
   if (await requireAuth()) {
     try {
-      await setDoc(doc(db, 'whiteboards', newBoard.id), stripUndefined(newBoard))
+      await setDoc(
+        doc(db, 'whiteboards', newBoard.id),
+        stripUndefinedDeep({
+          ...newBoard,
+          memberIds: arrayUnion(uid),
+        }),
+      )
       if (elements.length > 0) {
         await upsertWhiteboardElementsBatch(
           { kind: 'board', boardId: newBoard.id },

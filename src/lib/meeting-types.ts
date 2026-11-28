@@ -77,13 +77,13 @@ export interface BoardLaserState {
   at: number
 }
 
-export interface WhiteboardPresenceEntry {
+export interface WhiteboardPresenceDoc {
   uid: string
   name: string
-  x: number
-  y: number
-  at: number
+  laserX: number | null
+  laserY: number | null
   active: boolean
+  at: number
 }
 
 export interface MeetingSummary extends MeetingSettings {

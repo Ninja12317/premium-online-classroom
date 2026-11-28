@@ -1,5 +1,6 @@
 import { doc, getDoc, setDoc } from 'firebase/firestore'
 
+import { stripUndefinedDeep } from '@/lib/firestore-sanitize'
 import { generateMeetingId, isModernMeetingId } from '@/lib/meeting'
 import type { AvailabilityStatus } from '@/lib/profile'
 import {
@@ -86,13 +87,11 @@ export async function saveUserAccountDoc(
   if (!uid || typeof window === 'undefined') return
   try {
     await ensureAuth()
-    const clean: Record<string, unknown> = {
+    const clean = stripUndefinedDeep({
+      ...data,
       uid,
       updatedAt: Date.now(),
-    }
-    for (const [k, v] of Object.entries(data)) {
-      if (v !== undefined) clean[k] = v
-    }
+    })
     await setDoc(doc(db, 'users', uid), clean, { merge: true })
   } catch (err) {
     if (isPermissionDeniedError(err)) {

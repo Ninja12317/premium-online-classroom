@@ -33,6 +33,7 @@ import {
 import { getMeeting } from '@/lib/meetings.functions'
 import { normalizeMeetingId } from '@/lib/meeting'
 import type { MeetingSummary } from '@/lib/meeting-types'
+import { ensureAuth } from '@/services/firebase'
 import { useAttachStream, useLocalMedia } from '@/lib/use-local-media'
 import { useSpeaking } from '@/lib/use-speaking'
 import {
@@ -42,24 +43,16 @@ import {
 } from '@/lib/prefs'
 import { useUserProfile } from '@/lib/profile'
 import { useClientValue } from '@/lib/use-client-value'
-import { loadHostKey } from '@/lib/host-keys'
+import { loadHostKey, saveHostKey } from '@/lib/host-keys'
 import { useMounted } from '@/lib/use-mounted'
 import { cn } from '@/lib/utils'
-import { ensureAuth } from '@/services/firebase'
 
 type LobbyMeeting = MeetingSummary & { youAreHost: boolean }
 
 export const Route = createFileRoute('/join/$meetingId')({
-  loader: async ({ params }) => {
-    try {
-      const id = normalizeMeetingId(params.meetingId) ?? params.meetingId
-      return await getMeeting({ data: { meetingId: id } })
-    } catch {
-      return null
-    }
-  },
-  head: ({ loaderData }) => ({
-    meta: loaderData ? [{ title: `Join ${loaderData.title} · Lectern` }] : [],
+  loader: () => null as LobbyMeeting | null,
+  head: () => ({
+    meta: [{ title: 'Join class · Lectern' }],
   }),
   component: Lobby,
 })
@@ -76,18 +69,24 @@ function Lobby() {
   const [loadingMeeting, setLoadingMeeting] = useState(!initialMeeting)
   const [joiningGuest, setJoiningGuest] = useState(false)
 
-  // Client-side fetch runs in parallel with Firebase Auth warmup so clicking Join is instant.
+  // Parallel non-blocking boot: kick off auth + room metadata fetch together
+  // while camera/mic preview warms asynchronously in useLocalMedia.
   useEffect(() => {
-    void ensureAuth().catch(() => {})
     if (initialMeeting) return
     let active = true
-    Promise.allSettled([ensureAuth(), getMeeting({ data: { meetingId } })])
-      .then(([, res]) => {
-        if (active && res.status === 'fulfilled') setMeeting(res.value)
-      })
-      .finally(() => {
-        if (active) setLoadingMeeting(false)
-      })
+    void Promise.allSettled([
+      ensureAuth(),
+      getMeeting({ data: { meetingId } }),
+    ]).then(([, meetingRes]) => {
+      if (!active) return
+      if (meetingRes.status === 'fulfilled') {
+        setMeeting(meetingRes.value)
+        if (meetingRes.value?.title) {
+          document.title = `Join ${meetingRes.value.title} · Lectern`
+        }
+      }
+      setLoadingMeeting(false)
+    })
     return () => {
       active = false
     }
@@ -182,9 +181,14 @@ function Lobby() {
     if (!canJoin) return
     setJoiningGuest(true)
     try {
+      // Preserve host key if this tab just created the class while logged out.
+      const preservedHostKey = hostKey ?? loadHostKey(meetingId)
       // Direct meeting link opened while logged out: establish an explicit Guest session smoothly.
       if (authStatus === 'loggedOut' || !user) {
         await signInAsGuest(name)
+        if (preservedHostKey) {
+          saveHostKey(meetingId, preservedHostKey)
+        }
       }
       savePrefs({ ...prefs, name })
       try {
@@ -247,7 +251,11 @@ function Lobby() {
                       className="size-20 text-2xl"
                     />
                     <span className="text-sm opacity-80">
-                      {prefs.camOn ? 'Starting camera…' : 'Camera is off'}
+                      {prefs.camOn
+                        ? media.pending
+                          ? 'Starting camera…'
+                          : 'Camera unavailable'
+                        : 'Camera is off'}
                     </span>
                   </div>
                 )}

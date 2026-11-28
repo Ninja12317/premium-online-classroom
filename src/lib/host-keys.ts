@@ -1,6 +1,8 @@
 import type { ParticipantStatus, Role } from '@/lib/meeting-types'
 import { getActiveStorageUid } from '@/lib/storage-scope'
 
+const SESSION_HOST_PREFIX = 'lectern-session-host:'
+
 /** Host secrets scoped strictly to the active Firebase UID so accounts never share host keys. */
 function hostKeyPrefix(): string | null {
   const uid = getActiveStorageUid()
@@ -10,6 +12,11 @@ function hostKeyPrefix(): string | null {
 
 export function saveHostKey(meetingId: string, key: string) {
   if (typeof window === 'undefined') return
+  try {
+    sessionStorage.setItem(SESSION_HOST_PREFIX + meetingId, key)
+  } catch {
+    // ignore
+  }
   const prefix = hostKeyPrefix()
   if (!prefix) return
   try {
@@ -22,9 +29,12 @@ export function saveHostKey(meetingId: string, key: string) {
 export function loadHostKey(meetingId: string): string | null {
   if (typeof window === 'undefined') return null
   const prefix = hostKeyPrefix()
-  if (!prefix) return null
   try {
-    return localStorage.getItem(prefix + meetingId)
+    if (prefix) {
+      const scoped = localStorage.getItem(prefix + meetingId)
+      if (scoped) return scoped
+    }
+    return sessionStorage.getItem(SESSION_HOST_PREFIX + meetingId)
   } catch {
     return null
   }
@@ -62,6 +72,12 @@ export function clearScopedHostKeys(uid?: string | null) {
       }
     }
     for (const k of toRemove) localStorage.removeItem(k)
+    const sessionRemove: string[] = []
+    for (let i = 0; i < sessionStorage.length; i++) {
+      const k = sessionStorage.key(i)
+      if (k && k.startsWith(SESSION_HOST_PREFIX)) sessionRemove.push(k)
+    }
+    for (const k of sessionRemove) sessionStorage.removeItem(k)
   } catch {
     // ignore
   }

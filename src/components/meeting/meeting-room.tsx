@@ -170,6 +170,7 @@ export function MeetingRoom({
   const whiteboardRef = useRef<WhiteboardHandle>(null)
   const panelRef = useRef(panel)
   const notesTimerRef = useRef<number | null>(null)
+  const lastViewportSyncRef = useRef<number>(0)
   const seenReactionIdsRef = useRef<Set<string>>(new Set())
   const lastMuteAllAtRef = useRef<number>(meeting.muteAllAt ?? joinedAt)
   const lastBroadcastAtRef = useRef<number>(
@@ -238,26 +239,28 @@ export function MeetingRoom({
       if (m.activeWhiteboardTitle !== undefined) {
         setActiveWhiteboardTitle(m.activeWhiteboardTitle ?? null)
       }
-      if (m.presenterCamera && m.presenterCamera.by !== identity) {
+      const remoteCam = m.presenterCamera
+      const remoteVp = m.presenterViewport
+      if (remoteCam && remoteCam.by !== identity) {
         setRemotePresenterCamera({
-          cx: m.presenterCamera.cx,
-          cy: m.presenterCamera.cy,
-          zoom: m.presenterCamera.zoom,
-          at: m.presenterCamera.at,
-          force: m.presenterCamera.force,
+          cx: remoteCam.cx,
+          cy: remoteCam.cy,
+          zoom: remoteCam.zoom,
+          at: remoteCam.at,
+          force: remoteCam.force,
         })
       } else if (
-        m.presenterViewport &&
-        m.presenterViewport.by !== identity &&
-        typeof m.presenterViewport.cx === 'number' &&
-        typeof m.presenterViewport.cy === 'number'
+        remoteVp &&
+        remoteVp.by !== identity &&
+        remoteVp.cx !== undefined &&
+        remoteVp.cy !== undefined
       ) {
         setRemotePresenterCamera({
-          cx: m.presenterViewport.cx,
-          cy: m.presenterViewport.cy,
-          zoom: m.presenterViewport.zoom,
-          at: m.presenterViewport.at ?? Date.now(),
-          force: m.presenterViewport.force,
+          cx: remoteVp.cx,
+          cy: remoteVp.cy,
+          zoom: remoteVp.zoom,
+          at: remoteVp.at ?? Date.now(),
+          force: remoteVp.force,
         })
       }
       if (m.screenAnnotations !== undefined) {
@@ -288,7 +291,7 @@ export function MeetingRoom({
         locked: m.locked,
         waitingRoom: m.waitingRoom,
         allowStudentScreenShare: m.allowStudentScreenShare,
-        allowStudentDraw: m.allowStudentDraw ?? Boolean(m.allowParticipantAnnotate),
+        allowStudentDraw: m.allowParticipantAnnotate ?? m.allowStudentDraw,
         allowChat: m.allowChat,
         allowPrivateChat: m.allowPrivateChat,
       })
@@ -991,67 +994,84 @@ export function MeetingRoom({
     ),
   )
 
-  // Always unify on ONE Firestore path: `whiteboards/{effectiveBoardId}/elements/{elementId}`
-  // so Host and all remote joiners read and write the exact same document collection.
-  const effectiveBoardId = activeWhiteboardId || `meeting-${meeting.meetingId}`
+  // Canonical shared board ID so Host and remote Joiners ALWAYS subscribe to
+  // the exact same `whiteboards/{activeWhiteboardId}/elements` subcollection.
+  const effectiveWhiteboardId =
+    activeWhiteboardId || `wb-meet-${meeting.meetingId}`
 
-  // Ensure the shared whiteboard doc exists & record caller membership whenever the board is open
+  // Ensure the whiteboard doc exists and current user is in `memberIds`.
   useEffect(() => {
     if (!whiteboardOpen) return
     if (activeWhiteboardId) {
       void joinWhiteboardMembership(activeWhiteboardId)
       return
     }
-    const defaultTitle = activeWhiteboardTitle || `${meeting.title} Whiteboard`
-    void ensureMeetingWhiteboard(meeting.meetingId, defaultTitle, name).then(
-      (meta) => {
-        setActiveWhiteboardId((cur) => cur ?? meta.id)
-        setActiveWhiteboardTitle((cur) => cur ?? meta.title)
+    let cancelled = false
+    void ensureMeetingWhiteboard(meeting.meetingId, meeting.title, name).then(
+      (board) => {
+        if (cancelled) return
+        setActiveWhiteboardId(board.id)
+        setActiveWhiteboardTitle(board.title)
         if (isModerator) {
+          adapter.send({
+            t: 'wb-open',
+            open: true,
+            boardId: board.id,
+            boardTitle: board.title,
+          })
           void updateMeetingMeta(meeting.meetingId, {
             whiteboardOpen: true,
-            activeWhiteboardId: meta.id,
-            activeWhiteboardTitle: meta.title,
+            activeWhiteboardId: board.id,
+            activeWhiteboardTitle: board.title,
             allowParticipantAnnotate: settingsRef.current.allowStudentDraw,
           })
         }
       },
     )
+    return () => {
+      cancelled = true
+    }
   }, [
     whiteboardOpen,
     activeWhiteboardId,
-    activeWhiteboardTitle,
     meeting.meetingId,
     meeting.title,
     name,
     isModerator,
+    adapter,
   ])
 
   // ---- presentation ---------------------------------------------------------
-  const lastMeetingViewportWriteRef = useRef(0)
   const broadcastCamera = useCallback(
-    (cx: number, cy: number, zoom: number, force?: boolean) => {
+    (
+      cx: number,
+      cy: number,
+      zoom: number,
+      force?: boolean,
+      panX?: number,
+      panY?: number,
+    ) => {
       adapter.send({ t: 'wb-camera', cx, cy, zoom, force })
-      const ts = Date.now()
-      if (force || ts - lastMeetingViewportWriteRef.current >= 260) {
-        lastMeetingViewportWriteRef.current = ts
+      const nowTs = Date.now()
+      if (force || nowTs - lastViewportSyncRef.current >= 300) {
+        lastViewportSyncRef.current = nowTs
         void updateMeetingMeta(meeting.meetingId, {
+          presenterViewport: {
+            panX: panX ?? 0,
+            panY: panY ?? 0,
+            zoom,
+            cx,
+            cy,
+            by: identity,
+            at: nowTs,
+            force: Boolean(force),
+          },
           presenterCamera: {
             cx,
             cy,
             zoom,
             by: identity,
-            at: ts,
-            force: Boolean(force),
-          },
-          presenterViewport: {
-            panX: cx,
-            panY: cy,
-            zoom,
-            cx,
-            cy,
-            by: identity,
-            at: ts,
+            at: nowTs,
             force: Boolean(force),
           },
         })
@@ -1062,7 +1082,10 @@ export function MeetingRoom({
 
   const presentation = useMemo<Presentation | null>(() => {
     if (whiteboardOpen) {
-      const scope = { kind: 'board', boardId: effectiveBoardId } as const
+      const scope = {
+        kind: 'board',
+        boardId: effectiveWhiteboardId,
+      } as const
       const boardLabel = activeWhiteboardTitle || `${meeting.title} Whiteboard`
       return {
         kind: 'whiteboard',
@@ -1123,7 +1146,7 @@ export function MeetingRoom({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     whiteboardOpen,
-    effectiveBoardId,
+    activeWhiteboardId,
     activeWhiteboardTitle,
     meeting.meetingId,
     meeting.title,

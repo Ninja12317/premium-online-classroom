@@ -12,7 +12,7 @@ class FakePC {
   signalingState = 'stable'
   connectionState = 'new'
   iceGatheringState = 'gathering'
-  addedIce: RTCIceCandidateInit[] = []
+  addedIceCandidates: RTCIceCandidateInit[] = []
   transceivers: { sender: { replaceTrack: () => Promise<void> } }[] = []
   onicecandidate: ((ev: unknown) => void) | null = null
   onconnectionstatechange: (() => void) | null = null
@@ -55,7 +55,7 @@ class FakePC {
     }
   }
   async addIceCandidate(c: RTCIceCandidateInit) {
-    this.addedIce.push(c)
+    this.addedIceCandidates.push(c)
   }
   async getStats() {
     return new Map()
@@ -297,7 +297,9 @@ describe('MeshRoom', () => {
     await room.stop()
   })
 
-  it('sends offers immediately with Trickle ICE and iceCandidatePoolSize without waiting for gathering', async () => {
+  it('uses iceCandidatePoolSize: 4 and Trickle ICE without waiting for gathering', async () => {
+    const sentSignals: { kind: string; to: string; payload: string }[] = []
+    const cleanupSignals = vi.fn(async () => {})
     const sync = vi.fn(async () =>
       ok({
         peers: [
@@ -310,81 +312,116 @@ describe('MeshRoom', () => {
         ],
       }),
     )
-    const { room } = makeRoom(sync, 'a-host')
+    const room = new MeshRoom({
+      identity: 'a-host',
+      name: 'Teacher',
+      role: 'host',
+      iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }],
+      initialSettings: ok().settings,
+      sync: sync as never,
+      leave: vi.fn(async () => ({ ok: true })),
+      sendSignal: async (_sid, sig) => {
+        sentSignals.push(sig)
+      },
+      cleanupSignals,
+      onChange: vi.fn(),
+      onMessage: vi.fn(),
+    })
     room.start()
     await flush()
-
+    expect(cleanupSignals).toHaveBeenCalledWith(room.sessionId)
+    expect(FakePC.instances).toHaveLength(1)
     const pc = FakePC.instances[0]
     expect(pc.config?.iceCandidatePoolSize).toBe(4)
-    expect(pc.iceGatheringState).toBe('gathering')
+    // Offer was sent immediately even though iceGatheringState is still 'gathering'
+    expect(sentSignals.some((s) => s.kind === 'offer')).toBe(true)
 
-    // Emit a Trickle ICE candidate immediately after offer creation
+    // Trickle ICE candidate emits immediately without waiting for poll loop
     pc.onicecandidate?.({
-      candidate: { toJSON: () => ({ candidate: 'candidate:1 1 UDP 1 127.0.0.1 9999 typ host' }) },
+      candidate: {
+        toJSON: () => ({ candidate: 'candidate:1 1 udp 1 127.0.0.1 9 typ host' }),
+      },
     })
-
-    // Sent in ~15ms, NOT blocked by a 1500ms gathering wait
-    await vi.advanceTimersByTimeAsync(25)
-    const second = callArg(sync, 1)
-    expect(second.outbox.map((s) => s.kind)).toEqual(['offer', 'ice'])
+    expect(sentSignals.some((s) => s.kind === 'ice')).toBe(true)
     await room.stop()
   })
 
-  it('queues early remote ICE candidates arriving before offer and flushes them after setRemoteDescription', async () => {
-    let calls = 0
-    const sync = vi.fn(async () => {
-      calls += 1
-      return ok({
-        peers: [
-          { identity: 'a-teacher', session: 's9', name: 'Zoe', role: 'host' },
-        ],
-        inbox:
-          calls === 1
-            ? [
-                // ICE candidate arrives BEFORE the offer!
-                {
-                  id: 'ice-early',
-                  kind: 'ice' as const,
-                  from: 'a-teacher',
-                  fromSession: 's9',
-                  payload: JSON.stringify({
-                    candidate: 'candidate:early 1 UDP 1 1.2.3.4 5000 typ srflx',
-                  }),
-                },
-                {
-                  id: 'offer-1',
-                  kind: 'offer' as const,
-                  from: 'a-teacher',
-                  fromSession: 's9',
-                  payload: JSON.stringify({ type: 'offer', sdp: 'v=0' }),
-                },
-              ]
-            : [],
-      })
-    })
-    const { room } = makeRoom(sync, 'z-student')
-    room.start()
-    await flush()
-
-    const pc = FakePC.instances[0]
-    expect(pc.remoteDescription?.type).toBe('offer')
-    expect(pc.addedIce).toEqual([
-      { candidate: 'candidate:early 1 UDP 1 1.2.3.4 5000 typ srflx' },
-    ])
-    await room.stop()
-  })
-
-  it('triggers immediate sync when nudge() is called from real-time signaling listeners', async () => {
+  it('queues early remote ICE candidates before offer arrives and flushes after setRemoteDescription', async () => {
+    let pushSignals: ((sigs: import('@/lib/meeting-types').IncomingSignal[]) => void) | null = null
+    let pushParticipants:
+      | ((u: {
+          peers: import('@/lib/meeting-types').PeerInfo[]
+          waiting: import('@/lib/meeting-types').WaitingParticipant[]
+          leftIds: string[]
+        }) => void)
+      | null = null
     const sync = vi.fn(async () => ok())
-    const { room } = makeRoom(sync, 'a-host')
+    const room = new MeshRoom({
+      identity: 'z-student',
+      name: 'Student',
+      role: 'student',
+      iceServers: [],
+      initialSettings: ok().settings,
+      sync: sync as never,
+      leave: vi.fn(async () => ({ ok: true })),
+      sendSignal: async () => {},
+      subscribeSignals: (_sid, cb) => {
+        pushSignals = cb
+        return () => {}
+      },
+      subscribeParticipants: (cb) => {
+        pushParticipants = cb
+        return () => {}
+      },
+      onChange: vi.fn(),
+      onMessage: vi.fn(),
+    })
     room.start()
     await flush()
-    expect(sync).toHaveBeenCalledTimes(1)
 
-    // Without nudge(), next sync would wait SLOW_POLL_MS (4000ms)
-    room.nudge()
-    await vi.advanceTimersByTimeAsync(25)
-    expect(sync).toHaveBeenCalledTimes(2)
+    // Early ICE candidate arrives BEFORE participant discovery or Offer
+    pushSignals!([
+      {
+        id: 'ice-early-1',
+        kind: 'ice',
+        from: 'a-teacher',
+        fromSession: 's9',
+        payload: JSON.stringify({ candidate: 'candidate:early', sdpMid: '0' }),
+      },
+    ])
+    await flush()
+    expect(FakePC.instances).toHaveLength(0)
+
+    // Participant arrives, then Offer arrives
+    pushParticipants!({
+      peers: [{ identity: 'a-teacher', session: 's9', name: 'Zoe', role: 'host' }],
+      waiting: [],
+      leftIds: [],
+    })
+    pushSignals!([
+      {
+        id: 'offer-1',
+        kind: 'offer',
+        from: 'a-teacher',
+        fromSession: 's9',
+        payload: JSON.stringify({ type: 'offer', sdp: 'v=0' }),
+      },
+    ])
+    await flush()
+    expect(FakePC.instances).toHaveLength(1)
+    expect(FakePC.instances[0].addedIceCandidates).toEqual([
+      { candidate: 'candidate:early', sdpMid: '0' },
+    ])
+
+    // Immediate peer drop when leftIds reports departure
+    pushParticipants!({
+      peers: [],
+      waiting: [],
+      leftIds: ['a-teacher'],
+    })
+    await flush()
+    expect(room.peers.has('a-teacher')).toBe(false)
+    expect(FakePC.instances[0].connectionState).toBe('closed')
     await room.stop()
   })
 })

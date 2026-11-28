@@ -9,25 +9,6 @@ service cloud.firestore {
       return isSignedIn() && request.auth.uid == userId;
     }
 
-    function isMember(data) {
-      return isSignedIn() && (
-        (data.memberIds is list && request.auth.uid in data.memberIds) ||
-        (data.hostId is string && data.hostId == request.auth.uid) ||
-        (data.ownerId is string && data.ownerId == request.auth.uid)
-      );
-    }
-
-    function isJoiningSelf(existingData, nextData) {
-      return isSignedIn() &&
-        nextData.memberIds is list &&
-        request.auth.uid in nextData.memberIds &&
-        (
-          !(existingData.memberIds is list) ||
-          nextData.memberIds.hasAll(existingData.memberIds)
-        ) &&
-        nextData.hostId == existingData.hostId;
-    }
-
     // Registered user profiles (Teacher / Student accounts) — strictly owner-only
     match /users/{userId} {
       allow read, write: if isOwner(userId);
@@ -35,10 +16,7 @@ service cloud.firestore {
 
     // Meetings & all classroom subcollections
     match /meetings/{meetingId} {
-      // Single-document lookup, create, update, delete for any authenticated user (including Anonymous Guests)
       allow get, create, update, delete: if isSignedIn();
-
-      // Collection queries MUST strictly filter by memberIds array-contains request.auth.uid
       allow list: if isSignedIn() && request.auth.uid in resource.data.memberIds;
 
       match /participants/{participantId} {
@@ -62,12 +40,9 @@ service cloud.firestore {
       }
     }
 
-    // Standalone & in-meeting unified infinite whiteboards, elements & live presence
+    // Shared & standalone infinite whiteboards, elements, and live laser presence
     match /whiteboards/{boardId} {
-      // Single-document lookup, create, update, delete for any authenticated user
       allow get, create, update, delete: if isSignedIn();
-
-      // Collection queries MUST strictly filter by memberIds array-contains request.auth.uid
       allow list: if isSignedIn() && request.auth.uid in resource.data.memberIds;
 
       match /elements/{elementId} {

@@ -6,8 +6,10 @@ import { MeshRoom, type MeshPeer } from '@/lib/mesh/mesh-room'
 import type { JoinPrefs } from '@/lib/prefs'
 import { leaveRoom, syncRoom } from '@/lib/signaling.functions'
 import {
-  subscribeMeetingParticipants,
-  subscribeMeetingSignals,
+  cleanupStaleSignals,
+  sendSignalFirestore,
+  subscribeRoomParticipants,
+  subscribeRoomSignals,
   updateParticipantState,
 } from '@/services/firestore-meetings'
 import { useAttachStream, useLocalMedia } from '@/lib/use-local-media'
@@ -139,6 +141,14 @@ export function useMeshAdapter(opts: MeshAdapterOptions): RoomAdapter & {
           }),
         leave: () =>
           leaveRoom({ data: { meetingId, identity, participantKey } }),
+        sendSignal: (sessionId, signal) =>
+          sendSignalFirestore(meetingId, identity, sessionId, signal),
+        cleanupSignals: (sessionId) =>
+          cleanupStaleSignals(meetingId, identity, sessionId),
+        subscribeSignals: (sessionId, onSignals) =>
+          subscribeRoomSignals(meetingId, identity, sessionId, onSignals),
+        subscribeParticipants: (onUpdate) =>
+          subscribeRoomParticipants(meetingId, identity, onUpdate),
         onChange: () => bump((v) => v + 1),
         onMessage: (from, message) => {
           for (const cb of subscribers) cb(from, message)
@@ -146,28 +156,19 @@ export function useMeshAdapter(opts: MeshAdapterOptions): RoomAdapter & {
       }),
   )
 
-  // StrictMode-safe lifecycle: only depends on [room, meetingId, identity].
-  // Real-time signal & participant listeners nudge MeshRoom immediately (<150ms)
-  // so WebRTC offers/answers/ICE candidates never wait on poll intervals.
+  // StrictMode-safe lifecycle: only depends on [room] (tied to meetingId+identity).
+  // Never calls leaveRoom() on unmount; only leaves on explicit Leave click or beforeunload.
   useEffect(() => {
     room.start()
-    const unsubSignals = subscribeMeetingSignals(meetingId, identity, () => {
-      room.nudge()
-    })
-    const unsubParticipants = subscribeMeetingParticipants(meetingId, () => {
-      room.nudge()
-    })
     const onBeforeUnload = () => {
       void room.stop('left')
     }
     window.addEventListener('beforeunload', onBeforeUnload)
     return () => {
       window.removeEventListener('beforeunload', onBeforeUnload)
-      unsubSignals()
-      unsubParticipants()
       room.pause()
     }
-  }, [room, meetingId, identity])
+  }, [room])
 
   // Publish local tracks whenever they change.
   const camTrack = media.hasVideo
