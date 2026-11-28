@@ -1,3 +1,4 @@
+import { onAuthStateChanged } from 'firebase/auth'
 import {
   addDoc,
   arrayUnion,
@@ -24,6 +25,7 @@ import {
   getCachedClientUid,
   isPermissionDeniedError,
   reportFirestorePermissionError,
+  waitForAuthReady,
 } from '@/services/firebase'
 import { AuthRequiredError, isRegisteredUser } from '@/lib/auth-gate'
 import { stripUndefinedDeep } from '@/lib/firestore-sanitize'
@@ -137,6 +139,8 @@ export interface ParticipantDoc {
   sharing?: boolean
   breakoutRoomId?: string | null
   lastSeen: number
+  joinedAt?: unknown
+  leftAt?: unknown
   createdAt: number
   updatedAt: number
 }
@@ -388,16 +392,20 @@ export function summaryOf(row: MeetingDoc): MeetingSummary {
   }
 }
 
-function handleFsError(path: string, err: unknown) {
+function handleFsError(
+  path: string,
+  err: unknown,
+  opts?: { expectedUid?: string | null; isTornDown?: boolean },
+) {
   if (isPermissionDeniedError(err)) {
-    reportFirestorePermissionError(path, err)
+    reportFirestorePermissionError(path, err, opts)
   }
 }
 
 /**
  * Ensures Firebase Auth has resolved (Anonymous or Email/Password) before ANY
- * Firestore read/write/listener executes. Returns `false` on SSR so server-side
- * route loaders never fire unauthenticated client-SDK requests.
+ * room-level Firestore read/write/listener executes. Returns `false` on SSR so
+ * server-side route loaders never fire unauthenticated client-SDK requests.
  */
 async function requireAuth(): Promise<boolean> {
   if (typeof window === 'undefined') return false
@@ -431,30 +439,132 @@ function subscribeAfterAuth(
   }
 }
 
+/**
+ * Auth-gated collection listener for top-level user-scoped collections
+ * (`meetings`, `whiteboards`) governed by `allow list: if request.auth != null
+ * && request.auth.uid in resource.data.memberIds`.
+ *
+ * - NEVER calls `signInAnonymously()`; waits for `waitForAuthReady()`.
+ * - If signed out or `auth.currentUser.uid !== expectedUid`, emits empty silently.
+ * - Watches `onAuthStateChanged` and synchronously unsubscribes on sign-out or
+ *   account switch so outgoing listeners never flash a permission-denied banner.
+ */
+function subscribeWithCurrentUser(
+  expectedUid: string | null,
+  attach: (verifiedUid: string, isTornDown: () => boolean) => Unsubscribe,
+  onEmpty: () => void,
+): Unsubscribe {
+  if (!expectedUid || typeof window === 'undefined') {
+    onEmpty()
+    return () => {}
+  }
+  let tornDown = false
+  let unsubSnap: Unsubscribe | null = null
+  let unsubAuth: Unsubscribe | null = null
+
+  const teardown = (emitEmpty: boolean) => {
+    if (tornDown) return
+    tornDown = true
+    unsubSnap?.()
+    unsubSnap = null
+    unsubAuth?.()
+    unsubAuth = null
+    if (emitEmpty) onEmpty()
+  }
+
+  void waitForAuthReady().then((currentUser) => {
+    if (tornDown) return
+    if (!currentUser || currentUser.uid !== expectedUid) {
+      teardown(true)
+      return
+    }
+    const verifiedUid = currentUser.uid
+    unsubAuth = onAuthStateChanged(auth, (nextUser) => {
+      if (!nextUser || nextUser.uid !== verifiedUid) {
+        teardown(true)
+      }
+    })
+    if (tornDown) return
+    unsubSnap = attach(verifiedUid, () => tornDown)
+  })
+
+  return () => {
+    teardown(false)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Meetings CRUD (`meetings/{meetingId}`)
 // ---------------------------------------------------------------------------
+
+const FS_JOIN_SETTLE_MS = 900
+const FS_LEAVE_SETTLE_MS = 800
+const FS_FETCH_CACHED_MS = 750
+const FS_FETCH_SETTLE_MS = 1800
+
+function settleWithin<T, F = T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  fallback: F,
+): Promise<T | F> {
+  return new Promise<T | F>((resolve) => {
+    let done = false
+    const timer = setTimeout(() => {
+      if (done) return
+      done = true
+      resolve(fallback)
+    }, timeoutMs)
+    promise
+      .then((value) => {
+        if (done) return
+        done = true
+        clearTimeout(timer)
+        resolve(value)
+      })
+      .catch(() => {
+        if (done) return
+        done = true
+        clearTimeout(timer)
+        resolve(fallback)
+      })
+  })
+}
 
 export async function fetchMeetingDoc(
   meetingId: string,
 ): Promise<MeetingDoc | null> {
   const id = normalizeMeetingId(meetingId)
   if (!id || !isValidMeetingId(id)) return null
-  if (!(await requireAuth())) return getLocalMeeting(id)
+  const preAuthCached = getLocalMeeting(id)
+  if (!(await requireAuth())) return preAuthCached
+  const cached = getLocalMeeting(id) ?? preAuthCached
   try {
-    const snap = await getDoc(doc(db, 'meetings', id))
-    if (snap.exists()) {
-      const normalized = normalizeMeetingDoc(
-        id,
-        snap.data() as Record<string, unknown>,
-      )
+    const snap = await settleWithin(
+      getDoc(doc(db, 'meetings', id)),
+      cached ? FS_FETCH_CACHED_MS : FS_FETCH_SETTLE_MS,
+      null,
+    )
+    if (snap && snap.exists()) {
+      const raw = snap.data() as Record<string, unknown>
+      const normalized = normalizeMeetingDoc(id, raw)
+      // Preserve locally known host ownership if a remote merge doc lacked it
+      if (!raw.hostId && cached?.hostId) {
+        normalized.hostId = cached.hostId
+        if (!raw.hostKeyHash && cached.hostKeyHash) {
+          normalized.hostKeyHash = cached.hostKeyHash
+        }
+        if (!raw.title && !raw.topic && cached.title) {
+          normalized.title = cached.title
+          normalized.topic = cached.topic
+        }
+      }
       saveLocalMeeting(normalized)
       return normalized
     }
-    return getLocalMeeting(id)
+    return cached ?? getLocalMeeting(id)
   } catch (err) {
     handleFsError(`meetings/${id}`, err)
-    return getLocalMeeting(id)
+    return cached ?? getLocalMeeting(id)
   }
 }
 
@@ -673,10 +783,16 @@ export async function updateMeetingDetails(
   }
   saveLocalMeeting(next)
   if (await requireAuth()) {
+    const uid = auth.currentUser?.uid
     try {
-      await setDoc(doc(db, 'meetings', meetingId), stripUndefinedDeep(next), {
-        merge: true,
-      })
+      await setDoc(
+        doc(db, 'meetings', meetingId),
+        stripUndefinedDeep({
+          ...next,
+          ...(uid ? { memberIds: arrayUnion(uid) } : {}),
+        }),
+        { merge: true },
+      )
     } catch (err) {
       handleFsError(`meetings/${meetingId}`, err)
     }
@@ -697,34 +813,32 @@ export async function getMeetingSummary(
 export async function listUserMeetings(
   explicitUid?: string | null,
 ): Promise<(MeetingSummary & { passcode: string | null })[]> {
-  const uid =
-    explicitUid !== undefined
-      ? explicitUid
-      : (auth.currentUser?.uid ?? getActiveStorageUid())
-  if (!uid) return []
+  if (typeof window === 'undefined') return []
+  const currentUser = await waitForAuthReady()
+  if (!currentUser) return []
+  if (explicitUid && explicitUid !== currentUser.uid) return []
+  const uid = currentUser.uid
 
   const byId = new Map<string, MeetingDoc>()
 
-  if (await requireAuth()) {
-    try {
-      // Strictly uid-scoped single-field array-contains query (ZERO composite indexes)
-      const q = query(
-        collection(db, 'meetings'),
-        where('memberIds', 'array-contains', uid),
-      )
-      const snap = await getDocs(q)
-      for (const d of snap.docs) {
-        const m = normalizeMeetingDoc(d.id, d.data() as Record<string, unknown>)
+  try {
+    // Strictly uid-scoped single-field array-contains query (ZERO composite indexes)
+    const q = query(
+      collection(db, 'meetings'),
+      where('memberIds', 'array-contains', uid),
+    )
+    const snap = await getDocs(q)
+    for (const d of snap.docs) {
+      const m = normalizeMeetingDoc(d.id, d.data() as Record<string, unknown>)
+      byId.set(m.meetingId, m)
+    }
+    replaceLocalMeetings(Array.from(byId.values()))
+  } catch (err) {
+    handleFsError('meetings', err, { expectedUid: uid })
+    // Fallback only to UID-scoped cache if offline
+    for (const m of Object.values(loadLocalMeetings())) {
+      if (m.hostId === uid || m.memberIds.includes(uid)) {
         byId.set(m.meetingId, m)
-      }
-      replaceLocalMeetings(Array.from(byId.values()))
-    } catch (err) {
-      handleFsError('meetings', err)
-      // Fallback only to UID-scoped cache if offline
-      for (const m of Object.values(loadLocalMeetings())) {
-        if (m.hostId === uid || m.memberIds.includes(uid)) {
-          byId.set(m.meetingId, m)
-        }
       }
     }
   }
@@ -738,42 +852,47 @@ export async function listUserMeetings(
 /**
  * Real-time subscription to ONLY classrooms where `memberIds` contains `uid`.
  * Uses a single-field `array-contains` query and sorts in JavaScript (zero composite indexes).
+ * Never attaches when signed out or before auth resolves, and tears down cleanly on auth change.
  */
 export function subscribeUserMeetings(
   uid: string | null,
   onMeetings: (list: (MeetingSummary & { passcode: string | null })[]) => void,
 ): Unsubscribe {
-  if (!uid || typeof window === 'undefined') {
-    onMeetings([])
-    return () => {}
-  }
-  return subscribeAfterAuth('meetings', () => {
-    const q = query(
-      collection(db, 'meetings'),
-      where('memberIds', 'array-contains', uid),
-    )
-    return onSnapshot(
-      q,
-      (snap) => {
-        const docs = snap.docs.map((d) =>
-          normalizeMeetingDoc(d.id, d.data() as Record<string, unknown>),
-        )
-        docs.sort(
-          (a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt),
-        )
-        replaceLocalMeetings(docs)
-        onMeetings(
-          docs
-            .slice(0, 50)
-            .map((row) => ({ ...summaryOf(row), passcode: row.passcode })),
-        )
-      },
-      (err) => {
-        handleFsError('meetings', err)
-        onMeetings([])
-      },
-    )
-  })
+  return subscribeWithCurrentUser(
+    uid,
+    (verifiedUid, isTornDown) => {
+      const q = query(
+        collection(db, 'meetings'),
+        where('memberIds', 'array-contains', verifiedUid),
+      )
+      return onSnapshot(
+        q,
+        (snap) => {
+          if (isTornDown()) return
+          const docs = snap.docs.map((d) =>
+            normalizeMeetingDoc(d.id, d.data() as Record<string, unknown>),
+          )
+          docs.sort(
+            (a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt),
+          )
+          replaceLocalMeetings(docs)
+          onMeetings(
+            docs
+              .slice(0, 50)
+              .map((row) => ({ ...summaryOf(row), passcode: row.passcode })),
+          )
+        },
+        (err) => {
+          handleFsError('meetings', err, {
+            expectedUid: verifiedUid,
+            isTornDown: isTornDown(),
+          })
+          onMeetings([])
+        },
+      )
+    },
+    () => onMeetings([]),
+  )
 }
 
 export async function deleteMeetingRecord(meetingId: string) {
@@ -886,6 +1005,7 @@ export type JoinResult =
       meeting: MeetingSummary
       identity: string
       participantKey: string
+      sessionId: string
       role: Role
       iceServers: IceServer[]
     }
@@ -897,18 +1017,27 @@ export interface JoinMeetingInput {
   hostKey?: string
   identity?: string
   participantKey?: string
+  sessionId?: string
+}
+
+function generateSessionId(): string {
+  return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
 }
 
 function joinedPayload(
   meeting: MeetingDoc,
   participant: ParticipantDoc,
   participantKey: string,
+  sessionId: string,
 ): JoinResult {
   return {
     status: 'joined',
     meeting: summaryOf(meeting),
     identity: participant.identity,
     participantKey,
+    sessionId,
     role: participant.role,
     iceServers: getIceServers(),
   }
@@ -917,6 +1046,7 @@ function joinedPayload(
 export async function joinMeetingRecord(
   input: JoinMeetingInput,
 ): Promise<JoinResult> {
+  const sessionId = input.sessionId?.trim() || generateSessionId()
   const uid = await ensureClientUid()
   const meetingId = normalizeMeetingId(input.meetingId)
   if (!meetingId) return { status: 'not-found' }
@@ -973,7 +1103,7 @@ export async function joinMeetingRecord(
       role: 'host',
       status: 'admitted',
       keyHash: sha256Hex(hostSecret),
-      sessionId: null,
+      sessionId,
       micOn: false,
       camOn: false,
       handRaised: false,
@@ -993,31 +1123,48 @@ export async function joinMeetingRecord(
     }
     saveLocalMeeting(meeting)
     if (await requireAuth()) {
-      await Promise.allSettled([
-        setDoc(
-          doc(db, 'meetings', meetingId, 'participants', identity),
-          stripUndefinedDeep(participant),
-          { merge: true },
-        ).catch((err) =>
-          handleFsError(`meetings/${meetingId}/participants/${identity}`, err),
-        ),
-        setDoc(
-          doc(db, 'meetings', meetingId),
-          {
-            startedAt: serverTimestamp(),
-            status: 'live',
-            hostStarted: true,
-            memberIds: arrayUnion(uid),
-            updatedAt: now,
-          },
-          { merge: true },
-        ).catch((err) => handleFsError(`meetings/${meetingId}`, err)),
-      ])
+      void cleanupStaleSignals(meetingId, identity, sessionId)
+      await settleWithin(
+        Promise.allSettled([
+          setDoc(
+            doc(db, 'meetings', meetingId, 'participants', identity),
+            {
+              ...stripUndefinedDeep(participant),
+              joinedAt: serverTimestamp(),
+            },
+            { merge: true },
+          ).catch((err) =>
+            handleFsError(`meetings/${meetingId}/participants/${identity}`, err),
+          ),
+          setDoc(
+            doc(db, 'meetings', meetingId),
+            stripUndefinedDeep({
+              meetingId,
+              title: meeting.title,
+              topic: meeting.topic,
+              hostId: meeting.hostId ?? uid,
+              hostName: meeting.hostName,
+              hostKeyHash: meeting.hostKeyHash,
+              waitingRoom: meeting.waitingRoom,
+              waitingRoomEnabled: meeting.waitingRoomEnabled,
+              meetingType: meeting.meetingType,
+              startedAt: serverTimestamp(),
+              status: 'live',
+              hostStarted: true,
+              memberIds: arrayUnion(uid),
+              updatedAt: now,
+            }),
+            { merge: true },
+          ).catch((err) => handleFsError(`meetings/${meetingId}`, err)),
+        ]),
+        FS_JOIN_SETTLE_MS,
+        [],
+      )
     }
     if (meeting.activeWhiteboardId) {
       void joinWhiteboardMembership(meeting.activeWhiteboardId)
     }
-    return joinedPayload(meeting, participant, hostSecret)
+    return joinedPayload(meeting, participant, hostSecret, sessionId)
   }
 
   // Non-host participant opening a scheduled meeting before the Host starts it:
@@ -1031,27 +1178,43 @@ export async function joinMeetingRecord(
     const existing = await fetchParticipantDoc(meetingId, input.identity)
     if (existing && existing.keyHash === sha256Hex(input.participantKey)) {
       if (existing.status === 'admitted' || existing.status === 'left') {
+        const now = Date.now()
         existing.status = 'admitted'
         existing.name = input.name.trim() || existing.name
-        existing.lastSeen = Date.now()
-        existing.updatedAt = Date.now()
+        existing.sessionId = sessionId
+        existing.lastSeen = now
+        existing.updatedAt = now
         getLocalParticipantsMap(meetingId).set(existing.identity, existing)
         if (await requireAuth()) {
-          await Promise.allSettled([
-            setDoc(
-              doc(db, 'meetings', meetingId, 'participants', existing.identity),
-              stripUndefinedDeep(existing),
-              { merge: true },
-            ).catch((err) =>
-              handleFsError(
-                `meetings/${meetingId}/participants/${existing.identity}`,
-                err,
+          void cleanupStaleSignals(meetingId, existing.identity, sessionId)
+          await settleWithin(
+            Promise.allSettled([
+              setDoc(
+                doc(
+                  db,
+                  'meetings',
+                  meetingId,
+                  'participants',
+                  existing.identity,
+                ),
+                {
+                  ...stripUndefinedDeep(existing),
+                  joinedAt: serverTimestamp(),
+                },
+                { merge: true },
+              ).catch((err) =>
+                handleFsError(
+                  `meetings/${meetingId}/participants/${existing.identity}`,
+                  err,
+                ),
               ),
-            ),
-            ensureMembership(),
-          ])
+              ensureMembership(),
+            ]),
+            FS_JOIN_SETTLE_MS,
+            [],
+          )
         }
-        return joinedPayload(meeting, existing, input.participantKey)
+        return joinedPayload(meeting, existing, input.participantKey, sessionId)
       }
       if (existing.status === 'waiting') {
         return {
@@ -1089,7 +1252,7 @@ export async function joinMeetingRecord(
     role: 'student',
     status,
     keyHash: sha256Hex(participantKey),
-    sessionId: null,
+    sessionId: status === 'admitted' ? sessionId : null,
     micOn: false,
     camOn: false,
     handRaised: false,
@@ -1099,16 +1262,20 @@ export async function joinMeetingRecord(
   }
   getLocalParticipantsMap(meetingId).set(identity, participant)
   if (await requireAuth()) {
-    await Promise.allSettled([
-      setDoc(
-        doc(db, 'meetings', meetingId, 'participants', identity),
-        stripUndefinedDeep(participant),
-      ).catch((err) =>
-        handleFsError(`meetings/${meetingId}/participants/${identity}`, err),
-      ),
-      // Append uid to meeting.memberIds in parallel so room & chat appear immediately
-      ensureMembership(),
-    ])
+    await settleWithin(
+      Promise.allSettled([
+        setDoc(doc(db, 'meetings', meetingId, 'participants', identity), {
+          ...stripUndefinedDeep(participant),
+          joinedAt: serverTimestamp(),
+        }).catch((err) =>
+          handleFsError(`meetings/${meetingId}/participants/${identity}`, err),
+        ),
+        // Append uid to meeting.memberIds in parallel so room & chat appear immediately
+        ensureMembership(),
+      ]),
+      FS_JOIN_SETTLE_MS,
+      [],
+    )
   }
 
   if (status === 'waiting') {
@@ -1119,7 +1286,7 @@ export async function joinMeetingRecord(
       participantKey,
     }
   }
-  return joinedPayload(meeting, participant, participantKey)
+  return joinedPayload(meeting, participant, participantKey, sessionId)
 }
 
 export async function listWaitingParticipants(
@@ -1223,6 +1390,7 @@ export async function updateMeetingSettingsRecord(
   }
   saveLocalMeeting(next)
   if (await requireAuth()) {
+    const uid = auth.currentUser?.uid
     try {
       await setDoc(
         doc(db, 'meetings', meetingId),
@@ -1231,6 +1399,7 @@ export async function updateMeetingSettingsRecord(
           allowParticipantAnnotate: allowAnnotate,
           isLocked: next.locked,
           waitingRoomEnabled: next.waitingRoom,
+          ...(uid ? { memberIds: arrayUnion(uid) } : {}),
           updatedAt: Date.now(),
         }),
         { merge: true },
@@ -1300,10 +1469,17 @@ export async function endMeetingRecord(meetingId: string, actorKey: string) {
   meeting.updatedAt = now
   saveLocalMeeting(meeting)
   if (await requireAuth()) {
+    const uid = auth.currentUser?.uid
     try {
       await setDoc(
         doc(db, 'meetings', meetingId),
-        { endedAt, status: 'ended', hostStarted: false, updatedAt: now },
+        {
+          endedAt,
+          status: 'ended',
+          hostStarted: false,
+          ...(uid ? { memberIds: arrayUnion(uid) } : {}),
+          updatedAt: now,
+        },
         { merge: true },
       )
     } catch (err) {
@@ -1340,10 +1516,15 @@ export async function updateMeetingMeta(
     saveLocalMeeting({ ...existing, ...patch, updatedAt: Date.now() })
   }
   if (!(await requireAuth())) return
+  const uid = auth.currentUser?.uid
   try {
     await setDoc(
       doc(db, 'meetings', meetingId),
-      stripUndefinedDeep({ ...patch, updatedAt: Date.now() }),
+      stripUndefinedDeep({
+        ...patch,
+        ...(uid ? { memberIds: arrayUnion(uid) } : {}),
+        updatedAt: Date.now(),
+      }),
       { merge: true },
     )
   } catch (err) {
@@ -1614,25 +1795,36 @@ export async function leaveRoomFirestore(input: {
   identity: string
   participantKey: string
 }) {
+  const now = Date.now()
   const local = getLocalParticipantsMap(input.meetingId).get(input.identity)
   if (local) {
     local.sessionId = null
     local.status = 'left'
-    local.updatedAt = Date.now()
+    local.updatedAt = now
   }
   if (!(await requireAuth())) return { ok: true }
-  try {
-    await setDoc(
-      doc(db, 'meetings', input.meetingId, 'participants', input.identity),
-      { sessionId: null, status: 'left', updatedAt: Date.now() },
-      { merge: true },
-    )
-  } catch (err) {
-    handleFsError(
-      `meetings/${input.meetingId}/participants/${input.identity}`,
-      err,
-    )
-  }
+  await settleWithin(
+    Promise.allSettled([
+      setDoc(
+        doc(db, 'meetings', input.meetingId, 'participants', input.identity),
+        {
+          sessionId: null,
+          status: 'left',
+          leftAt: serverTimestamp(),
+          updatedAt: now,
+        },
+        { merge: true },
+      ).catch((err) =>
+        handleFsError(
+          `meetings/${input.meetingId}/participants/${input.identity}`,
+          err,
+        ),
+      ),
+      cleanupStaleSignals(input.meetingId, input.identity, ''),
+    ]),
+    FS_LEAVE_SETTLE_MS,
+    [],
+  )
   return { ok: true }
 }
 
@@ -2411,31 +2603,29 @@ export async function joinWhiteboardMembership(boardId: string) {
 export async function listStandaloneBoards(
   explicitUid?: string | null,
 ): Promise<StandaloneBoardMeta[]> {
-  const uid =
-    explicitUid !== undefined
-      ? explicitUid
-      : (auth.currentUser?.uid ?? getActiveStorageUid())
-  if (!uid) return []
+  if (typeof window === 'undefined') return []
+  const currentUser = await waitForAuthReady()
+  if (!currentUser) return []
+  if (explicitUid && explicitUid !== currentUser.uid) return []
+  const uid = currentUser.uid
   const byId = new Map<string, StandaloneBoardMeta>()
-  if (await requireAuth()) {
-    try {
-      const q = query(
-        collection(db, 'whiteboards'),
-        where('memberIds', 'array-contains', uid),
-      )
-      const snap = await getDocs(q)
-      for (const d of snap.docs) {
-        const b = d.data() as StandaloneBoardMeta
-        byId.set(b.id || d.id, { ...b, id: b.id || d.id })
-      }
-      const list = Array.from(byId.values()).sort(
-        (a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0),
-      )
-      saveLocalBoards(list)
-      return list
-    } catch (err) {
-      handleFsError('whiteboards', err)
+  try {
+    const q = query(
+      collection(db, 'whiteboards'),
+      where('memberIds', 'array-contains', uid),
+    )
+    const snap = await getDocs(q)
+    for (const d of snap.docs) {
+      const b = d.data() as StandaloneBoardMeta
+      byId.set(b.id || d.id, { ...b, id: b.id || d.id })
     }
+    const list = Array.from(byId.values()).sort(
+      (a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0),
+    )
+    saveLocalBoards(list)
+    return list
+  } catch (err) {
+    handleFsError('whiteboards', err, { expectedUid: uid })
   }
   return loadLocalBoards()
     .filter((b) => b.ownerId === uid || Boolean(b.memberIds?.includes(uid)))
@@ -2445,38 +2635,43 @@ export async function listStandaloneBoards(
 /**
  * Real-time subscription to ONLY standalone whiteboards where `memberIds` contains `uid`.
  * Uses a single-field `array-contains` query and sorts in JavaScript (zero composite indexes).
+ * Never attaches when signed out or before auth resolves, and tears down cleanly on auth change.
  */
 export function subscribeUserWhiteboards(
   uid: string | null,
   onBoards: (boards: StandaloneBoardMeta[]) => void,
 ): Unsubscribe {
-  if (!uid || typeof window === 'undefined') {
-    onBoards([])
-    return () => {}
-  }
-  return subscribeAfterAuth('whiteboards', () => {
-    const q = query(
-      collection(db, 'whiteboards'),
-      where('memberIds', 'array-contains', uid),
-    )
-    return onSnapshot(
-      q,
-      (snap) => {
-        const list = snap.docs
-          .map((d) => {
-            const b = d.data() as StandaloneBoardMeta
-            return { ...b, id: b.id || d.id }
+  return subscribeWithCurrentUser(
+    uid,
+    (verifiedUid, isTornDown) => {
+      const q = query(
+        collection(db, 'whiteboards'),
+        where('memberIds', 'array-contains', verifiedUid),
+      )
+      return onSnapshot(
+        q,
+        (snap) => {
+          if (isTornDown()) return
+          const list = snap.docs
+            .map((d) => {
+              const b = d.data() as StandaloneBoardMeta
+              return { ...b, id: b.id || d.id }
+            })
+            .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+          saveLocalBoards(list)
+          onBoards(list)
+        },
+        (err) => {
+          handleFsError('whiteboards', err, {
+            expectedUid: verifiedUid,
+            isTornDown: isTornDown(),
           })
-          .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
-        saveLocalBoards(list)
-        onBoards(list)
-      },
-      (err) => {
-        handleFsError('whiteboards', err)
-        onBoards([])
-      },
-    )
-  })
+          onBoards([])
+        },
+      )
+    },
+    () => onBoards([]),
+  )
 }
 
 export interface CreateBoardOptions {
@@ -2555,8 +2750,13 @@ export async function updateWhiteboardMeta(
   })
   patchLocalBoardMeta(boardId, payload)
   if (!(await requireAuth())) return
+  const uid = auth.currentUser?.uid
   try {
-    await setDoc(doc(db, 'whiteboards', boardId), payload, { merge: true })
+    await setDoc(
+      doc(db, 'whiteboards', boardId),
+      { ...payload, ...(uid ? { memberIds: arrayUnion(uid) } : {}) },
+      { merge: true },
+    )
   } catch (err) {
     handleFsError(`whiteboards/${boardId}`, err)
   }
@@ -2658,10 +2858,15 @@ export async function renameStandaloneBoard(id: string, title: string) {
   )
   saveLocalBoards(next)
   if (!(await requireAuth())) return
+  const uid = auth.currentUser?.uid
   try {
     await setDoc(
       doc(db, 'whiteboards', id),
-      { title: trimmed, updatedAt: now },
+      {
+        title: trimmed,
+        updatedAt: now,
+        ...(uid ? { memberIds: arrayUnion(uid) } : {}),
+      },
       { merge: true },
     )
   } catch (err) {

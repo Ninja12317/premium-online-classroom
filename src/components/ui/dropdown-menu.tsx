@@ -2,6 +2,7 @@
 
 import * as React from 'react'
 import { cn } from '@/lib/utils'
+import { useFullscreenContainer } from '@/lib/use-fullscreen-container'
 import { CheckIcon, ChevronRightIcon, CircleIcon } from 'lucide-react'
 import * as DropdownMenuPrimitive from '@radix-ui/react-dropdown-menu'
 
@@ -33,10 +34,15 @@ function DropdownMenuTrigger({
 function DropdownMenuContent({
   className,
   sideOffset = 4,
+  container,
   ...props
-}: React.ComponentProps<typeof DropdownMenuPrimitive.Content>) {
+}: React.ComponentProps<typeof DropdownMenuPrimitive.Content> & {
+  container?: HTMLElement | null
+}) {
+  const fullscreenContainer = useFullscreenContainer()
+  const portalContainer = container ?? fullscreenContainer ?? undefined
   return (
-    <DropdownMenuPrimitive.Portal>
+    <DropdownMenuPrimitive.Portal container={portalContainer}>
       <DropdownMenuPrimitive.Content
         data-slot="dropdown-menu-content"
         sideOffset={sideOffset}
@@ -223,10 +229,15 @@ function DropdownMenuSubTrigger({
 
 function DropdownMenuSubContent({
   className,
+  container,
   ...props
-}: React.ComponentProps<typeof DropdownMenuPrimitive.SubContent>) {
+}: React.ComponentProps<typeof DropdownMenuPrimitive.SubContent> & {
+  container?: HTMLElement | null
+}) {
+  const fullscreenContainer = useFullscreenContainer()
+  const portalContainer = container ?? fullscreenContainer ?? undefined
   return (
-    <DropdownMenuPrimitive.Portal>
+    <DropdownMenuPrimitive.Portal container={portalContainer}>
       <DropdownMenuPrimitive.SubContent
         data-slot="dropdown-menu-sub-content"
         className={cn(

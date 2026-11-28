@@ -39,6 +39,7 @@ import { MediaError } from '@/components/media-error'
 import type { ChatMessage } from '@/components/meeting/types'
 import { Whiteboard } from '@/components/meeting/whiteboard/whiteboard'
 import { WhiteboardGallery } from '@/components/meeting/whiteboard/whiteboard-picker'
+import { useBackNavigationGuard } from '@/lib/use-back-navigation-guard'
 import { ScheduleDialog } from '@/components/schedule-dialog'
 import { ThemeToggle } from '@/components/theme-toggle'
 import { Badge } from '@/components/ui/badge'
@@ -872,6 +873,11 @@ export function WhiteboardsTab({
       'Guest'
     : 'Guest'
 
+  const { releaseGuard: releaseBoardBackGuard } = useBackNavigationGuard(
+    activeBoard !== null,
+    'Use the Whiteboards back button to close this board',
+  )
+
   useEffect(() => {
     onFullscreenChange?.(activeBoard !== null)
     return () => onFullscreenChange?.(false)
@@ -879,11 +885,17 @@ export function WhiteboardsTab({
 
   if (activeBoard) {
     return (
-      <div className="flex h-[calc(100svh-5rem)] min-h-[520px] flex-col gap-3">
+      <div
+        className="flex h-[calc(100dvh-5.5rem-env(safe-area-inset-top)-env(safe-area-inset-bottom))] min-h-[420px] flex-col gap-3 overscroll-none overscroll-x-none"
+        style={{ overscrollBehavior: 'none', overscrollBehaviorX: 'none' }}
+      >
         <div className="flex items-center justify-between gap-2">
           <div className="flex min-w-0 items-center gap-2.5">
             <BackButton
-              onClick={() => setActiveBoard(null)}
+              onClick={() => {
+                releaseBoardBackGuard()
+                setActiveBoard(null)
+              }}
               label="Whiteboards"
               className="shrink-0"
             />
@@ -895,7 +907,7 @@ export function WhiteboardsTab({
             Auto-saved
           </Badge>
         </div>
-        <div className="relative min-h-0 flex-1">
+        <div className="relative min-h-0 flex-1 overscroll-none overscroll-x-none">
           <Whiteboard
             canDraw
             isTeacher={role === 'teacher'}

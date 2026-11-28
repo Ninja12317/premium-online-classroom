@@ -18,6 +18,7 @@ import {
   MessageSquare,
   Mic,
   MicOff,
+  Minimize,
   MonitorUp,
   MoreHorizontal,
   PenTool,
@@ -99,6 +100,8 @@ export interface ControlBarProps {
   onReaction: (emoji: string) => void
   onToggleView: () => void
   onSetView?: (view: ViewMode) => void
+  isFullscreen?: boolean
+  portalContainer?: HTMLElement | null
   onFullscreen: () => void
   onSettings: () => void
   onShortcuts: () => void
@@ -204,7 +207,7 @@ export const ControlBar = memo(function ControlBar(p: ControlBarProps) {
       </div>
 
       {/* controls */}
-      <div className="flex flex-1 items-center justify-center gap-1.5 sm:gap-2 md:flex-none">
+      <div className="no-scrollbar flex min-w-0 flex-1 items-center justify-center gap-1.5 overflow-x-auto sm:gap-2 md:flex-none md:overflow-visible">
         <Ctl
           label={p.micOn ? 'Mute' : 'Unmute'}
           shortcut="M"
@@ -244,7 +247,12 @@ export const ControlBar = memo(function ControlBar(p: ControlBarProps) {
               </TooltipTrigger>
               <TooltipContent side="top">Security</TooltipContent>
             </Tooltip>
-            <DropdownMenuContent side="top" align="center" className="w-64">
+            <DropdownMenuContent
+              side="top"
+              align="center"
+              container={p.portalContainer}
+              className="w-64"
+            >
               <DropdownMenuLabel>Security & Permissions</DropdownMenuLabel>
               {p.meetingId && (
                 <>
@@ -413,7 +421,11 @@ export const ControlBar = memo(function ControlBar(p: ControlBarProps) {
               <SmilePlus className={icon} />
             </button>
           </PopoverTrigger>
-          <PopoverContent side="top" className="w-auto p-2">
+          <PopoverContent
+            side="top"
+            container={p.portalContainer}
+            className="w-auto p-2"
+          >
             <ReactionGrid
               onPick={p.onReaction}
               handRaised={p.handRaised}
@@ -471,7 +483,12 @@ export const ControlBar = memo(function ControlBar(p: ControlBarProps) {
             </TooltipTrigger>
             <TooltipContent side="top">View</TooltipContent>
           </Tooltip>
-          <DropdownMenuContent side="top" align="center" className="w-48">
+          <DropdownMenuContent
+            side="top"
+            align="center"
+            container={p.portalContainer}
+            className="w-48"
+          >
             <DropdownMenuLabel>Stage layout</DropdownMenuLabel>
             <DropdownMenuItem onSelect={() => setView('gallery')}>
               <LayoutGrid /> Gallery view
@@ -487,7 +504,8 @@ export const ControlBar = memo(function ControlBar(p: ControlBarProps) {
             </DropdownMenuItem>
             <DropdownMenuSeparator />
             <DropdownMenuItem onSelect={p.onFullscreen}>
-              <Maximize /> Full screen
+              {p.isFullscreen ? <Minimize /> : <Maximize />}
+              {p.isFullscreen ? 'Exit full screen' : 'Full screen'}
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
@@ -508,7 +526,12 @@ export const ControlBar = memo(function ControlBar(p: ControlBarProps) {
             </TooltipTrigger>
             <TooltipContent side="top">More</TooltipContent>
           </Tooltip>
-          <DropdownMenuContent side="top" align="center" className="w-64">
+          <DropdownMenuContent
+            side="top"
+            align="center"
+            container={p.portalContainer}
+            className="w-64"
+          >
             <DropdownMenuLabel className="truncate md:hidden">
               {p.title} · {p.duration}
             </DropdownMenuLabel>
@@ -581,7 +604,8 @@ export const ControlBar = memo(function ControlBar(p: ControlBarProps) {
               {p.view === 'gallery' ? 'Speaker view' : 'Gallery view'}
             </DropdownMenuItem>
             <DropdownMenuItem onSelect={p.onFullscreen}>
-              <Maximize /> Full screen
+              {p.isFullscreen ? <Minimize /> : <Maximize />}
+              {p.isFullscreen ? 'Exit full screen' : 'Full screen'}
             </DropdownMenuItem>
             <DropdownMenuItem onSelect={p.onSettings}>
               <Settings2 /> Audio and video settings
@@ -620,7 +644,7 @@ export const ControlBar = memo(function ControlBar(p: ControlBarProps) {
       </div>
 
       {/* leave */}
-      <div className="flex flex-1 justify-end md:flex-1">
+      <div className="flex shrink-0 justify-end md:flex-1">
         <Button
           variant="destructive"
           className="h-11 gap-2 rounded-xl px-3 sm:h-12 sm:px-5"

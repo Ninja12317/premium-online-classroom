@@ -37,6 +37,7 @@ import {
   saveParticipant,
 } from '@/lib/host-keys'
 import { loadPrefsCached, type JoinPrefs } from '@/lib/prefs'
+import { setActiveStorageUid } from '@/lib/storage-scope'
 import { ensureAuth } from '@/services/firebase'
 import {
   subscribeMeetingDoc,
@@ -76,6 +77,10 @@ function MeetPage() {
     async (p: JoinPrefs, code?: string) => {
       const stored = loadParticipant(meetingId)
       const hostKey = hostKeyRef.current
+      const sessionId =
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
       try {
         const result = await joinMeeting({
           data: {
@@ -85,6 +90,7 @@ function MeetPage() {
             hostKey: hostKey ?? undefined,
             identity: stored?.identity,
             participantKey: stored?.participantKey,
+            sessionId,
           },
         })
         if (result.status === 'joined') {
@@ -133,34 +139,59 @@ function MeetPage() {
 
   // Stable one-time parallel boot keyed ONLY on [meetingId].
   useEffect(() => {
-    const loadedPrefs = loadPrefsCached()
-    const stored = loadParticipant(meetingId)
-    const resolvedName = loadedPrefs.name.trim() || stored?.name?.trim() || ''
-    if (!resolvedName) {
-      void navigate({
-        to: '/join/$meetingId',
-        params: { meetingId },
-        replace: true,
-      })
-      return
-    }
-    const effectivePrefs: JoinPrefs = { ...loadedPrefs, name: resolvedName }
-    prefsRef.current = effectivePrefs
-    hostKeyRef.current = loadHostKey(meetingId)
-    let code: string | undefined
-    try {
-      code =
-        sessionStorage.getItem(`lectern-passcode:${meetingId}`) ?? undefined
-    } catch {
-      // ignore
-    }
-    void Promise.resolve().then(() => {
+    let cancelled = false
+    const boot = async () => {
+      let loadedPrefs = loadPrefsCached()
+      let stored = loadParticipant(meetingId)
+      let resolvedName = loadedPrefs.name.trim() || stored?.name?.trim() || ''
+
+      // On hard refresh, Firebase Auth may not have populated the UID-scoped
+      // storage namespace yet. Wait for auth before deciding to redirect.
+      if (!resolvedName) {
+        try {
+          const user = await ensureAuth()
+          if (cancelled) return
+          setActiveStorageUid(user.uid)
+          loadedPrefs = loadPrefsCached()
+          stored = loadParticipant(meetingId)
+          resolvedName =
+            loadedPrefs.name.trim() || stored?.name?.trim() || ''
+        } catch {
+          if (cancelled) return
+        }
+      }
+
+      if (cancelled) return
+      if (!resolvedName) {
+        void navigate({
+          to: '/join/$meetingId',
+          params: { meetingId },
+          replace: true,
+        })
+        return
+      }
+
+      const effectivePrefs: JoinPrefs = { ...loadedPrefs, name: resolvedName }
+      prefsRef.current = effectivePrefs
+      hostKeyRef.current = loadHostKey(meetingId)
+      let code: string | undefined
+      try {
+        code =
+          sessionStorage.getItem(`lectern-passcode:${meetingId}`) ?? undefined
+      } catch {
+        // ignore
+      }
       setPrefs(effectivePrefs)
-      return Promise.allSettled([
+      await Promise.allSettled([
         ensureAuth(),
         executeJoin(effectivePrefs, code),
       ])
-    })
+    }
+
+    void boot()
+    return () => {
+      cancelled = true
+    }
   }, [meetingId, navigate, executeJoin])
 
   // Scheduled meeting not started yet: attach lightweight Firestore listener
@@ -316,7 +347,7 @@ function MeetPage() {
               ? current.meeting
               : null
         if (!meeting) return current
-        if (reason === 'removed' || reason === 'ended' || reason === 'left') {
+        if (reason === 'removed' || reason === 'ended') {
           clearParticipant(meetingId)
         }
         return { kind: 'left', reason, meeting }
@@ -324,6 +355,24 @@ function MeetPage() {
     },
     [meetingId],
   )
+
+  const handleRejoin = useCallback(() => {
+    const activePrefs = prefsRef.current ?? loadPrefsCached()
+    let code: string | undefined
+    try {
+      code =
+        sessionStorage.getItem(`lectern-passcode:${meetingId}`) ?? undefined
+    } catch {
+      // ignore
+    }
+    joinedIdentityRef.current = null
+    setJoinedConfirmed(false)
+    setPhase({ kind: 'joining' })
+    void Promise.allSettled([
+      ensureAuth(),
+      executeJoin(activePrefs, code),
+    ])
+  }, [meetingId, executeJoin])
 
   if (phase.kind === 'joining' || !prefs) {
     return (
@@ -342,6 +391,7 @@ function MeetPage() {
         reason={phase.reason}
         meeting={phase.meeting}
         meetingId={meetingId}
+        onRejoin={handleRejoin}
       />
     )
   }
@@ -477,12 +527,13 @@ function MeetPage() {
     case 'joined':
       return (
         <LiveMeeting
-          key={result.identity}
+          key={`${result.identity}:${result.sessionId}`}
           iceServers={result.iceServers}
           prefs={prefs}
           meeting={result.meeting}
           role={result.role}
           identity={result.identity}
+          sessionId={result.sessionId}
           actorKey={result.participantKey}
           passcode={hostPasscode}
           onLeft={onLeft}
@@ -496,6 +547,7 @@ interface MeetingProps {
   meeting: MeetingSummary
   role: Role
   identity: string
+  sessionId: string
   actorKey: string
   passcode: string | null
   onLeft: (reason: LeaveReason) => void
@@ -506,12 +558,14 @@ function LiveMeeting({
   prefs,
   meeting,
   role,
+  sessionId,
   ...rest
 }: MeetingProps & { iceServers: IceServer[] }) {
   const adapter = useMeshAdapter({
     meetingId: meeting.meetingId,
     identity: rest.identity,
     participantKey: rest.actorKey,
+    sessionId,
     name: prefs.name,
     role,
     prefs,
@@ -546,10 +600,12 @@ function LeftScreen({
   reason,
   meeting,
   meetingId,
+  onRejoin,
 }: {
   reason: LeaveReason
   meeting: MeetingSummary
   meetingId: string
+  onRejoin: () => void
 }) {
   const copy: Record<
     LeaveReason,
@@ -592,13 +648,18 @@ function LeftScreen({
     <Screen icon={c.icon} title={c.title} subtitle={c.subtitle}>
       <div className="flex flex-wrap justify-center gap-2">
         {c.rejoin && (
-          <Button asChild>
-            <Link to="/join/$meetingId" params={{ meetingId }}>
+          <>
+            <Button type="button" onClick={onRejoin}>
               Rejoin
-            </Link>
-          </Button>
+            </Button>
+            <Button asChild variant="outline">
+              <Link to="/join/$meetingId" params={{ meetingId }}>
+                Audio &amp; video setup
+              </Link>
+            </Button>
+          </>
         )}
-        <Button asChild variant={c.rejoin ? 'outline' : 'default'}>
+        <Button asChild variant={c.rejoin ? 'ghost' : 'default'}>
           <Link to="/">Go home</Link>
         </Button>
       </div>

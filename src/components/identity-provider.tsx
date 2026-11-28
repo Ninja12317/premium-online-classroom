@@ -37,8 +37,11 @@ import {
 import {
   analyticsPromise,
   auth,
+  beginAuthTransition,
   clearCachedClientUid,
+  endAuthTransition,
   resetAuthInit,
+  resetFirestoreNotice,
 } from '@/services/firebase'
 import { clearLocalMeetingCaches } from '@/services/firestore-meetings'
 import {
@@ -249,6 +252,7 @@ export function IdentityProvider({ children }: { children: ReactNode }) {
       setUser(mapped)
       setClientUid(fbUser.uid)
       setAuthStatus('authenticated')
+      resetFirestoreNotice()
       return mapped
     },
     [resetAllProfileMemory],
@@ -260,6 +264,7 @@ export function IdentityProvider({ children }: { children: ReactNode }) {
     setUser(null)
     setClientUid('')
     setAuthStatus('loggedOut')
+    resetFirestoreNotice()
   }, [])
 
   const refresh = useCallback(async () => {
@@ -294,23 +299,34 @@ export function IdentityProvider({ children }: { children: ReactNode }) {
 
   const signInAccount = useCallback(
     async (email: string, password: string): Promise<LecternUser> => {
-      resetAllProfileMemory()
-      const cred = await signInWithEmailAndPassword(auth, email.trim(), password)
-      return hydrateRegisteredUser(cred.user)
+      beginAuthTransition()
+      try {
+        resetAllProfileMemory()
+        const cred = await signInWithEmailAndPassword(
+          auth,
+          email.trim(),
+          password,
+        )
+        return await hydrateRegisteredUser(cred.user)
+      } finally {
+        endAuthTransition()
+      }
     },
     [hydrateRegisteredUser, resetAllProfileMemory],
   )
 
   const registerAccount = useCallback(
     async (input: RegisterAccountInput): Promise<LecternUser> => {
-      resetAllProfileMemory()
-      const cleanName = input.fullName.trim()
-      const cleanEmail = input.email.trim()
-      const cred = await createUserWithEmailAndPassword(
-        auth,
-        cleanEmail,
-        input.password,
-      )
+      beginAuthTransition()
+      try {
+        resetAllProfileMemory()
+        const cleanName = input.fullName.trim()
+        const cleanEmail = input.email.trim()
+        const cred = await createUserWithEmailAndPassword(
+          auth,
+          cleanEmail,
+          input.password,
+        )
       if (cleanName) {
         await updateProfile(cred.user, { displayName: cleanName })
       }
@@ -364,10 +380,14 @@ export function IdentityProvider({ children }: { children: ReactNode }) {
         classOrRollNo: userDoc.classOrRollNo,
         pmi,
       }
-      setUser(mapped)
-      setClientUid(cred.user.uid)
-      setAuthStatus('authenticated')
-      return mapped
+        setUser(mapped)
+        setClientUid(cred.user.uid)
+        setAuthStatus('authenticated')
+        resetFirestoreNotice()
+        return mapped
+      } finally {
+        endAuthTransition()
+      }
     },
     [resetAllProfileMemory],
   )
@@ -382,6 +402,7 @@ export function IdentityProvider({ children }: { children: ReactNode }) {
     async (displayNameInput?: string): Promise<LecternUser> => {
       const cleanName = (displayNameInput ?? '').trim() || 'Guest'
       pendingGuestNameRef.current = cleanName
+      beginAuthTransition()
       try {
         const existingAnon =
           auth.currentUser &&
@@ -435,9 +456,11 @@ export function IdentityProvider({ children }: { children: ReactNode }) {
         setUser(mapped)
         setClientUid(fbUser.uid)
         setAuthStatus('guest')
+        resetFirestoreNotice()
         return mapped
       } finally {
         pendingGuestNameRef.current = null
+        endAuthTransition()
       }
     },
     [resetAllProfileMemory],
@@ -546,19 +569,24 @@ export function IdentityProvider({ children }: { children: ReactNode }) {
 
   const signOut = useCallback(async () => {
     const prevUid = auth.currentUser?.uid ?? lastUidRef.current
-    resetAuthInit()
+    beginAuthTransition()
     try {
-      await firebaseSignOut(auth)
-    } catch {
-      // Continue clearing local state even if offline
+      resetAuthInit()
+      try {
+        await firebaseSignOut(auth)
+      } catch {
+        // Continue clearing local state even if offline
+      }
+      clearGuestSession()
+      clearScopedHostKeys(prevUid)
+      clearProfile()
+      clearPrefs()
+      clearCachedClientUid()
+      resetAllProfileMemory()
+      applyLoggedOutState()
+    } finally {
+      endAuthTransition()
     }
-    clearGuestSession()
-    clearScopedHostKeys(prevUid)
-    clearProfile()
-    clearPrefs()
-    clearCachedClientUid()
-    resetAllProfileMemory()
-    applyLoggedOutState()
   }, [applyLoggedOutState, resetAllProfileMemory])
 
   useEffect(() => {

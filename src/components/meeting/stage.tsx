@@ -173,11 +173,11 @@ export function Stage({
         <div className="absolute inset-0 h-full w-full overflow-hidden">
           {main.node}
           {/* Picture-in-Picture active speaker video strip over Whiteboard */}
-          <div className="pointer-events-auto absolute bottom-3 left-3 z-20 flex flex-col items-start gap-1.5">
+          <div className="pointer-events-auto absolute bottom-16 left-3 z-20 flex flex-col items-start gap-1.5 sm:bottom-3">
             <button
               type="button"
               onClick={() => setPipVisible((v) => !v)}
-              className="flex items-center gap-1.5 rounded-lg border border-border bg-card/95 px-2.5 py-1 text-xs font-medium text-card-foreground shadow-md backdrop-blur hover:bg-muted"
+              className="flex min-h-9 items-center gap-1.5 rounded-lg border border-border bg-card/95 px-2.5 py-1 text-xs font-medium text-card-foreground shadow-md backdrop-blur hover:bg-muted sm:min-h-0"
             >
               {pipVisible ? (
                 <>
@@ -191,11 +191,11 @@ export function Stage({
             </button>
             {pipVisible && (
               <div
-                className="flex max-w-[calc(100vw-16rem)] items-center gap-2 overflow-x-auto rounded-xl border border-border bg-stage/90 p-1.5 shadow-lg backdrop-blur"
+                className="no-scrollbar flex max-w-[calc(100vw-1.5rem)] items-center gap-2 overflow-x-auto rounded-xl border border-border bg-stage/90 p-1.5 shadow-lg backdrop-blur sm:max-w-[calc(100vw-16rem)]"
                 aria-label="Other participants"
               >
                 {pipTiles.map((tile) => (
-                  <div key={tile.id} className="w-40 shrink-0 sm:w-44">
+                  <div key={tile.id} className="w-36 shrink-0 sm:w-44">
                     <ParticipantTile
                       tile={tile}
                       video={renderVideo(tile)}

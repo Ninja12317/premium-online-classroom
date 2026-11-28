@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import type { DeviceSelection } from '@/components/device-settings'
 import type { IceServer, MeetingSettings, Role } from '@/lib/meeting-types'
@@ -19,7 +19,7 @@ import { useSpeaking } from '@/lib/use-speaking'
 import type { DisconnectCause, RoomAdapter, RoomState } from './adapter'
 import type { TileModel } from './types'
 
-function StreamVideo({
+const StreamVideo = memo(function StreamVideo({
   stream,
   contain,
   mirror,
@@ -47,10 +47,10 @@ function StreamVideo({
         .join(' ')}
     />
   )
-}
+})
 
 /** Plays a remote audio stream, honouring the chosen speaker when supported. */
-function StreamAudio({
+const StreamAudio = memo(function StreamAudio({
   stream,
   sinkId,
 }: {
@@ -75,12 +75,13 @@ function StreamAudio({
     el.setSinkId(sinkId).catch(() => {})
   }, [sinkId])
   return <audio ref={ref} autoPlay />
-}
+})
 
 export interface MeshAdapterOptions {
   meetingId: string
   identity: string
   participantKey: string
+  sessionId?: string
   name: string
   role: Role
   prefs: JoinPrefs
@@ -125,6 +126,7 @@ export function useMeshAdapter(opts: MeshAdapterOptions): RoomAdapter & {
     () =>
       new MeshRoom({
         identity,
+        sessionId: opts.sessionId,
         name,
         role,
         iceServers: opts.iceServers,
@@ -156,16 +158,27 @@ export function useMeshAdapter(opts: MeshAdapterOptions): RoomAdapter & {
       }),
   )
 
-  // StrictMode-safe lifecycle: only depends on [room] (tied to meetingId+identity).
-  // Never calls leaveRoom() on unmount; only leaves on explicit Leave click or beforeunload.
+  const stopMediaRef = useRef(() => {})
+  useEffect(() => {
+    stopMediaRef.current = () => {
+      media.stopAllTracks()
+      share.stop()
+    }
+  }, [media, share])
+
+  // StrictMode-safe lifecycle: only depends on [room] (tied to meetingId+identity+sessionId).
+  // Complete teardown runs on explicit leave, pagehide, and beforeunload.
   useEffect(() => {
     room.start()
-    const onBeforeUnload = () => {
+    const onUnload = () => {
+      stopMediaRef.current()
       void room.stop('left')
     }
-    window.addEventListener('beforeunload', onBeforeUnload)
+    window.addEventListener('pagehide', onUnload)
+    window.addEventListener('beforeunload', onUnload)
     return () => {
-      window.removeEventListener('beforeunload', onBeforeUnload)
+      window.removeEventListener('pagehide', onUnload)
+      window.removeEventListener('beforeunload', onUnload)
       room.pause()
     }
   }, [room])
@@ -337,6 +350,18 @@ export function useMeshAdapter(opts: MeshAdapterOptions): RoomAdapter & {
     [room],
   )
 
+  const setMicOn = useCallback(async (on: boolean) => setMic(on), [])
+  const setCamOn = useCallback(async (on: boolean) => setCam(on), [])
+  const stopShare = useCallback(async () => share.stop(), [share])
+  const setDevices = useCallback(
+    async (next: DeviceSelection) => setSelection(next),
+    [],
+  )
+  const leave = useCallback(async () => {
+    stopMediaRef.current()
+    await room.stop('left')
+  }, [room])
+
   const state: RoomState = room.status
   const disconnectCause: DisconnectCause =
     room.cause === 'left' ? null : room.cause
@@ -356,15 +381,15 @@ export function useMeshAdapter(opts: MeshAdapterOptions): RoomAdapter & {
     camOn: camOn && media.hasVideo,
     blurOn,
     setBlurOn,
-    setMicOn: async (on) => setMic(on),
-    setCamOn: async (on) => setCam(on),
+    setMicOn,
+    setCamOn,
     sharing,
     shareSupported: share.supported,
     startShare: share.start,
-    stopShare: async () => share.stop(),
+    stopShare,
     devices: media.devices,
     selection,
-    setDevices: async (next) => setSelection(next),
+    setDevices,
     micTrack,
     mediaError: media.error,
     quality: room.status === 'reconnecting' ? 'lost' : localQuality,
@@ -377,8 +402,6 @@ export function useMeshAdapter(opts: MeshAdapterOptions): RoomAdapter & {
     subscribe,
     handRaised,
     setHand: setHandRaised,
-    leave: async () => {
-      await room.stop('left')
-    },
+    leave,
   }
 }

@@ -2,6 +2,7 @@
 
 import * as React from 'react'
 import { cn } from '@/lib/utils'
+import { useFullscreenContainer } from '@/lib/use-fullscreen-container'
 import * as PopoverPrimitive from '@radix-ui/react-popover'
 
 function Popover({
@@ -20,10 +21,15 @@ function PopoverContent({
   className,
   align = 'center',
   sideOffset = 4,
+  container,
   ...props
-}: React.ComponentProps<typeof PopoverPrimitive.Content>) {
+}: React.ComponentProps<typeof PopoverPrimitive.Content> & {
+  container?: HTMLElement | null
+}) {
+  const fullscreenContainer = useFullscreenContainer()
+  const portalContainer = container ?? fullscreenContainer ?? undefined
   return (
-    <PopoverPrimitive.Portal>
+    <PopoverPrimitive.Portal container={portalContainer}>
       <PopoverPrimitive.Content
         data-slot="popover-content"
         align={align}

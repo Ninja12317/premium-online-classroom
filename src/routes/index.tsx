@@ -193,13 +193,17 @@ function HomeDashboard() {
     return () => window.clearInterval(t)
   }, [])
 
-  const activeProfileUid =
+  const candidateProfileUid =
     ready && (authStatus === 'authenticated' || authStatus === 'guest')
       ? clientUid || user?.id || null
       : null
+  const activeProfileUid =
+    candidateProfileUid && auth.currentUser?.uid === candidateProfileUid
+      ? candidateProfileUid
+      : null
 
   const refreshMeetings = useCallback(async () => {
-    if (!activeProfileUid) {
+    if (!activeProfileUid || auth.currentUser?.uid !== activeProfileUid) {
       setMeetings([])
       setLoadingMeetings(false)
       return
@@ -223,7 +227,8 @@ function HomeDashboard() {
     setLoadingMeetings(Boolean(activeProfileUid))
   }
 
-  // Real-time UID-scoped Firestore listener: immediately clears on logout or UID switch
+  // Real-time UID-scoped Firestore listener: never attaches before auth resolves
+  // or while signed out, and immediately unsubscribes on sign-out / UID switch.
   useEffect(() => {
     if (!ready || !activeProfileUid) return
     const unsub = subscribeUserMeetings(activeProfileUid, (list) => {
@@ -399,8 +404,8 @@ function HomeDashboard() {
     <div
       className={
         whiteboardFullscreen
-          ? 'min-h-svh bg-background'
-          : 'min-h-svh bg-background pb-24 md:pb-0'
+          ? 'min-h-dvh bg-background'
+          : 'min-h-dvh bg-background pb-[calc(6rem+env(safe-area-inset-bottom))] md:pb-0'
       }
     >
       <SiteHeader activeTab={activeTab} onTabChange={handleTabChange} />

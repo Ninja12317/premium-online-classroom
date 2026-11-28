@@ -5,9 +5,9 @@ import { generateMeetingId, isModernMeetingId } from '@/lib/meeting'
 import type { AvailabilityStatus } from '@/lib/profile'
 import {
   db,
-  ensureAuth,
   isPermissionDeniedError,
   reportFirestorePermissionError,
+  waitForAuthReady,
 } from '@/services/firebase'
 
 export type AccountRole = 'teacher' | 'student'
@@ -35,7 +35,8 @@ export async function getUserAccountDoc(
 ): Promise<FirestoreUserDoc | null> {
   if (!uid || typeof window === 'undefined') return null
   try {
-    await ensureAuth()
+    const currentUser = await waitForAuthReady()
+    if (!currentUser || currentUser.uid !== uid) return null
     const ref = doc(db, 'users', uid)
     const snap = await getDoc(ref)
     if (!snap.exists()) return null
@@ -73,7 +74,7 @@ export async function getUserAccountDoc(
     }
   } catch (err) {
     if (isPermissionDeniedError(err)) {
-      reportFirestorePermissionError(`users/${uid}`, err)
+      reportFirestorePermissionError(`users/${uid}`, err, { expectedUid: uid })
     }
     return null
   }
@@ -86,7 +87,8 @@ export async function saveUserAccountDoc(
 ): Promise<void> {
   if (!uid || typeof window === 'undefined') return
   try {
-    await ensureAuth()
+    const currentUser = await waitForAuthReady()
+    if (!currentUser || currentUser.uid !== uid) return
     const clean = stripUndefinedDeep({
       ...data,
       uid,
@@ -95,7 +97,7 @@ export async function saveUserAccountDoc(
     await setDoc(doc(db, 'users', uid), clean, { merge: true })
   } catch (err) {
     if (isPermissionDeniedError(err)) {
-      reportFirestorePermissionError(`users/${uid}`, err)
+      reportFirestorePermissionError(`users/${uid}`, err, { expectedUid: uid })
     }
   }
 }

@@ -11,16 +11,22 @@ class FakePC {
   remoteDescription: { type: string; sdp: string } | null = null
   signalingState = 'stable'
   connectionState = 'new'
+  iceConnectionState = 'new'
   iceGatheringState = 'gathering'
+  restartIceCalls = 0
   addedIceCandidates: RTCIceCandidateInit[] = []
   transceivers: { sender: { replaceTrack: () => Promise<void> } }[] = []
   onicecandidate: ((ev: unknown) => void) | null = null
+  oniceconnectionstatechange: (() => void) | null = null
   onconnectionstatechange: (() => void) | null = null
   ontrack: ((ev: unknown) => void) | null = null
   dc: FakeDC | null = null
   constructor(config?: RTCConfiguration) {
     this.config = config
     FakePC.instances.push(this)
+  }
+  restartIce() {
+    this.restartIceCalls += 1
   }
   createDataChannel() {
     this.dc = new FakeDC()
@@ -422,6 +428,160 @@ describe('MeshRoom', () => {
     await flush()
     expect(room.peers.has('a-teacher')).toBe(false)
     expect(FakePC.instances[0].connectionState).toBe('closed')
+    await room.stop()
+  })
+
+  it('generates a fresh UUID sessionId per instance and tears down completely on stop()', async () => {
+    const unsubSignals = vi.fn()
+    const unsubParticipants = vi.fn()
+    const leave = vi.fn(async () => ({ ok: true }))
+    const sync = vi.fn(async () =>
+      ok({
+        peers: [
+          { identity: 'b-student', session: 's1', name: 'Sam', role: 'student' },
+        ],
+      }),
+    )
+    const room1 = new MeshRoom({
+      identity: 'a-host',
+      name: 'Teacher',
+      role: 'host',
+      iceServers: [],
+      initialSettings: ok().settings,
+      sync: sync as never,
+      leave,
+      subscribeSignals: () => unsubSignals,
+      subscribeParticipants: () => unsubParticipants,
+      onChange: vi.fn(),
+      onMessage: vi.fn(),
+    })
+    const room2 = new MeshRoom({
+      identity: 'a-host',
+      name: 'Teacher',
+      role: 'host',
+      iceServers: [],
+      initialSettings: ok().settings,
+      sync: sync as never,
+      leave,
+      onChange: vi.fn(),
+      onMessage: vi.fn(),
+    })
+    expect(room1.sessionId).not.toBe(room2.sessionId)
+    expect(room1.sessionId.length).toBeGreaterThanOrEqual(20)
+
+    room1.setLocalTracks({
+      mic: { kind: 'audio' } as MediaStreamTrack,
+      cam: { kind: 'video' } as MediaStreamTrack,
+      screen: null,
+      screenAudio: null,
+    })
+    room1.start()
+    await flush()
+    expect(FakePC.instances).toHaveLength(1)
+    expect(room1.peers.size).toBe(1)
+
+    await room1.stop('left')
+    expect(FakePC.instances[0].connectionState).toBe('closed')
+    expect(unsubSignals).toHaveBeenCalledTimes(1)
+    expect(unsubParticipants).toHaveBeenCalledTimes(1)
+    expect(leave).toHaveBeenCalledTimes(1)
+    expect(room1.peers.size).toBe(0)
+    expect(room1.localTracks).toEqual({
+      mic: null,
+      cam: null,
+      screen: null,
+      screenAudio: null,
+    })
+  })
+
+  it('tears down stale RTCPeerConnection and renegotiates when a remote peer rejoins with a new sessionId', async () => {
+    let pushParticipants:
+      | ((u: {
+          peers: import('@/lib/meeting-types').PeerInfo[]
+          waiting: import('@/lib/meeting-types').WaitingParticipant[]
+          leftIds: string[]
+        }) => void)
+      | null = null
+    const sentSignals: { kind: string; to: string; toSession: string }[] = []
+    const sync = vi.fn(async () => ok())
+    const room = new MeshRoom({
+      identity: 'a-host',
+      name: 'Teacher',
+      role: 'host',
+      iceServers: [],
+      initialSettings: ok().settings,
+      sync: sync as never,
+      leave: vi.fn(async () => ({ ok: true })),
+      sendSignal: async (_sid, sig) => {
+        sentSignals.push(sig)
+      },
+      subscribeParticipants: (cb) => {
+        pushParticipants = cb
+        return () => {}
+      },
+      onChange: vi.fn(),
+      onMessage: vi.fn(),
+    })
+    room.start()
+    await flush()
+
+    // Initial peer session
+    pushParticipants!({
+      peers: [{ identity: 'b-student', session: 'sess-old', name: 'Sam', role: 'student' }],
+      waiting: [],
+      leftIds: [],
+    })
+    await flush()
+    expect(FakePC.instances).toHaveLength(1)
+    const firstPc = FakePC.instances[0]
+    firstPc.dc!.open()
+    expect(room.peers.get('b-student')?.link).toBe('connected')
+
+    // Peer rejoins with a brand-new sessionId
+    pushParticipants!({
+      peers: [{ identity: 'b-student', session: 'sess-new', name: 'Sam', role: 'student' }],
+      waiting: [],
+      leftIds: [],
+    })
+    await flush()
+    expect(firstPc.connectionState).toBe('closed')
+    expect(FakePC.instances).toHaveLength(2)
+    expect(
+      sentSignals.some(
+        (s) => s.kind === 'offer' && s.to === 'b-student' && s.toSession === 'sess-new',
+      ),
+    ).toBe(true)
+    await room.stop()
+  })
+
+  it('calls restartIce() on disconnected peer connections and rebuilds if unrecovered', async () => {
+    const sync = vi.fn(async () =>
+      ok({
+        peers: [
+          { identity: 'b-student', session: 's1', name: 'Sam', role: 'student' },
+        ],
+      }),
+    )
+    const { room } = makeRoom(sync, 'a-host')
+    room.start()
+    await flush()
+    expect(FakePC.instances).toHaveLength(1)
+    const pc1 = FakePC.instances[0]
+    pc1.connectionState = 'connected'
+    pc1.dc!.open()
+    expect(room.peers.get('b-student')?.quality).toBe('good')
+
+    // Simulate network drop -> disconnected triggers restartIce() immediately
+    pc1.connectionState = 'disconnected'
+    pc1.onconnectionstatechange?.()
+    expect(pc1.restartIceCalls).toBe(1)
+    expect(room.peers.get('b-student')?.quality).toBe('lost')
+
+    // If still disconnected after recovery grace (3s), stale PC closes and a fresh PC opens
+    await vi.advanceTimersByTimeAsync(3100)
+    await flush()
+    expect(pc1.connectionState).toBe('closed')
+    expect(FakePC.instances).toHaveLength(2)
     await room.stop()
   })
 })

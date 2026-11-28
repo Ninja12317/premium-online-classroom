@@ -44,6 +44,11 @@ import {
   updateSettings,
 } from '@/lib/meetings.functions'
 import type { RealtimeMessage } from '@/lib/realtime'
+import {
+  toggleDocumentFullscreen,
+  useFullscreenContainer,
+} from '@/lib/use-fullscreen-container'
+import { useBackNavigationGuard } from '@/lib/use-back-navigation-guard'
 import { useHotkeys } from '@/lib/use-hotkeys'
 import { useTabRecorder } from '@/lib/use-tab-recorder'
 import {
@@ -883,7 +888,13 @@ export function MeetingRoom({
     toast.success('All students muted')
   }
 
+  const { releaseGuard: releaseBackGuard } = useBackNavigationGuard(
+    true,
+    'Use Leave to exit the class',
+  )
+
   const leave = async () => {
+    releaseBackGuard()
     setLeaveOpen(false)
     await adapter.leave()
     onLeft('left')
@@ -896,27 +907,53 @@ export function MeetingRoom({
       toast.error(errorMessage(err, 'Could not end the class.'))
       return
     }
+    releaseBackGuard()
     adapter.send({ t: 'ended' })
     await new Promise((r) => window.setTimeout(r, 150))
     await adapter.leave()
     onLeft('ended')
   }
 
-  const copyLink = () => {
-    void navigator.clipboard
-      .writeText(meetingUrl(meeting.meetingId))
-      .then(() => toast.success('Invite link copied'))
-  }
+  const copyLink = useCallback(() => {
+    const url = meetingUrl(meeting.meetingId)
+    const fallbackCopy = () => {
+      try {
+        const ta = document.createElement('textarea')
+        ta.value = url
+        ta.setAttribute('readonly', '')
+        ta.style.position = 'fixed'
+        ta.style.opacity = '0'
+        document.body.appendChild(ta)
+        ta.select()
+        const ok = document.execCommand('copy')
+        document.body.removeChild(ta)
+        if (ok) {
+          toast.success('Invite link copied')
+          return
+        }
+      } catch {
+        // fall through
+      }
+      toast.error('Could not copy invite link. Copy the address bar URL.')
+    }
+    if (navigator.clipboard?.writeText) {
+      void navigator.clipboard
+        .writeText(url)
+        .then(() => toast.success('Invite link copied'))
+        .catch(fallbackCopy)
+    } else {
+      fallbackCopy()
+    }
+  }, [meeting.meetingId])
 
-  const toggleFullscreen = () => {
-    const el = rootRef.current
-    if (!el) return
-    if (document.fullscreenElement) void document.exitFullscreen()
-    else
-      void el
-        .requestFullscreen?.()
-        .catch(() => toast('Full screen is not available here.'))
-  }
+  const fullscreenContainer = useFullscreenContainer()
+  const isFullscreen = Boolean(fullscreenContainer)
+
+  const toggleFullscreen = useCallback(() => {
+    void toggleDocumentFullscreen().then((ok) => {
+      if (!ok) toast('Full screen is not available here.')
+    })
+  }, [])
 
   // ---- local recording saved to IndexedDB Recordings tab --------------------
   const recorder = useTabRecorder(adapter.micTrack, {
@@ -987,6 +1024,7 @@ export function MeetingRoom({
         toggleCaptions,
         toggleHand,
         cycleView,
+        toggleFullscreen,
         openPanel,
         canDraw,
         isModerator,
@@ -1239,7 +1277,11 @@ export function MeetingRoom({
   )
 
   return (
-    <div ref={rootRef} className="flex h-svh flex-col bg-stage text-foreground">
+    <div
+      ref={rootRef}
+      className="safe-top flex h-dvh w-full flex-col overscroll-none overscroll-x-none bg-stage text-foreground"
+      style={{ overscrollBehavior: 'none', overscrollBehaviorX: 'none' }}
+    >
       {adapter.audioNode}
 
       {/* banners */}
@@ -1279,7 +1321,7 @@ export function MeetingRoom({
         </Banner>
       )}
       {recordingOn && (
-        <div className="pointer-events-none absolute left-1/2 top-3 z-20 flex -translate-x-1/2 items-center gap-1.5 rounded-full bg-black/60 px-3 py-1 text-xs font-medium text-white backdrop-blur md:hidden">
+        <div className="pointer-events-none absolute left-1/2 top-[calc(env(safe-area-inset-top)+0.75rem)] z-20 flex -translate-x-1/2 items-center gap-1.5 rounded-full bg-black/60 px-3 py-1 text-xs font-medium text-white backdrop-blur md:hidden">
           <Circle className="size-2 fill-live text-live animate-pulse-dot" />{' '}
           Recording
         </div>
@@ -1307,7 +1349,7 @@ export function MeetingRoom({
               role="region"
               aria-live="polite"
               aria-label="Live captions"
-              className="pointer-events-none absolute bottom-4 left-1/2 z-20 max-w-2xl -translate-x-1/2 rounded-xl bg-black/75 px-4 py-2 text-center text-sm text-white shadow-lg backdrop-blur"
+              className="pointer-events-none absolute bottom-4 left-1/2 z-20 w-max max-w-[calc(100%-2rem)] -translate-x-1/2 rounded-xl bg-black/75 px-4 py-2 text-center text-sm text-white shadow-lg backdrop-blur sm:max-w-2xl"
             >
               {captionLine ? (
                 <span>
@@ -1335,7 +1377,8 @@ export function MeetingRoom({
         <Sheet open={!!panel} onOpenChange={(open) => !open && setPanel(null)}>
           <SheetContent
             side="right"
-            className="w-full p-0 sm:max-w-md [&>button]:hidden"
+            container={fullscreenContainer}
+            className="safe-top safe-bottom w-full p-0 sm:max-w-md [&>button]:hidden"
           >
             <SheetTitle className="sr-only">Meeting panel</SheetTitle>
             <SheetDescription className="sr-only">
@@ -1387,6 +1430,8 @@ export function MeetingRoom({
         onReaction={sendReaction}
         onToggleView={cycleView}
         onSetView={setView}
+        isFullscreen={isFullscreen}
+        portalContainer={fullscreenContainer}
         onFullscreen={toggleFullscreen}
         onSettings={() => setSettingsOpen(true)}
         onShortcuts={() => setShortcutsOpen(true)}

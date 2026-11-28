@@ -1,5 +1,6 @@
 import {
   Calendar,
+  Download,
   Film,
   Home,
   MessageSquare,
@@ -11,6 +12,8 @@ import { Brand } from '@/components/brand'
 import { useIdentity } from '@/components/identity-provider'
 import { ProfileMenu } from '@/components/profile-menu'
 import { ThemeToggle } from '@/components/theme-toggle'
+import { Button } from '@/components/ui/button'
+import { usePWAInstall } from '@/lib/use-pwa-install'
 import { cn } from '@/lib/utils'
 
 export type DashboardTab =
@@ -42,17 +45,18 @@ export function SiteHeader({
   onTabChange?: (tab: DashboardTab) => void
 }) {
   const { ready } = useIdentity()
+  const { isInstallable, promptInstall } = usePWAInstall()
 
   return (
-    <header className="sticky top-0 z-30 border-b border-border/60 bg-background/85 backdrop-blur supports-[backdrop-filter]:bg-background/70">
+    <header className="safe-top sticky top-0 z-30 border-b border-border/60 bg-background/85 backdrop-blur supports-[backdrop-filter]:bg-background/70">
       <div className="mx-auto flex h-14 max-w-content items-center justify-between gap-2 px-4 sm:px-6">
         <Brand />
 
-        {/* Desktop navigation bar (hidden on mobile < 768px) */}
+        {/* Desktop & tablet navigation bar (hidden on mobile < 768px) */}
         {onTabChange && (
           <nav
             aria-label="Primary navigation"
-            className="hidden items-center gap-0.5 rounded-xl bg-muted/70 p-1 md:flex"
+            className="no-scrollbar hidden min-w-0 items-center gap-0.5 overflow-x-auto rounded-xl bg-muted/70 p-1 md:flex"
           >
             {DASHBOARD_NAV_ITEMS.map((item) => {
               const active = activeTab === item.id
@@ -63,13 +67,13 @@ export function SiteHeader({
                   onClick={() => onTabChange(item.id)}
                   aria-current={active ? 'page' : undefined}
                   className={cn(
-                    'flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors motion-reduce:transition-none lg:px-3 lg:text-sm',
+                    'flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-2 py-1.5 text-xs font-medium transition-colors motion-reduce:transition-none lg:px-3 lg:text-sm',
                     active
                       ? 'bg-card text-foreground shadow-xs'
                       : 'text-muted-foreground hover:text-foreground',
                   )}
                 >
-                  <item.icon className="size-4 shrink-0" />
+                  <item.icon className="hidden size-4 shrink-0 lg:block" />
                   <span>{item.label}</span>
                 </button>
               )
@@ -77,7 +81,20 @@ export function SiteHeader({
           </nav>
         )}
 
-        <nav className="flex items-center gap-1" aria-label="Account">
+        <nav className="flex shrink-0 items-center gap-1" aria-label="Account">
+          {isInstallable && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              aria-label="Install App"
+              onClick={() => void promptInstall()}
+              className="hidden h-9 gap-1.5 rounded-full border-primary/30 bg-primary/8 px-2.5 text-xs font-medium text-primary hover:bg-primary/14 sm:inline-flex xl:px-3"
+            >
+              <Download className="size-3.5 shrink-0" />
+              <span className="sm:inline md:hidden xl:inline">Install App</span>
+            </Button>
+          )}
           <ThemeToggle />
           {!ready ? (
             <span className="ml-1 h-9 w-9 animate-pulse rounded-full bg-muted sm:w-24" />

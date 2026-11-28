@@ -2,6 +2,7 @@
 
 import * as React from 'react'
 import { cn } from '@/lib/utils'
+import { useFullscreenContainer } from '@/lib/use-fullscreen-container'
 import * as TooltipPrimitive from '@radix-ui/react-tooltip'
 
 function TooltipProvider({
@@ -33,10 +34,15 @@ function TooltipContent({
   className,
   sideOffset = 0,
   children,
+  container,
   ...props
-}: React.ComponentProps<typeof TooltipPrimitive.Content>) {
+}: React.ComponentProps<typeof TooltipPrimitive.Content> & {
+  container?: HTMLElement | null
+}) {
+  const fullscreenContainer = useFullscreenContainer()
+  const portalContainer = container ?? fullscreenContainer ?? undefined
   return (
-    <TooltipPrimitive.Portal>
+    <TooltipPrimitive.Portal container={portalContainer}>
       <TooltipPrimitive.Content
         data-slot="tooltip-content"
         sideOffset={sideOffset}

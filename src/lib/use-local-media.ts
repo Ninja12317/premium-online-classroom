@@ -239,6 +239,19 @@ export function useLocalMedia(options: LocalMediaOptions) {
     }
   }, [])
 
+  const stopAllTracks = useCallback(() => {
+    for (const track of streamRef.current?.getTracks() ?? []) {
+      try {
+        track.stop()
+      } catch {
+        // ignore
+      }
+    }
+    streamRef.current = null
+    setHasVideo(false)
+    setStream(null)
+  }, [])
+
   // Release hardware when the screen unmounts.
   useEffect(() => {
     return () => {
@@ -255,6 +268,7 @@ export function useLocalMedia(options: LocalMediaOptions) {
     pending,
     supported,
     refreshDevices,
+    stopAllTracks,
   }
 }
 

@@ -93,6 +93,16 @@ import {
   upsertWhiteboardElement,
   upsertWhiteboardElementsBatch,
 } from '@/services/firestore-meetings'
+import {
+  INTERNAL_CLIPBOARD_MIME,
+  PASTE_OFFSET_PX,
+  cloneBoardElementsWithOffset,
+  compressImageBlobForBoard,
+  computeWrappedTextMetrics,
+  extractPastedImageBlobs,
+  extractPastedText,
+  isEditableEventTarget,
+} from './clipboard-utils'
 import { newPage, type WbOp, type WbPage } from './engine'
 import { FramesSidebar } from './frames-sidebar'
 import {
@@ -276,30 +286,10 @@ function getHandlePositions(
 }
 
 async function compressImageFile(
-  file: File,
+  file: Blob,
 ): Promise<{ dataUrl: string; width: number; height: number }> {
-  const rawUrl = await new Promise<string>((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => resolve(String(reader.result))
-    reader.onerror = () => reject(new Error('Could not read image'))
-    reader.readAsDataURL(file)
-  })
-  const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-    const el = new Image()
-    el.onload = () => resolve(el)
-    el.onerror = () => reject(new Error('Could not decode image'))
-    el.src = rawUrl
-  })
-  const maxDim = 960
-  const scale = Math.min(1, maxDim / Math.max(img.width, img.height))
-  const w = Math.max(1, Math.round(img.width * scale))
-  const h = Math.max(1, Math.round(img.height * scale))
-  const canvas = document.createElement('canvas')
-  canvas.width = w
-  canvas.height = h
-  canvas.getContext('2d')!.drawImage(img, 0, 0, w, h)
-  const dataUrl = canvas.toDataURL('image/jpeg', 0.82)
-  return { dataUrl, width: Math.min(460, w), height: Math.min(460, h) }
+  const { dataUrl, width, height } = await compressImageBlobForBoard(file)
+  return { dataUrl, width, height }
 }
 
 /**
@@ -342,6 +332,10 @@ export function Whiteboard({
   const [selectedIds, setSelectedIds] = useState<string[]>([])
   const selectedIdsRef = useRef<string[]>(selectedIds)
   const [clipboard, setClipboard] = useState<BoardElement[]>([])
+  const clipboardRef = useRef<BoardElement[]>([])
+  const internalCopyTokenRef = useRef<string | null>(null)
+  const lastNativeCopyAtRef = useRef(0)
+  const lastNativePasteAtRef = useRef(0)
 
   const [tool, setTool] = useState<InfiniteTool>('pen')
   const [penPreset, setPenPreset] = useState<PenPreset>('smooth')
@@ -475,11 +469,14 @@ export function Whiteboard({
     panY: number
   } | null>(null)
 
+  const followPresenterRef = useRef(followPresenter)
   useLayoutEffect(() => {
     elementsRef.current = elements
     selectedIdsRef.current = selectedIds
     cameraRef.current = camera
-  }, [elements, selectedIds, camera])
+    clipboardRef.current = clipboard
+    followPresenterRef.current = followPresenter
+  }, [elements, selectedIds, camera, clipboard, followPresenter])
 
   // Keep backwards-compatible handle for MeetingRoom
   useImperativeHandle(
@@ -1194,9 +1191,28 @@ export function Whiteboard({
 
   const didInitCamera = useRef(false)
   const paintCanvasRef = useRef(paintCanvas)
+  const paintRafRef = useRef(0)
   useLayoutEffect(() => {
     paintCanvasRef.current = paintCanvas
   }, [paintCanvas])
+
+  const schedulePaint = useCallback(() => {
+    if (typeof window === 'undefined') return
+    if (paintRafRef.current) return
+    paintRafRef.current = window.requestAnimationFrame(() => {
+      paintRafRef.current = 0
+      paintCanvasRef.current()
+    })
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (paintRafRef.current && typeof window !== 'undefined') {
+        window.cancelAnimationFrame(paintRafRef.current)
+        paintRafRef.current = 0
+      }
+    }
+  }, [])
 
   useLayoutEffect(() => {
     const el = containerRef.current
@@ -1219,7 +1235,7 @@ export function Whiteboard({
         cameraRef.current = nextCam
         setCamera(nextCam)
       }
-      paintCanvasRef.current()
+      schedulePaint()
       setRenderTick((t) => t + 1)
     }
     resize()
@@ -1230,11 +1246,11 @@ export function Whiteboard({
       ro.disconnect()
       window.removeEventListener('resize', resize)
     }
-  }, [])
+  }, [schedulePaint])
 
   useEffect(() => {
-    paintCanvas()
-  }, [paintCanvas, elements, selectedIds, camera, renderTick])
+    schedulePaint()
+  }, [schedulePaint, paintCanvas, elements, selectedIds, camera, renderTick])
 
   // Animate laser fade at 60fps
   useEffect(() => {
@@ -1307,57 +1323,71 @@ export function Whiteboard({
     syncDelete(Array.from(delIds))
   }, [canDraw, pushHistory, syncDelete])
 
-  const copySelected = useCallback(() => {
-    if (selectedIdsRef.current.length === 0) return
-    const sel = new Set(selectedIdsRef.current)
-    const picked = elementsRef.current.filter(
-      (e) => sel.has(e.id) && e.kind !== 'pdf-deck',
-    )
-    if (picked.length === 0) return
-    setClipboard(picked)
-    toast.success(`Copied ${picked.length} ${picked.length === 1 ? 'item' : 'items'}`)
-  }, [])
+  const copySelected = useCallback(
+    (opts?: { silent?: boolean }): string | null => {
+      if (selectedIdsRef.current.length === 0) return null
+      const sel = new Set(selectedIdsRef.current)
+      const picked = elementsRef.current.filter(
+        (e) => sel.has(e.id) && e.kind !== 'pdf-deck',
+      )
+      if (picked.length === 0) return null
+      const token = `lectern-wb:${makeElementId()}`
+      clipboardRef.current = picked
+      internalCopyTokenRef.current = token
+      setClipboard(picked)
+      if (opts?.silent !== true) {
+        toast.success(
+          `Copied ${picked.length} ${picked.length === 1 ? 'item' : 'items'}`,
+        )
+      }
+      return token
+    },
+    [],
+  )
+
+  const cutSelected = useCallback((): string | null => {
+    if (!canDraw || selectedIdsRef.current.length === 0) return null
+    const token = copySelected({ silent: true })
+    if (!token) return null
+    const count = clipboardRef.current.length
+    deleteSelected()
+    toast.success(`Cut ${count} ${count === 1 ? 'item' : 'items'}`)
+    return token
+  }, [canDraw, copySelected, deleteSelected])
 
   const pasteClipboard = useCallback(() => {
-    if (!canDraw || clipboard.length === 0) return
+    if (!canDraw || clipboardRef.current.length === 0) return
     const prev = elementsRef.current
-    const maxZ = prev.reduce((m, e) => Math.max(m, e.zIndex), 0)
-    let z = maxZ + 1
-    const copies = clipboard.map((el) => ({
-      ...translateElement(el, 32, 32),
-      id: makeElementId(),
-      locked: false,
-      groupId: undefined,
-      zIndex: z++,
-      createdAt: Date.now(),
-    }))
+    const copies = cloneBoardElementsWithOffset(
+      clipboardRef.current,
+      prev,
+      PASTE_OFFSET_PX,
+      PASTE_OFFSET_PX,
+    )
+    if (copies.length === 0) return
     const next = [...prev, ...copies]
     pushHistory(prev)
     elementsRef.current = next
     setElements(next)
     setSelectedIds(copies.map((c) => c.id))
+    // Cascade subsequent Ctrl+V pastes by another (+24, +24)
+    clipboardRef.current = copies
+    setClipboard(copies)
     setTool('select')
     syncBatch(copies)
-  }, [canDraw, clipboard, pushHistory, syncBatch])
+  }, [canDraw, pushHistory, syncBatch])
 
   const duplicateSelected = useCallback(() => {
     if (!canDraw || selectedIdsRef.current.length === 0) return
     const sel = new Set(selectedIdsRef.current)
     const prev = elementsRef.current
-    const maxZ = prev.reduce((m, e) => Math.max(m, e.zIndex), 0)
-    const copies: BoardElement[] = []
-    let z = maxZ + 1
-    for (const el of prev) {
-      if (!sel.has(el.id) || el.kind === 'pdf-deck') continue
-      copies.push({
-        ...translateElement(el, 28, 28),
-        id: makeElementId(),
-        locked: false,
-        groupId: undefined,
-        zIndex: z++,
-        createdAt: Date.now(),
-      })
-    }
+    const picked = prev.filter((el) => sel.has(el.id) && el.kind !== 'pdf-deck')
+    const copies = cloneBoardElementsWithOffset(
+      picked,
+      prev,
+      PASTE_OFFSET_PX,
+      PASTE_OFFSET_PX,
+    )
     if (copies.length === 0) return
     const next = [...prev, ...copies]
     pushHistory(prev)
@@ -1813,7 +1843,7 @@ export function Whiteboard({
   )
 
   const addImageAt = useCallback(
-    async (file: File, wx?: number, wy?: number) => {
+    async (file: Blob, wx?: number, wy?: number, toastLabel?: string) => {
       if (!canDraw) return
       try {
         const { dataUrl, width, height } = await compressImageFile(file)
@@ -1847,11 +1877,82 @@ export function Whiteboard({
         setSelectedIds([imgEl.id])
         setTool('select')
         syncUpsert(imgEl)
+        if (toastLabel) toast.success(toastLabel)
       } catch {
         toast.error('Could not load that image.')
       }
     },
     [author, canDraw, getViewportCenterWorld, pushHistory, syncUpsert],
+  )
+
+  const addPastedTextAt = useCallback(
+    (rawText: string, wx?: number, wy?: number) => {
+      if (!canDraw) return
+      const normalized = rawText.replace(/\r\n?/g, '\n').trimEnd()
+      if (!normalized.trim()) return
+      const fontSize = Math.max(18, Math.min(28, strokeWidth * 5))
+      const { width, height } = computeWrappedTextMetrics(
+        normalized,
+        fontSize,
+        520,
+      )
+      const center = getViewportCenterWorld()
+      const cx = wx ?? center.x
+      const cy = wy ?? center.y
+      const prev = elementsRef.current
+      const maxZ = prev.reduce((m, e) => Math.max(m, e.zIndex), 0)
+      const deck = findEnclosingPdfDeck(cx, cy)
+      const textEl: BoardElement = {
+        id: makeElementId(),
+        kind: 'text',
+        x: cx - width / 2,
+        y: cy - height / 2,
+        w: width,
+        h: height,
+        rotation: 0,
+        strokeColor:
+          boardTheme === 'dark' && strokeColor === '#1f2924'
+            ? '#ffffff'
+            : strokeColor,
+        fillColor: 'transparent',
+        strokeWidth,
+        strokeStyle: 'solid',
+        opacity,
+        text: normalized,
+        fontFamily: 'sans',
+        fontSize,
+        fontWeight: 'normal',
+        fontStyle: 'normal',
+        textDecoration: 'none',
+        textAlign: 'left',
+        textBg: 'transparent',
+        pdfDeckId: deck?.id,
+        pdfDeckPage: deck ? (deck.pdfPageIndex ?? 0) : undefined,
+        zIndex: maxZ + 1,
+        author,
+        createdAt: Date.now(),
+      }
+      const next = [...prev, textEl]
+      pushHistory(prev)
+      elementsRef.current = next
+      setElements(next)
+      setSelectedIds([textEl.id])
+      setTool('select')
+      syncUpsert(textEl)
+      toast.success('Pasted text')
+    },
+    [
+      author,
+      boardTheme,
+      canDraw,
+      findEnclosingPdfDeck,
+      getViewportCenterWorld,
+      opacity,
+      pushHistory,
+      strokeColor,
+      strokeWidth,
+      syncUpsert,
+    ],
   )
 
   // ---- PDF File Import & Interactive PDF Deck Page Flipping ----------------
@@ -2638,7 +2739,7 @@ export function Whiteboard({
       startWy: startY,
       startCamera: { ...cameraRef.current },
     }
-    paintCanvas()
+    schedulePaint()
   }
 
   const onPointerMove = (e: React.PointerEvent) => {
@@ -2680,7 +2781,7 @@ export function Whiteboard({
         24 / cameraRef.current.zoom,
       )
       hoveredAnchorRef.current = snap ? { x: snap.x, y: snap.y } : null
-      paintCanvas()
+      schedulePaint()
       return
     }
 
@@ -2731,7 +2832,7 @@ export function Whiteboard({
         w: Math.abs(wx - inter.startWx),
         h: Math.abs(wy - inter.startWy),
       }
-      paintCanvas()
+      schedulePaint()
       return
     }
 
@@ -2857,24 +2958,37 @@ export function Whiteboard({
       const d = draftRef.current
       if (d.kind === 'pen' || d.kind === 'highlighter') {
         const pts = d.points!
-        const lx = pts[pts.length - 2]
-        const ly = pts[pts.length - 1]
-        const dist = Math.hypot(wx - lx, wy - ly)
-        if (dist < 1.5 / cameraRef.current.zoom) return
-        pts.push(wx, wy)
-        if (d.kind === 'pen' && d.penPreset === 'calligraphy') {
-          const nowT = Date.now()
-          const prevSample = lastDrawSampleRef.current
-          const dt = Math.max(4, nowT - (prevSample?.t ?? nowT - 16))
-          const velocity = dist / dt // px per ms
-          // Slower stroke = wider ink deposit, faster stroke = crisp tapered stroke
-          const factor = Math.max(0.35, Math.min(1.65, 1.5 - velocity * 0.45))
-          const prevW =
-            d.pointWidths?.[d.pointWidths.length - 1] ?? d.strokeWidth
-          const smoothedW = prevW * 0.6 + d.strokeWidth * factor * 0.4
-          d.pointWidths = [...(d.pointWidths ?? []), smoothedW]
-          lastDrawSampleRef.current = { x: wx, y: wy, t: nowT }
+        const nativeEvt = e.nativeEvent
+        const coalesced =
+          typeof nativeEvt.getCoalescedEvents === 'function'
+            ? nativeEvt.getCoalescedEvents()
+            : []
+        const samples = coalesced.length > 0 ? coalesced : [nativeEvt]
+        const minStep = 1.5 / cameraRef.current.zoom
+        let appended = false
+
+        for (const sample of samples) {
+          const { x: sx, y: sy } = screenToWorld(sample.clientX, sample.clientY)
+          const lx = pts[pts.length - 2]
+          const ly = pts[pts.length - 1]
+          const dist = Math.hypot(sx - lx, sy - ly)
+          if (dist < minStep) continue
+          pts.push(sx, sy)
+          appended = true
+          if (d.kind === 'pen' && d.penPreset === 'calligraphy') {
+            const nowT = sample.timeStamp || Date.now()
+            const prevSample = lastDrawSampleRef.current
+            const dt = Math.max(4, nowT - (prevSample?.t ?? nowT - 16))
+            const velocity = dist / dt
+            const factor = Math.max(0.35, Math.min(1.65, 1.5 - velocity * 0.45))
+            const prevW =
+              d.pointWidths?.[d.pointWidths.length - 1] ?? d.strokeWidth
+            const smoothedW = prevW * 0.6 + d.strokeWidth * factor * 0.4
+            d.pointWidths = [...(d.pointWidths ?? []), smoothedW]
+            lastDrawSampleRef.current = { x: sx, y: sy, t: nowT }
+          }
         }
+        if (!appended) return
       } else if (d.kind === 'line' || d.kind === 'arrow') {
         const snap = findNearestAnchor(
           getVisibleElements(elementsRef.current),
@@ -2896,7 +3010,7 @@ export function Whiteboard({
         d.w = Math.abs(wx - inter.startWx)
         d.h = Math.abs(wy - inter.startWy)
       }
-      paintCanvas()
+      schedulePaint()
       const now = Date.now()
       if (now - lastStreamSyncRef.current >= 65) {
         lastStreamSyncRef.current = now
@@ -3111,36 +3225,97 @@ export function Whiteboard({
     setContextMenu({ x: mx, y: my })
   }
 
-  const onWheel = (e: React.WheelEvent) => {
-    e.preventDefault()
-    if (followPresenter) setFollowPresenter(false)
-    if (e.ctrlKey || e.metaKey) {
-      zoomAt(e.deltaY < 0 ? 1.12 : 1 / 1.12, e.clientX, e.clientY)
-    } else {
-      setCamera((c) => ({
-        ...c,
-        panX: c.panX - e.deltaX,
-        panY: c.panY - e.deltaY,
-      }))
-    }
-  }
+  // Non-passive wheel, touchmove, edge-touchstart, and Safari gesture guards
+  // so trackpad horizontal pans, pinch-zoom, and mobile edge swipes never
+  // trigger browser Back/Forward navigation or scroll bounce.
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
 
-  // Drag-and-drop Image OR PDF upload onto canvas
+    const onNativeWheel = (e: WheelEvent) => {
+      // Allow scrolling inside inline text/table inputs if focused
+      if (isEditableEventTarget(e.target)) return
+      e.preventDefault()
+      if (followPresenterRef.current) setFollowPresenter(false)
+      if (e.ctrlKey || e.metaKey) {
+        const factor =
+          e.deltaMode === 0
+            ? Math.exp(-Math.max(-60, Math.min(60, e.deltaY)) * 0.0085)
+            : e.deltaY < 0
+              ? 1.12
+              : 1 / 1.12
+        zoomAt(factor, e.clientX, e.clientY)
+      } else {
+        setCamera((c) => ({
+          ...c,
+          panX: c.panX - e.deltaX,
+          panY: c.panY - e.deltaY,
+        }))
+      }
+    }
+
+    const onNativeTouchMove = (e: TouchEvent) => {
+      if (isEditableEventTarget(e.target)) return
+      e.preventDefault()
+    }
+
+    const onNativeTouchStart = (e: TouchEvent) => {
+      if (isEditableEventTarget(e.target)) return
+      const targetEl = e.target as HTMLElement | null
+      if (targetEl?.closest('button, a, [role="menu"], [role="dialog"]')) {
+        return
+      }
+      const nearHorizontalEdge = Array.from(e.touches).some(
+        (t) => t.clientX < 32 || t.clientX > window.innerWidth - 32,
+      )
+      if (e.touches.length >= 2 || nearHorizontalEdge) {
+        e.preventDefault()
+      }
+    }
+
+    const onNativeGesture = (e: Event) => {
+      e.preventDefault()
+    }
+
+    el.addEventListener('wheel', onNativeWheel, { passive: false })
+    el.addEventListener('touchmove', onNativeTouchMove, { passive: false })
+    el.addEventListener('touchstart', onNativeTouchStart, { passive: false })
+    el.addEventListener('gesturestart', onNativeGesture, { passive: false })
+    el.addEventListener('gesturechange', onNativeGesture, { passive: false })
+    return () => {
+      el.removeEventListener('wheel', onNativeWheel)
+      el.removeEventListener('touchmove', onNativeTouchMove)
+      el.removeEventListener('touchstart', onNativeTouchStart)
+      el.removeEventListener('gesturestart', onNativeGesture)
+      el.removeEventListener('gesturechange', onNativeGesture)
+    }
+  }, [zoomAt])
+
+  // Drag-and-drop Image OR PDF upload onto canvas (uses same compression + sync pipeline)
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault()
     if (!canDraw) return
-    const file = e.dataTransfer.files?.[0]
-    if (!file) return
-    if (
-      file.type === 'application/pdf' ||
-      file.name.toLowerCase().endsWith('.pdf')
-    ) {
-      void openPdfFileForImport(file)
+    const files = Array.from(e.dataTransfer.files ?? [])
+    if (files.length === 0) return
+    const pdfFile = files.find(
+      (f) =>
+        f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf'),
+    )
+    if (pdfFile) {
+      void openPdfFileForImport(pdfFile)
       return
     }
-    if (file.type.startsWith('image/')) {
+    const imageFiles = files.filter((f) => f.type.startsWith('image/'))
+    if (imageFiles.length > 0) {
       const { x, y } = screenToWorld(e.clientX, e.clientY)
-      void addImageAt(file, x, y)
+      imageFiles.forEach((imgFile, idx) => {
+        void addImageAt(
+          imgFile,
+          x + idx * PASTE_OFFSET_PX,
+          y + idx * PASTE_OFFSET_PX,
+          idx === 0 ? 'Pasted image' : undefined,
+        )
+      })
     }
   }
 
@@ -3192,17 +3367,119 @@ export function Whiteboard({
     }))
   }
 
+  // ---- Global Clipboard (Copy / Cut / Paste from ANY external or internal source) ----
+  useEffect(() => {
+    const isTyping = (target: EventTarget | null) =>
+      isEditableEventTarget(target) ||
+      isEditableEventTarget(document.activeElement)
+
+    const onNativeCopy = (e: ClipboardEvent) => {
+      if (isTyping(e.target)) return
+      if (selectedIdsRef.current.length === 0) return
+      const token = copySelected()
+      if (!token) return
+      lastNativeCopyAtRef.current = Date.now()
+      e.preventDefault()
+      try {
+        e.clipboardData?.setData(INTERNAL_CLIPBOARD_MIME, token)
+        e.clipboardData?.setData('text/plain', token)
+      } catch {
+        // Ignore restricted clipboard writes
+      }
+    }
+
+    const onNativeCut = (e: ClipboardEvent) => {
+      if (isTyping(e.target) || !canDraw) return
+      if (selectedIdsRef.current.length === 0) return
+      const token = cutSelected()
+      if (!token) return
+      lastNativeCopyAtRef.current = Date.now()
+      e.preventDefault()
+      try {
+        e.clipboardData?.setData(INTERNAL_CLIPBOARD_MIME, token)
+        e.clipboardData?.setData('text/plain', token)
+      } catch {
+        // Ignore restricted clipboard writes
+      }
+    }
+
+    const onNativePaste = (e: ClipboardEvent) => {
+      if (isTyping(e.target) || !canDraw) return
+      lastNativePasteAtRef.current = Date.now()
+      const cd = e.clipboardData
+
+      // 1. Images & screenshots (Snipping Tool, macOS Screenshot, Chrome, Word/PDF/Figma)
+      const imageBlobs = extractPastedImageBlobs(cd)
+      if (imageBlobs.length > 0) {
+        e.preventDefault()
+        const center = getViewportCenterWorld()
+        imageBlobs.forEach((blob, idx) => {
+          void addImageAt(
+            blob,
+            center.x + idx * PASTE_OFFSET_PX,
+            center.y + idx * PASTE_OFFSET_PX,
+            idx === 0 ? 'Pasted image' : undefined,
+          )
+        })
+        return
+      }
+
+      // 2. Internal board elements copied/cut via Ctrl/Cmd+C or Ctrl/Cmd+X
+      const internalToken = cd?.getData?.(INTERNAL_CLIPBOARD_MIME) || ''
+      const plainRaw = cd?.getData?.('text/plain') || ''
+      const matchesInternal =
+        Boolean(internalCopyTokenRef.current) &&
+        (internalToken === internalCopyTokenRef.current ||
+          plainRaw === internalCopyTokenRef.current)
+
+      if (matchesInternal && clipboardRef.current.length > 0) {
+        e.preventDefault()
+        pasteClipboard()
+        return
+      }
+
+      // 3. External text & math expressions (text/plain or stripped text/html)
+      const pastedText = extractPastedText(cd)
+      if (pastedText.length > 0) {
+        e.preventDefault()
+        addPastedTextAt(pastedText)
+        return
+      }
+
+      // 4. Fallback to internal clipboard if system clipboard payload is empty
+      if (clipboardRef.current.length > 0) {
+        e.preventDefault()
+        pasteClipboard()
+      }
+    }
+
+    window.addEventListener('copy', onNativeCopy)
+    window.addEventListener('cut', onNativeCut)
+    window.addEventListener('paste', onNativePaste)
+    return () => {
+      window.removeEventListener('copy', onNativeCopy)
+      window.removeEventListener('cut', onNativeCut)
+      window.removeEventListener('paste', onNativePaste)
+    }
+  }, [
+    addImageAt,
+    addPastedTextAt,
+    canDraw,
+    copySelected,
+    cutSelected,
+    getViewportCenterWorld,
+    pasteClipboard,
+  ])
+
   // ---- Keyboard shortcuts --------------------------------------------------
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement | null
       if (
-        target?.tagName === 'TEXTAREA' ||
-        target?.tagName === 'INPUT' ||
-        target?.tagName === 'SELECT' ||
-        target?.isContentEditable
-      )
+        isEditableEventTarget(e.target) ||
+        isEditableEventTarget(document.activeElement)
+      ) {
         return
+      }
       if (e.code === 'Space') {
         setSpacePressed(true)
         return
@@ -3219,11 +3496,40 @@ export function Whiteboard({
           e.preventDefault()
           duplicateSelected()
         } else if (k === 'c') {
-          e.preventDefault()
-          copySelected()
+          // Allow native `copy` event to run first so system clipboard receives token;
+          // fallback handles synthetic keydown events where browser doesn't fire `copy`.
+          const pressedAt = Date.now()
+          window.setTimeout(() => {
+            if (
+              lastNativeCopyAtRef.current < pressedAt &&
+              selectedIdsRef.current.length > 0
+            ) {
+              copySelected()
+            }
+          }, 20)
+        } else if (k === 'x') {
+          const pressedAt = Date.now()
+          window.setTimeout(() => {
+            if (
+              lastNativeCopyAtRef.current < pressedAt &&
+              selectedIdsRef.current.length > 0
+            ) {
+              cutSelected()
+            }
+          }, 20)
         } else if (k === 'v') {
-          e.preventDefault()
-          pasteClipboard()
+          // NEVER preventDefault() on Ctrl/Cmd+V so the browser fires the real
+          // `paste` event with OS clipboardData (screenshots, images, text).
+          // Fallback only runs if no native `paste` fired (synthetic keyboard event).
+          const pressedAt = Date.now()
+          window.setTimeout(() => {
+            if (
+              lastNativePasteAtRef.current < pressedAt &&
+              clipboardRef.current.length > 0
+            ) {
+              pasteClipboard()
+            }
+          }, 30)
         }
         return
       }
@@ -3264,6 +3570,7 @@ export function Whiteboard({
   }, [
     canDraw,
     copySelected,
+    cutSelected,
     deleteSelected,
     duplicateSelected,
     pasteClipboard,
@@ -3446,9 +3753,10 @@ export function Whiteboard({
   return (
     <div
       className={cn(
-        'flex h-full w-full flex-col overflow-hidden rounded-xl border border-border bg-card text-card-foreground',
+        'flex h-full w-full flex-col overflow-hidden overscroll-none overscroll-x-none rounded-xl border border-border bg-card text-card-foreground',
         className,
       )}
+      style={{ overscrollBehavior: 'none', overscrollBehaviorX: 'none' }}
     >
       {/* Hidden file inputs */}
       <input
@@ -3497,9 +3805,9 @@ export function Whiteboard({
       />
 
       {/* Top Toolbar */}
-      <div className="flex flex-wrap items-center gap-1.5 border-b border-border bg-card px-2 py-1.5 text-card-foreground">
+      <div className="no-scrollbar flex flex-nowrap items-center gap-1.5 overflow-x-auto border-b border-border bg-card px-2 py-1.5 text-card-foreground md:flex-wrap md:overflow-visible">
         {canDraw ? (
-          <div className="flex flex-wrap items-center gap-0.5 rounded-lg bg-muted p-0.5">
+          <div className="flex shrink-0 flex-nowrap items-center gap-0.5 rounded-lg bg-muted p-0.5">
             <ToolButton
               label="Select (V)"
               active={tool === 'select'}
@@ -3531,7 +3839,7 @@ export function Whiteboard({
                     aria-label="Pen styles and presets"
                     title="Pen styles, stroke type & thickness"
                     className={cn(
-                      'grid h-8 w-4 place-items-center rounded-md transition-colors hover:bg-background',
+                      'grid h-10 w-6 shrink-0 place-items-center rounded-md transition-colors hover:bg-background md:h-8 md:w-4',
                       tool === 'pen' && 'text-primary',
                     )}
                   >
@@ -3678,7 +3986,7 @@ export function Whiteboard({
                       aria-label="Shapes"
                       aria-pressed={isShapeActive}
                       className={cn(
-                        'grid size-8 place-items-center rounded-md transition-colors motion-reduce:transition-none',
+                        'grid size-10 shrink-0 place-items-center rounded-md transition-colors motion-reduce:transition-none md:size-8',
                         isShapeActive
                           ? 'bg-primary text-primary-foreground'
                           : 'hover:bg-background',
@@ -3741,7 +4049,7 @@ export function Whiteboard({
                     <button
                       type="button"
                       aria-label="Insert table"
-                      className="grid size-8 place-items-center rounded-md hover:bg-background"
+                      className="grid size-10 shrink-0 place-items-center rounded-md hover:bg-background md:size-8"
                     >
                       <Table2 className="size-4" />
                     </button>
@@ -3851,7 +4159,7 @@ export function Whiteboard({
                     <button
                       type="button"
                       aria-label="Math symbols and coordinate plane"
-                      className="grid size-8 place-items-center rounded-md hover:bg-background"
+                      className="grid size-10 shrink-0 place-items-center rounded-md hover:bg-background md:size-8"
                     >
                       <Sigma className="size-4" />
                     </button>
@@ -3913,7 +4221,7 @@ export function Whiteboard({
                     <button
                       type="button"
                       aria-label="Templates"
-                      className="grid size-8 place-items-center rounded-md hover:bg-background"
+                      className="grid size-10 shrink-0 place-items-center rounded-md hover:bg-background md:size-8"
                     >
                       <LayoutTemplate className="size-4" />
                     </button>
@@ -3949,10 +4257,10 @@ export function Whiteboard({
 
         {/* Color swatches, width, undo/redo, clear */}
         {canDraw && (
-          <div className="flex flex-wrap items-center gap-1.5">
+          <div className="flex shrink-0 flex-nowrap items-center gap-1.5">
             {tool === 'sticky' ? (
               <div
-                className="flex items-center gap-1"
+                className="flex shrink-0 items-center gap-1"
                 aria-label="Sticky note colour"
               >
                 {STICKY_COLORS.map((sc) => (
@@ -3962,7 +4270,7 @@ export function Whiteboard({
                     aria-label={`Sticky ${sc.name}`}
                     onClick={() => setStickyColor(sc.bg)}
                     className={cn(
-                      'size-5 rounded border border-black/15 transition-transform',
+                      'size-7 shrink-0 rounded border border-black/15 transition-transform md:size-5',
                       stickyColor === sc.bg && 'scale-110 ring-2 ring-ring',
                     )}
                     style={{ background: sc.bg }}
@@ -3971,7 +4279,7 @@ export function Whiteboard({
               </div>
             ) : (
               <div
-                className="flex items-center gap-1"
+                className="flex shrink-0 items-center gap-1"
                 role="radiogroup"
                 aria-label="Colour"
               >
@@ -3984,7 +4292,7 @@ export function Whiteboard({
                     aria-label={`Colour ${c}`}
                     onClick={() => setStrokeColor(c)}
                     className={cn(
-                      'size-5 rounded-full border border-black/15 transition-transform motion-reduce:transition-none',
+                      'size-7 shrink-0 rounded-full border border-black/15 transition-transform motion-reduce:transition-none md:size-5',
                       strokeColor === c &&
                         'scale-110 ring-2 ring-ring ring-offset-1 ring-offset-card',
                     )}
@@ -3992,7 +4300,7 @@ export function Whiteboard({
                   />
                 ))}
                 <label
-                  className="relative grid size-5 cursor-pointer place-items-center overflow-hidden rounded-full border border-border text-[9px] font-bold"
+                  className="relative grid size-7 shrink-0 cursor-pointer place-items-center overflow-hidden rounded-full border border-border text-[9px] font-bold md:size-5"
                   title="Custom color"
                 >
                   <span className="sr-only">Custom colour</span>
@@ -4060,14 +4368,14 @@ export function Whiteboard({
         )}
 
         {/* Right utilities: Slides, Bring Everyone, Boards, Annotate, Follow, Background, Export, Close */}
-        <div className="ml-auto flex flex-wrap items-center gap-1">
+        <div className="ml-auto flex shrink-0 flex-nowrap items-center gap-1">
           <button
             type="button"
             aria-pressed={framesOpen}
             aria-label="Lesson slides and frames"
             onClick={() => setFramesOpen((o) => !o)}
             className={cn(
-              'flex h-8 items-center gap-1.5 rounded-lg border px-2 text-xs font-medium transition-colors',
+              'flex h-10 shrink-0 items-center gap-1.5 rounded-lg border px-2.5 text-xs font-medium transition-colors md:h-8 md:px-2',
               framesOpen
                 ? 'border-primary/40 bg-primary/12 text-primary'
                 : 'border-border bg-muted/60 text-muted-foreground hover:text-foreground',
@@ -4086,7 +4394,7 @@ export function Whiteboard({
                   type="button"
                   size="xs"
                   variant="outline"
-                  className="h-8 gap-1.5 px-2 text-xs"
+                  className="h-10 shrink-0 gap-1.5 px-2.5 text-xs md:h-8 md:px-2"
                   aria-label="Bring everyone to my view"
                   onClick={bringEveryoneToMe}
                 >
@@ -4106,7 +4414,7 @@ export function Whiteboard({
               type="button"
               size="xs"
               variant="outline"
-              className="h-8 gap-1.5 px-2 text-xs"
+              className="h-10 shrink-0 gap-1.5 px-2.5 text-xs md:h-8 md:px-2"
               onClick={onOpenBoardPicker}
               title="Switch or start a saved whiteboard"
             >
@@ -4129,7 +4437,7 @@ export function Whiteboard({
                     onToggleParticipantsAnnotate(!allowParticipantsAnnotate)
                   }
                   className={cn(
-                    'flex h-8 items-center gap-1.5 rounded-lg border px-2 text-xs font-medium transition-colors motion-reduce:transition-none',
+                    'flex h-10 shrink-0 items-center gap-1.5 rounded-lg border px-2.5 text-xs font-medium transition-colors motion-reduce:transition-none md:h-8 md:px-2',
                     allowParticipantsAnnotate
                       ? 'border-primary/40 bg-primary/12 text-primary'
                       : 'border-border bg-muted/60 text-muted-foreground hover:text-foreground',
@@ -4158,7 +4466,7 @@ export function Whiteboard({
                   aria-label="Follow presenter view"
                   onClick={() => setFollowPresenter((f) => !f)}
                   className={cn(
-                    'flex h-8 items-center gap-1.5 rounded-lg border px-2 text-xs font-medium transition-colors motion-reduce:transition-none',
+                    'flex h-10 shrink-0 items-center gap-1.5 rounded-lg border px-2.5 text-xs font-medium transition-colors motion-reduce:transition-none md:h-8 md:px-2',
                     followPresenter
                       ? 'border-primary/40 bg-primary/12 text-primary'
                       : 'border-border bg-muted/60 text-muted-foreground hover:text-foreground',
@@ -4185,7 +4493,7 @@ export function Whiteboard({
                   <Button
                     variant="ghost"
                     size="icon"
-                    className="size-8"
+                    className="size-10 shrink-0 md:size-8"
                     aria-label="Board background"
                   >
                     <Grid2X2 className="size-4" />
@@ -4241,7 +4549,7 @@ export function Whiteboard({
               <Button
                 variant="ghost"
                 size="icon"
-                className="size-8"
+                className="size-10 shrink-0 md:size-8"
                 aria-label="Export"
               >
                 <Download className="size-4" />
@@ -4284,7 +4592,7 @@ export function Whiteboard({
             <Button
               variant="ghost"
               size="icon"
-              className="size-8"
+              className="size-10 shrink-0 md:size-8"
               onClick={onClose}
               aria-label="Close whiteboard"
             >
@@ -4295,18 +4603,27 @@ export function Whiteboard({
       </div>
 
       {/* Infinite Canvas Viewport */}
-      <div className="relative min-h-0 flex-1 overflow-hidden">
+      <div
+        className="relative min-h-0 flex-1 overflow-hidden overscroll-none overscroll-x-none"
+        style={{ overscrollBehavior: 'none', overscrollBehaviorX: 'none' }}
+      >
         <div
           ref={containerRef}
-          className="absolute inset-0 h-full w-full touch-none select-none overflow-hidden"
-          style={{ cursor }}
+          className="absolute inset-0 h-full w-full touch-none select-none overflow-hidden overscroll-none overscroll-x-none"
+          style={{
+            cursor,
+            touchAction: 'none',
+            userSelect: 'none',
+            WebkitUserSelect: 'none',
+            overscrollBehavior: 'none',
+            overscrollBehaviorX: 'none',
+          }}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
           onPointerCancel={onPointerUp}
           onDoubleClick={onDoubleClick}
           onContextMenu={onContextMenu}
-          onWheel={onWheel}
           onDragOver={(e) => e.preventDefault()}
           onDrop={onDrop}
           role="img"
@@ -4314,7 +4631,12 @@ export function Whiteboard({
         >
           <canvas
             ref={canvasRef}
-            className="absolute inset-0 block h-full w-full"
+            className="absolute inset-0 block h-full w-full touch-none select-none"
+            style={{
+              touchAction: 'none',
+              userSelect: 'none',
+              WebkitUserSelect: 'none',
+            }}
           />
 
           {/* Interactive PDF Deck Page Flipper Overlays */}
@@ -4480,7 +4802,7 @@ export function Whiteboard({
 
           {/* Bottom-right Navigation HUD & Interactive Minimap */}
           <div
-            className="absolute bottom-3 right-3 z-10 flex flex-col items-end gap-2"
+            className="absolute bottom-[calc(env(safe-area-inset-bottom)+0.75rem)] right-3 z-10 flex max-w-[calc(100%-1.5rem)] flex-col items-end gap-2"
             onPointerDown={(e) => e.stopPropagation()}
           >
             {showMinimap && (
@@ -4500,7 +4822,7 @@ export function Whiteboard({
                 />
               </div>
             )}
-            <div className="flex items-center gap-0.5 rounded-xl border border-border bg-card/95 p-1 text-card-foreground shadow-md backdrop-blur">
+            <div className="no-scrollbar flex max-w-full items-center gap-0.5 overflow-x-auto rounded-xl border border-border bg-card/95 p-1 text-card-foreground shadow-md backdrop-blur">
               <ToolButton label="Zoom out" onClick={() => zoomAt(1 / 1.25)}>
                 <Minus className="size-3.5" />
               </ToolButton>
@@ -4601,7 +4923,7 @@ function ToolButton({
           disabled={disabled}
           onClick={onClick}
           className={cn(
-            'grid size-8 place-items-center rounded-md transition-colors motion-reduce:transition-none disabled:opacity-40',
+            'grid size-10 shrink-0 place-items-center rounded-md transition-colors motion-reduce:transition-none disabled:opacity-40 md:size-8',
             active
               ? 'bg-primary text-primary-foreground'
               : 'hover:bg-background',

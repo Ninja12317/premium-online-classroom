@@ -214,12 +214,16 @@ code {
   }
   html {
     color-scheme: light;
+    overscroll-behavior: none;
+    overscroll-behavior-x: none;
   }
   html.dark {
     color-scheme: dark;
   }
   body {
     @apply bg-background text-foreground;
+    overscroll-behavior: none;
+    overscroll-behavior-x: none;
   }
   h1,
   h2,
@@ -255,6 +259,18 @@ code {
     transparent;
 }
 
+@utility safe-top {
+  padding-top: env(safe-area-inset-top);
+}
+
 @utility safe-bottom {
   padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+}
+
+@utility no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
 }

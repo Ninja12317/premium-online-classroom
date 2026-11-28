@@ -8,6 +8,13 @@ import {
   type User,
 } from 'firebase/auth'
 
+import {
+  isPermissionDeniedError,
+  shouldReportFirestoreError,
+} from '@/lib/firestore-errors'
+
+export { isPermissionDeniedError }
+
 function readEnv(key: keyof ImportMetaEnv): string | undefined {
   const value = import.meta.env?.[key]
   if (typeof value !== 'string') return undefined
@@ -74,6 +81,8 @@ function getOrCreateLocalUid(): string {
 }
 
 let authInitPromise: Promise<User> | null = null
+let authReadyPromise: Promise<User | null> | null = null
+let authTransitionDepth = 0
 
 /** Reset cached auth promise (called right before/after explicit signOut). */
 export function resetAuthInit() {
@@ -81,10 +90,66 @@ export function resetAuthInit() {
 }
 
 /**
+ * Marks an intentional Firebase Auth transition (sign-in, registration, guest
+ * switch, or sign-out) so outgoing Firestore listeners tearing down mid-switch
+ * never flash a stale permission-denied banner.
+ */
+export function beginAuthTransition() {
+  authTransitionDepth += 1
+}
+
+export function endAuthTransition() {
+  authTransitionDepth = Math.max(0, authTransitionDepth - 1)
+}
+
+export function isAuthTransitioning(): boolean {
+  return authTransitionDepth > 0
+}
+
+/**
+ * Waits for Firebase Auth's initial persistence check (`authStateReady` /
+ * `onAuthStateChanged`) to resolve WITHOUT ever triggering anonymous sign-in.
+ * Returns `auth.currentUser` (`User | null`) once ready.
+ */
+export function waitForAuthReady(): Promise<User | null> {
+  if (typeof window === 'undefined') {
+    return Promise.resolve(null)
+  }
+  if (!authReadyPromise) {
+    authReadyPromise = (async (): Promise<User | null> => {
+      if (typeof auth.authStateReady === 'function') {
+        await auth.authStateReady()
+      } else {
+        await new Promise<void>((resolve) => {
+          let settled = false
+          const unsub = onAuthStateChanged(
+            auth,
+            () => {
+              if (settled) return
+              settled = true
+              unsub()
+              resolve()
+            },
+            () => {
+              if (settled) return
+              settled = true
+              unsub()
+              resolve()
+            },
+          )
+        })
+      }
+      return auth.currentUser
+    })()
+  }
+  return authReadyPromise.then(() => auth.currentUser)
+}
+
+/**
  * Single cached auth gate: resolves ONLY after `auth.currentUser` is confirmed
  * non-null (automatically calling `signInAnonymously(auth)` if no user is
- * signed in). Every Firestore read, write, and onSnapshot listener awaits this
- * so ZERO requests ever fire while `auth.currentUser === null`.
+ * signed in). Used ONLY for room/meeting/whiteboard collaboration actions
+ * where guest anonymous access is allowed (never for signed-out dashboard lists).
  */
 export function ensureAuth(): Promise<User> {
   if (typeof window === 'undefined') {
@@ -98,28 +163,7 @@ export function ensureAuth(): Promise<User> {
   if (!authInitPromise) {
     authInitPromise = (async (): Promise<User> => {
       try {
-        if (typeof auth.authStateReady === 'function') {
-          await auth.authStateReady()
-        } else {
-          await new Promise<void>((resolve, reject) => {
-            let settled = false
-            const unsub = onAuthStateChanged(
-              auth,
-              () => {
-                if (settled) return
-                settled = true
-                unsub()
-                resolve()
-              },
-              (err) => {
-                if (settled) return
-                settled = true
-                unsub()
-                reject(err)
-              },
-            )
-          })
-        }
+        await waitForAuthReady()
         if (auth.currentUser) {
           return auth.currentUser
         }
@@ -185,19 +229,22 @@ let currentNotice: FirestoreNotice | null = null
 let noticeDismissed = false
 const noticeListeners = new Set<() => void>()
 
-export function isPermissionDeniedError(err: unknown): boolean {
-  if (!err || typeof err !== 'object') return false
-  const e = err as { code?: string; message?: string }
-  const code = String(e.code ?? '').toLowerCase()
-  const msg = String(e.message ?? '').toLowerCase()
-  return (
-    code.includes('permission-denied') ||
-    msg.includes('permission-denied') ||
-    msg.includes('missing or insufficient permissions')
-  )
-}
-
-export function reportFirestorePermissionError(path: string, err?: unknown) {
+export function reportFirestorePermissionError(
+  path: string,
+  err?: unknown,
+  opts?: { expectedUid?: string | null; isTornDown?: boolean },
+) {
+  if (
+    !shouldReportFirestoreError({
+      err: err ?? { code: 'permission-denied' },
+      expectedUid: opts?.expectedUid,
+      currentUid: auth.currentUser?.uid ?? null,
+      isAuthTransitioning: isAuthTransitioning(),
+      isTornDown: opts?.isTornDown,
+    })
+  ) {
+    return
+  }
   // Never spam duplicate notices or re-open after the user dismissed the banner.
   if (noticeDismissed || currentNotice !== null) return
   const code =
@@ -215,6 +262,14 @@ export function reportFirestorePermissionError(path: string, err?: unknown) {
 
 export function clearFirestoreNotice() {
   noticeDismissed = true
+  currentNotice = null
+  for (const l of noticeListeners) l()
+}
+
+/** Clears any stale banner on auth state change without permanently suppressing future genuine errors. */
+export function resetFirestoreNotice() {
+  if (currentNotice === null && !noticeDismissed) return
+  noticeDismissed = false
   currentNotice = null
   for (const l of noticeListeners) l()
 }

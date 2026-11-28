@@ -31,6 +31,7 @@ import {
 import { Input } from '@/components/ui/input'
 import type { StandaloneBoardMeta } from '@/lib/meeting-types'
 import { cn } from '@/lib/utils'
+import { auth } from '@/services/firebase'
 import {
   createStandaloneBoard,
   deleteStandaloneBoard,
@@ -113,10 +114,12 @@ export function WhiteboardGallery({
   openLabel = 'Open',
 }: WhiteboardGalleryProps) {
   const { authStatus, clientUid, ready } = useIdentity()
-  const activeUid =
+  const candidateUid =
     ready && (authStatus === 'authenticated' || authStatus === 'guest')
       ? clientUid
       : null
+  const activeUid =
+    candidateUid && auth.currentUser?.uid === candidateUid ? candidateUid : null
   const [boards, setBoards] = useState<StandaloneBoardMeta[]>([])
   const [loading, setLoading] = useState(() => Boolean(activeUid))
   const [creating, setCreating] = useState<string | null>(null)

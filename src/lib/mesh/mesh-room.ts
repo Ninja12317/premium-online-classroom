@@ -67,6 +67,8 @@ export type MeshDisconnectCause = 'removed' | 'ended' | 'lost' | 'left' | null
 
 export interface MeshRoomOptions {
   identity: string
+  /** Optional pre-generated UUID sessionId (falls back to crypto.randomUUID()). */
+  sessionId?: string
   name: string
   role: Role
   iceServers: IceServer[]
@@ -114,6 +116,7 @@ interface Link {
   openedAt: number
   createdAt: number
   statsTimer: number
+  disconnectTimer: number
   lastStats: { lost: number; received: number } | null
 }
 
@@ -130,19 +133,20 @@ const IMMEDIATE_MS = 50
 const FAST_POLL_MS = 1000
 const SLOW_POLL_MS = 4000
 const CONNECT_TIMEOUT_MS = 15_000
-const RETRY_AFTER_FAIL_MS = 4000
+const DISCONNECT_RECOVERY_MS = 3000
+const RETRY_AFTER_FAIL_MS = 1500
 const PRESENCE_GRACE_MS = 12_000
 const SYNC_FAILS_BEFORE_RECONNECTING = 2
 const SYNC_GIVE_UP_MS = 60_000
 
 export function newSessionId() {
-  return typeof crypto !== 'undefined' && 'randomUUID' in crypto
-    ? crypto.randomUUID().replace(/-/g, '').slice(0, 20)
-    : Math.random().toString(36).slice(2, 14) + Date.now().toString(36)
+  return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Math.random().toString(36).slice(2, 14)}-${Date.now().toString(36)}`
 }
 
 export class MeshRoom {
-  readonly sessionId = newSessionId()
+  readonly sessionId: string
   status: MeshStatus = 'connecting'
   cause: MeshDisconnectCause = null
   role: Role
@@ -191,6 +195,7 @@ export class MeshRoom {
   private initialMisses = 0
 
   constructor(private opts: MeshRoomOptions) {
+    this.sessionId = opts.sessionId?.trim() || newSessionId()
     this.role = opts.role
     this.settings = opts.initialSettings
   }
@@ -267,13 +272,20 @@ export class MeshRoom {
       this.closeLink(link)
     }
     this.links.clear()
+    this.outbox = []
+    this.earlyIceByPeer.clear()
+    this.pendingOffersByPeer.clear()
   }
 
-  /** Leaves the room: tells peers, closes connections, clears presence. */
+  /** Leaves the room: tells peers, closes all peer connections, unsubscribes, and clears all refs. */
   async stop(cause: MeshDisconnectCause = 'left') {
     if (!this.running && this.status === 'disconnected') return
     this.running = false
     window.clearTimeout(this.timer)
+    if (this.changeFrame) {
+      window.cancelAnimationFrame(this.changeFrame)
+      this.changeFrame = 0
+    }
     this.unsubSignals?.()
     this.unsubSignals = null
     this.unsubParticipants?.()
@@ -289,9 +301,19 @@ export class MeshRoom {
     }
     this.links.clear()
     this.peers.clear()
+    this.outbox = []
+    this.lastSeen.clear()
+    this.failedAt.clear()
+    this.gone.clear()
     this.earlyIceByPeer.clear()
     this.pendingOffersByPeer.clear()
     this.seenSignalIds.clear()
+    this.localTracks = {
+      mic: null,
+      cam: null,
+      screen: null,
+      screenAudio: null,
+    }
     this.status = 'disconnected'
     this.cause = cause
     this.emit()
@@ -530,10 +552,17 @@ export class MeshRoom {
         }
         // Otherwise wait for their offer.
       } else if (
+        link.pc.connectionState === 'failed' ||
+        link.pc.connectionState === 'closed' ||
+        link.pc.iceConnectionState === 'failed' ||
+        link.pc.iceConnectionState === 'closed'
+      ) {
+        this.rebuildPeerLink(info.identity)
+      } else if (
         link.pc.connectionState !== 'connected' &&
         now - link.createdAt > CONNECT_TIMEOUT_MS
       ) {
-        this.markFailed(info.identity)
+        this.rebuildPeerLink(info.identity)
       }
     }
     for (const [id, peer] of this.peers) {
@@ -597,6 +626,67 @@ export class MeshRoom {
     this.emit()
   }
 
+  private rebuildPeerLink(id: string) {
+    const peer = this.peers.get(id)
+    const lastFailed = this.failedAt.get(id) ?? 0
+    const now = Date.now()
+    this.dropLink(id)
+    this.earlyIceByPeer.delete(id)
+    if (!peer || !this.running) {
+      this.emit()
+      return
+    }
+    this.failedAt.set(id, now)
+    peer.link = 'failed'
+    peer.quality = 'lost'
+    // Immediately re-establish a fresh RTCPeerConnection on first failure or
+    // after the short cooldown so rejoining/transient drops recover seamlessly.
+    if (this.isInitiator(id) && now - lastFailed >= RETRY_AFTER_FAIL_MS) {
+      void this.openLink(peer, true)
+      return
+    }
+    this.emit()
+  }
+
+  private handleDisconnectedLink(peer: MeshPeer, link: Link) {
+    const id = peer.identity
+    if (this.links.get(id) !== link) return
+    peer.quality = 'lost'
+    try {
+      if (typeof link.pc.restartIce === 'function') {
+        link.pc.restartIce()
+      }
+    } catch {
+      // Ignore if peer connection is already closing.
+    }
+    if (!link.disconnectTimer) {
+      link.disconnectTimer = window.setTimeout(() => {
+        link.disconnectTimer = 0
+        if (this.links.get(id) !== link) return
+        const conn = link.pc.connectionState
+        const ice = link.pc.iceConnectionState
+        if (
+          conn === 'disconnected' ||
+          conn === 'failed' ||
+          conn === 'closed' ||
+          ice === 'disconnected' ||
+          ice === 'failed' ||
+          ice === 'closed'
+        ) {
+          this.rebuildPeerLink(id)
+        }
+      }, DISCONNECT_RECOVERY_MS)
+    }
+    this.emit()
+  }
+
+  private clearDisconnectTimer(link: Link) {
+    if (link.disconnectTimer) {
+      window.clearTimeout(link.disconnectTimer)
+      link.disconnectTimer = 0
+    }
+  }
+
   // ---- connections -----------------------------------------------------------
 
   private createLink(peer: MeshPeer, initiator: boolean): Link {
@@ -617,12 +707,14 @@ export class MeshRoom {
       openedAt: 0,
       createdAt: Date.now(),
       statsTimer: 0,
+      disconnectTimer: 0,
       lastStats: null,
     }
     const id = peer.identity
 
     dc.onopen = () => {
       if (this.links.get(id) !== link) return
+      this.clearDisconnectTimer(link)
       link.openedAt = Date.now()
       peer.link = 'connected'
       peer.quality = 'good'
@@ -658,15 +750,28 @@ export class MeshRoom {
         payload: JSON.stringify(ev.candidate.toJSON()),
       })
     }
+    pc.oniceconnectionstatechange = () => {
+      if (this.links.get(id) !== link) return
+      const s = pc.iceConnectionState
+      if (s === 'failed' || s === 'closed') {
+        this.rebuildPeerLink(id)
+      } else if (s === 'disconnected') {
+        this.handleDisconnectedLink(peer, link)
+      } else if (s === 'connected' || s === 'completed') {
+        this.clearDisconnectTimer(link)
+        if (peer.quality === 'lost') peer.quality = 'good'
+        this.emit()
+      }
+    }
     pc.onconnectionstatechange = () => {
       if (this.links.get(id) !== link) return
       const s = pc.connectionState
       if (s === 'failed' || s === 'closed') {
-        this.markFailed(id)
+        this.rebuildPeerLink(id)
       } else if (s === 'disconnected') {
-        peer.quality = 'lost'
-        this.emit()
+        this.handleDisconnectedLink(peer, link)
       } else if (s === 'connected') {
+        this.clearDisconnectTimer(link)
         if (peer.quality === 'lost') peer.quality = 'good'
         this.emit()
       }
@@ -720,10 +825,12 @@ export class MeshRoom {
 
   private closeLink(link: Link) {
     window.clearInterval(link.statsTimer)
+    this.clearDisconnectTimer(link)
     link.dc.onopen = null
     link.dc.onmessage = null
     link.dc.onclose = null
     link.pc.onicecandidate = null
+    link.pc.oniceconnectionstatechange = null
     link.pc.onconnectionstatechange = null
     link.pc.ontrack = null
     try {
@@ -843,8 +950,31 @@ export class MeshRoom {
     if (signal.kind === 'offer') {
       // Deterministic offer direction + Polite Peer glare handling:
       // Lexicographically smaller identity is the impolite initiator and leads.
+      const isNewRemoteSession = peer.session !== signal.fromSession
+      if (isNewRemoteSession) {
+        this.gone.delete(signal.from)
+        this.failedAt.delete(signal.from)
+        this.earlyIceByPeer.delete(signal.from)
+        this.dropLink(signal.from)
+        peer.session = signal.fromSession
+        peer.link = 'connecting'
+      }
       const polite = !this.isInitiator(signal.from)
-      if (!polite) return
+      if (!polite) {
+        // Impolite initiator: ignore glare from an already-live session,
+        // but if the remote peer rejoined with a fresh sessionId or our link
+        // is missing/dead, immediately send a fresh offer to their new session.
+        const active = this.links.get(signal.from)
+        if (
+          isNewRemoteSession ||
+          !active ||
+          active.pc.connectionState === 'failed' ||
+          active.pc.connectionState === 'closed'
+        ) {
+          void this.openLink(peer, true)
+        }
+        return
+      }
       await this.answer(peer, signal)
       return
     }

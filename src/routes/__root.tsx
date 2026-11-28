@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import {
   HeadContent,
   Outlet,
@@ -36,10 +37,22 @@ export const Route = createRootRoute({
       { property: 'og:type', content: 'website' },
       { name: 'twitter:card', content: 'summary_large_image' },
       { name: 'theme-color', content: '#115E46' },
+      { name: 'mobile-web-app-capable', content: 'yes' },
+      { name: 'apple-mobile-web-app-capable', content: 'yes' },
+      {
+        name: 'apple-mobile-web-app-status-bar-style',
+        content: 'black-translucent',
+      },
+      { name: 'apple-mobile-web-app-title', content: 'Lectern' },
     ],
     links: [
       { rel: 'icon', type: 'image/svg+xml', href: '/favicon.svg?v=3' },
-      { rel: 'apple-touch-icon', href: '/favicon.svg?v=3' },
+      {
+        rel: 'apple-touch-icon',
+        sizes: '180x180',
+        href: '/apple-touch-icon.png',
+      },
+      { rel: 'manifest', href: '/manifest.webmanifest' },
       { rel: 'preconnect', href: 'https://fonts.googleapis.com' },
       {
         rel: 'preconnect',
@@ -58,8 +71,23 @@ export const Route = createRootRoute({
   notFoundComponent: NotFoundPage,
 })
 
-// Handles auth callbacks and non-blocking Firestore permission notices.
+// Handles auth callbacks, PWA service worker registration, and non-blocking Firestore permission notices.
 function RootLayout() {
+  useEffect(() => {
+    if (typeof window === 'undefined' || !('serviceWorker' in navigator)) return
+    const register = () => {
+      navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {
+        // Ignore registration failure in private windows or unsupported environments
+      })
+    }
+    if (document.readyState === 'complete') {
+      register()
+    } else {
+      window.addEventListener('load', register, { once: true })
+      return () => window.removeEventListener('load', register)
+    }
+  }, [])
+
   return (
     <>
       <AuthCallbackHandler />

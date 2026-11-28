@@ -4,6 +4,7 @@ import {
   BookOpen,
   Camera,
   Check,
+  Download,
   GraduationCap,
   LogIn,
   LogOut,
@@ -11,6 +12,7 @@ import {
   Moon,
   Pencil,
   Settings,
+  Share,
   Sun,
   Trash2,
   UserRound,
@@ -49,7 +51,40 @@ import {
   useUserProfile,
 } from '@/lib/profile'
 import { useTheme } from '@/lib/theme'
+import { usePWAInstall } from '@/lib/use-pwa-install'
 import { cn } from '@/lib/utils'
+
+function InstallAppMenuSection({ onTriggered }: { onTriggered?: () => void }) {
+  const { isInstallable, showIOSHint, promptInstall } = usePWAInstall()
+
+  if (!isInstallable && !showIOSHint) return null
+
+  return (
+    <>
+      <Separator />
+      <div className="p-2">
+        {isInstallable ? (
+          <button
+            type="button"
+            onClick={() => {
+              onTriggered?.()
+              void promptInstall()
+            }}
+            className="flex w-full items-center gap-2 rounded-xl px-2.5 py-2 text-left text-xs font-medium text-primary transition-colors hover:bg-primary/10"
+          >
+            <Download className="size-4 shrink-0" />
+            Install App
+          </button>
+        ) : (
+          <p className="flex items-center gap-2 px-2.5 py-1.5 text-[11px] leading-snug text-muted-foreground">
+            <Share className="size-3.5 shrink-0 text-primary" />
+            <span>Tap Share → Add to Home Screen</span>
+          </p>
+        )}
+      </div>
+    </>
+  )
+}
 
 function AppearanceRow() {
   const { theme, setTheme } = useTheme()
@@ -213,6 +248,7 @@ export function ProfileMenu({
             <div className="px-4 py-3">
               <AppearanceRow />
             </div>
+            <InstallAppMenuSection onTriggered={() => setOpen(false)} />
           </PopoverContent>
         </Popover>
 
@@ -338,6 +374,8 @@ export function ProfileMenu({
             <div className="px-4 py-3">
               <AppearanceRow />
             </div>
+
+            <InstallAppMenuSection onTriggered={() => setOpen(false)} />
 
             <Separator />
 
@@ -608,6 +646,8 @@ export function ProfileMenu({
               />
             </div>
           </div>
+
+          <InstallAppMenuSection onTriggered={() => setOpen(false)} />
 
           <Separator />
 
