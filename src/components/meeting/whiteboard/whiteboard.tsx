@@ -87,7 +87,9 @@ import {
   deleteWhiteboardElements,
   subscribeWhiteboardElements,
   subscribeWhiteboardMeta,
+  subscribeWhiteboardPresence,
   updateWhiteboardMeta,
+  updateWhiteboardPresence,
   upsertWhiteboardElement,
   upsertWhiteboardElementsBatch,
 } from '@/services/firestore-meetings'
@@ -504,14 +506,23 @@ export function Whiteboard({
         if (activeIds.size === 0 && !draftId) {
           elementsRef.current = remote
           setElements(remote)
+          window.requestAnimationFrame(() => paintCanvasRef.current())
           return
         }
         const localById = new Map(elementsRef.current.map((e) => [e.id, e]))
         const merged = remote
           .filter((e) => e.id !== draftId)
           .map((e) => (activeIds.has(e.id) ? (localById.get(e.id) ?? e) : e))
+        // Preserve newly-typed live text/sticky elements that aren't in the remote snapshot yet
+        for (const activeId of activeIds) {
+          if (activeId !== draftId && !merged.some((e) => e.id === activeId)) {
+            const localEl = localById.get(activeId)
+            if (localEl) merged.push(localEl)
+          }
+        }
         elementsRef.current = merged
         setElements(merged)
+        window.requestAnimationFrame(() => paintCanvasRef.current())
       },
     )
     const unsubMeta =
@@ -528,30 +539,57 @@ export function Whiteboard({
                 force: meta.presenterCamera.force,
               })
             }
-            if (
-              meta.laser &&
-              meta.laser.id !== author &&
-              meta.laser.at > lastFsLaserAtRef.current &&
-              Date.now() - meta.laser.at < 2000
-            ) {
-              lastFsLaserAtRef.current = meta.laser.at
-              const l = meta.laser
-              setFsLasers((prev) => {
-                const nowTs = Date.now()
-                const others = prev.filter((x) => x.id !== l.id)
-                const cur = prev.find((x) => x.id === l.id)
+          })
+        : () => {}
+    const unsubPresence =
+      syncScope.kind === 'board'
+        ? subscribeWhiteboardPresence(syncScope.boardId, (entries) => {
+            const nowTs = Date.now()
+            setFsLasers((prev) => {
+              const byId = new Map(prev.map((l) => [l.id, l]))
+              let changed = false
+              for (const entry of entries) {
+                if (entry.uid === author) continue
+                if (!entry.active || nowTs - entry.at > 2000) {
+                  if (byId.has(entry.uid)) {
+                    byId.delete(entry.uid)
+                    changed = true
+                  }
+                  continue
+                }
+                const cur = byId.get(entry.uid)
+                const lastPt = cur?.points[cur.points.length - 1]
+                if (
+                  lastPt &&
+                  lastPt.x === entry.x &&
+                  lastPt.y === entry.y &&
+                  entry.at <= lastFsLaserAtRef.current
+                ) {
+                  continue
+                }
+                lastFsLaserAtRef.current = Math.max(
+                  lastFsLaserAtRef.current,
+                  entry.at,
+                )
                 const pts = [
                   ...(cur?.points.filter((pt) => nowTs - pt.at < 1500) ?? []),
-                  { x: l.x, y: l.y, at: nowTs },
+                  { x: entry.x, y: entry.y, at: nowTs },
                 ]
-                return [...others, { id: l.id, name: l.name, points: pts }]
-              })
-            }
+                byId.set(entry.uid, {
+                  id: entry.uid,
+                  name: entry.name,
+                  points: pts,
+                })
+                changed = true
+              }
+              return changed ? Array.from(byId.values()) : prev
+            })
           })
         : () => {}
     return () => {
       unsubEls()
       unsubMeta()
+      unsubPresence()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [syncKey, author])
@@ -2011,12 +2049,17 @@ export function Whiteboard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canDraw, onOp, pushHistory, syncKey])
 
-  // ---- Rich Inline Text Commit ---------------------------------------------
-  const commitTextEdit = useCallback(
-    (draft: RichTextDraft) => {
-      setTextEdit(null)
+  // ---- Rich Inline Text Live Streaming & Commit ----------------------------
+  const liveTextStreamIdRef = useRef<string | null>(null)
+  const lastTextStreamRef = useRef(0)
+
+  const buildTextElementFromDraft = useCallback(
+    (
+      draft: RichTextDraft,
+      id: string,
+      existing?: BoardElement,
+    ): BoardElement => {
       const trimmed = draft.value.trimEnd()
-      const prev = elementsRef.current
       const textDecoration: BoardElement['textDecoration'] =
         draft.underline && draft.strikethrough
           ? 'underline line-through'
@@ -2025,6 +2068,141 @@ export function Whiteboard({
             : draft.strikethrough
               ? 'line-through'
               : 'none'
+      if (existing) {
+        return {
+          ...existing,
+          w: draft.w,
+          h:
+            existing.kind === 'text'
+              ? Math.max(
+                  36,
+                  (trimmed || ' ').split('\n').length * draft.fontSize * 1.38,
+                )
+              : draft.h,
+          text: trimmed,
+          fontFamily: draft.fontFamily,
+          fontSize: draft.fontSize,
+          fontWeight: draft.fontWeight,
+          fontStyle: draft.fontStyle,
+          textDecoration,
+          textAlign: draft.textAlign,
+          textBg: draft.textBg,
+          strokeColor:
+            existing.kind === 'text' ? draft.color : existing.strokeColor,
+        }
+      }
+      const prev = elementsRef.current
+      const maxZ = prev.reduce((m, e) => Math.max(m, e.zIndex), 0)
+      const deck = findEnclosingPdfDeck(draft.wx, draft.wy)
+      if (draft.kind === 'sticky') {
+        return {
+          id,
+          kind: 'sticky',
+          x: draft.wx,
+          y: draft.wy,
+          w: draft.w,
+          h: draft.h,
+          rotation: 0,
+          strokeColor: draft.color,
+          fillColor: 'transparent',
+          strokeWidth: 2,
+          strokeStyle: 'solid',
+          opacity,
+          text: trimmed || 'Note',
+          fontFamily: draft.fontFamily,
+          fontSize: draft.fontSize,
+          fontWeight: draft.fontWeight,
+          fontStyle: draft.fontStyle,
+          textAlign: draft.textAlign,
+          stickyBg: draft.stickyBg || stickyColor,
+          pdfDeckId: deck?.id,
+          pdfDeckPage: deck ? (deck.pdfPageIndex ?? 0) : undefined,
+          zIndex: maxZ + 1,
+          author,
+          createdAt: Date.now(),
+        }
+      }
+      return {
+        id,
+        kind: 'text',
+        x: draft.wx,
+        y: draft.wy,
+        w: Math.max(140, draft.w),
+        h: Math.max(
+          36,
+          (trimmed || ' ').split('\n').length * draft.fontSize * 1.38,
+        ),
+        rotation: 0,
+        strokeColor: draft.color,
+        fillColor: 'transparent',
+        strokeWidth,
+        strokeStyle: 'solid',
+        opacity,
+        text: trimmed,
+        fontFamily: draft.fontFamily,
+        fontSize: draft.fontSize,
+        fontWeight: draft.fontWeight,
+        fontStyle: draft.fontStyle,
+        textDecoration,
+        textAlign: draft.textAlign,
+        textBg: draft.textBg,
+        pdfDeckId: deck?.id,
+        pdfDeckPage: deck ? (deck.pdfPageIndex ?? 0) : undefined,
+        zIndex: maxZ + 1,
+        author,
+        createdAt: Date.now(),
+      }
+    },
+    [author, findEnclosingPdfDeck, opacity, stickyColor, strokeWidth],
+  )
+
+  const handleTextEditChange = useCallback(
+    (nextDraft: RichTextDraft) => {
+      setTextEdit(nextDraft)
+      if (!syncScope) return
+      const now = Date.now()
+      if (now - lastTextStreamRef.current < 75) return
+      lastTextStreamRef.current = now
+
+      const targetId =
+        nextDraft.elementId ??
+        liveTextStreamIdRef.current ??
+        (liveTextStreamIdRef.current = makeElementId())
+      activeEditingIdsRef.current.add(targetId)
+      const existing = elementsRef.current.find((e) => e.id === targetId)
+      const liveEl = buildTextElementFromDraft(nextDraft, targetId, existing)
+      if (!liveEl.text && liveEl.kind === 'text') return
+      syncUpsert(liveEl)
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [syncKey, buildTextElementFromDraft, syncUpsert],
+  )
+
+  const cancelTextEdit = useCallback(() => {
+    const streamedId = liveTextStreamIdRef.current
+    liveTextStreamIdRef.current = null
+    if (streamedId) {
+      activeEditingIdsRef.current.delete(streamedId)
+      // Remove temporary unsaved text doc if it wasn't committed locally
+      if (!elementsRef.current.some((e) => e.id === streamedId)) {
+        syncDelete([streamedId])
+      }
+    }
+    if (textEdit?.elementId) {
+      activeEditingIdsRef.current.delete(textEdit.elementId)
+    }
+    setTextEdit(null)
+  }, [syncDelete, textEdit])
+
+  const commitTextEdit = useCallback(
+    (draft: RichTextDraft) => {
+      const streamedId = liveTextStreamIdRef.current
+      liveTextStreamIdRef.current = null
+      if (streamedId) activeEditingIdsRef.current.delete(streamedId)
+      if (draft.elementId) activeEditingIdsRef.current.delete(draft.elementId)
+      setTextEdit(null)
+      const trimmed = draft.value.trimEnd()
+      const prev = elementsRef.current
 
       if (draft.elementId) {
         const existing = prev.find((e) => e.id === draft.elementId)
@@ -2037,20 +2215,11 @@ export function Whiteboard({
           syncDelete([draft.elementId])
           return
         }
-        const updated: BoardElement = {
-          ...existing,
-          w: draft.w,
-          text: trimmed,
-          fontFamily: draft.fontFamily,
-          fontSize: draft.fontSize,
-          fontWeight: draft.fontWeight,
-          fontStyle: draft.fontStyle,
-          textDecoration,
-          textAlign: draft.textAlign,
-          textBg: draft.textBg,
-          strokeColor:
-            existing.kind === 'text' ? draft.color : existing.strokeColor,
-        }
+        const updated = buildTextElementFromDraft(
+          draft,
+          draft.elementId,
+          existing,
+        )
         pushHistory(prev)
         const next = prev.map((e) => (e.id === draft.elementId ? updated : e))
         elementsRef.current = next
@@ -2059,81 +2228,20 @@ export function Whiteboard({
         return
       }
 
-      if (!trimmed && draft.kind === 'text') return
-      const maxZ = prev.reduce((m, e) => Math.max(m, e.zIndex), 0)
-      const deck = findEnclosingPdfDeck(draft.wx, draft.wy)
-      const created: BoardElement =
-        draft.kind === 'sticky'
-          ? {
-              id: makeElementId(),
-              kind: 'sticky',
-              x: draft.wx,
-              y: draft.wy,
-              w: draft.w,
-              h: draft.h,
-              rotation: 0,
-              strokeColor: draft.color,
-              fillColor: 'transparent',
-              strokeWidth: 2,
-              strokeStyle: 'solid',
-              opacity,
-              text: trimmed || 'Note',
-              fontFamily: draft.fontFamily,
-              fontSize: draft.fontSize,
-              fontWeight: draft.fontWeight,
-              fontStyle: draft.fontStyle,
-              textAlign: draft.textAlign,
-              stickyBg: draft.stickyBg || stickyColor,
-              pdfDeckId: deck?.id,
-              pdfDeckPage: deck ? (deck.pdfPageIndex ?? 0) : undefined,
-              zIndex: maxZ + 1,
-              author,
-              createdAt: Date.now(),
-            }
-          : {
-              id: makeElementId(),
-              kind: 'text',
-              x: draft.wx,
-              y: draft.wy,
-              w: Math.max(140, draft.w),
-              h: Math.max(36, trimmed.split('\n').length * draft.fontSize * 1.38),
-              rotation: 0,
-              strokeColor: draft.color,
-              fillColor: 'transparent',
-              strokeWidth,
-              strokeStyle: 'solid',
-              opacity,
-              text: trimmed,
-              fontFamily: draft.fontFamily,
-              fontSize: draft.fontSize,
-              fontWeight: draft.fontWeight,
-              fontStyle: draft.fontStyle,
-              textDecoration,
-              textAlign: draft.textAlign,
-              textBg: draft.textBg,
-              pdfDeckId: deck?.id,
-              pdfDeckPage: deck ? (deck.pdfPageIndex ?? 0) : undefined,
-              zIndex: maxZ + 1,
-              author,
-              createdAt: Date.now(),
-            }
+      if (!trimmed && draft.kind === 'text') {
+        if (streamedId) syncDelete([streamedId])
+        return
+      }
+      const id = streamedId ?? makeElementId()
+      const created = buildTextElementFromDraft(draft, id)
       pushHistory(prev)
-      const next = [...prev, created]
+      const next = [...prev.filter((e) => e.id !== id), created]
       elementsRef.current = next
       setElements(next)
       setSelectedIds([created.id])
       syncUpsert(created)
     },
-    [
-      author,
-      findEnclosingPdfDeck,
-      opacity,
-      pushHistory,
-      stickyColor,
-      strokeWidth,
-      syncDelete,
-      syncUpsert,
-    ],
+    [buildTextElementFromDraft, pushHistory, syncDelete, syncUpsert],
   )
 
   // ---- Pointer Events ------------------------------------------------------
@@ -2245,14 +2353,12 @@ export function Whiteboard({
       localLaserRef.current.push({ x: wx, y: wy, at: Date.now() })
       onLaser?.(wx, wy)
       if (syncScope?.kind === 'board') {
-        void updateWhiteboardMeta(syncScope.boardId, {
-          laser: {
-            id: author,
-            name: authorName || 'Presenter',
-            x: wx,
-            y: wy,
-            at: Date.now(),
-          },
+        void updateWhiteboardPresence(syncScope.boardId, author, {
+          name: authorName || 'Presenter',
+          x: wx,
+          y: wy,
+          at: Date.now(),
+          active: true,
         })
       }
       setRenderTick((t) => t + 1)
@@ -2549,17 +2655,15 @@ export function Whiteboard({
       }
       if (
         syncScope?.kind === 'board' &&
-        now - lastFsLaserEmitRef.current > 90
+        now - lastFsLaserEmitRef.current > 60
       ) {
         lastFsLaserEmitRef.current = now
-        void updateWhiteboardMeta(syncScope.boardId, {
-          laser: {
-            id: author,
-            name: authorName || 'Presenter',
-            x: wx,
-            y: wy,
-            at: now,
-          },
+        void updateWhiteboardPresence(syncScope.boardId, author, {
+          name: authorName || 'Presenter',
+          x: wx,
+          y: wy,
+          at: now,
+          active: true,
         })
       }
       setRenderTick((t) => t + 1)
@@ -2621,7 +2725,7 @@ export function Whiteboard({
       elementsRef.current = next
       setElements(next)
       const now = Date.now()
-      if (movedEls.length > 0 && now - lastStreamSyncRef.current > 90) {
+      if (movedEls.length > 0 && now - lastStreamSyncRef.current > 65) {
         lastStreamSyncRef.current = now
         syncBatch([...movedEls, ...updatedConnectors])
       }
@@ -2666,7 +2770,7 @@ export function Whiteboard({
       elementsRef.current = next
       setElements(next)
       const now = Date.now()
-      if (now - lastStreamSyncRef.current > 90) {
+      if (now - lastStreamSyncRef.current > 65) {
         lastStreamSyncRef.current = now
         syncBatch([resized, ...updatedConnectors])
       }
@@ -2693,7 +2797,7 @@ export function Whiteboard({
       elementsRef.current = next
       setElements(next)
       const now = Date.now()
-      if (now - lastStreamSyncRef.current > 90) {
+      if (now - lastStreamSyncRef.current > 65) {
         lastStreamSyncRef.current = now
         syncUpsert(rotated)
       }
@@ -2745,7 +2849,7 @@ export function Whiteboard({
       }
       paintCanvas()
       const now = Date.now()
-      if (now - lastStreamSyncRef.current > 85) {
+      if (now - lastStreamSyncRef.current > 65) {
         lastStreamSyncRef.current = now
         syncUpsert({
           ...d,
@@ -2766,6 +2870,20 @@ export function Whiteboard({
     interactionRef.current = null
     guidesRef.current = []
     hoveredAnchorRef.current = null
+
+    if (inter.mode === 'laser') {
+      if (syncScope?.kind === 'board') {
+        const last = localLaserRef.current[localLaserRef.current.length - 1]
+        void updateWhiteboardPresence(syncScope.boardId, author, {
+          name: authorName || 'Presenter',
+          x: last?.x ?? inter.startWx,
+          y: last?.y ?? inter.startWy,
+          at: Date.now(),
+          active: false,
+        })
+      }
+      return
+    }
 
     if (inter.mode === 'marquee') {
       const m = marqueeRef.current
@@ -4272,9 +4390,9 @@ export function Whiteboard({
               camera={camera}
               boardTheme={boardTheme}
               containerWidth={viewportSize.width}
-              onChange={setTextEdit}
+              onChange={handleTextEditChange}
               onCommit={commitTextEdit}
-              onCancel={() => setTextEdit(null)}
+              onCancel={cancelTextEdit}
             />
           )}
 

@@ -4,6 +4,7 @@ import { generateMeetingId, isModernMeetingId } from '@/lib/meeting'
 import type { AvailabilityStatus } from '@/lib/profile'
 import {
   db,
+  ensureAuth,
   isPermissionDeniedError,
   reportFirestorePermissionError,
 } from '@/services/firebase'
@@ -31,8 +32,9 @@ export interface FirestoreUserDoc {
 export async function getUserAccountDoc(
   uid: string,
 ): Promise<FirestoreUserDoc | null> {
-  if (!uid) return null
+  if (!uid || typeof window === 'undefined') return null
   try {
+    await ensureAuth()
     const ref = doc(db, 'users', uid)
     const snap = await getDoc(ref)
     if (!snap.exists()) return null
@@ -81,8 +83,9 @@ export async function saveUserAccountDoc(
   uid: string,
   data: Partial<FirestoreUserDoc>,
 ): Promise<void> {
-  if (!uid) return
+  if (!uid || typeof window === 'undefined') return
   try {
+    await ensureAuth()
     const clean: Record<string, unknown> = {
       uid,
       updatedAt: Date.now(),

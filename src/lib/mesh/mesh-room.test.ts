@@ -6,17 +6,20 @@ import { MeshRoom } from './mesh-room'
 /** Minimal RTCPeerConnection stand-in: enough to drive the signalling path. */
 class FakePC {
   static instances: FakePC[] = []
+  config: RTCConfiguration | undefined
   localDescription: { type: string; sdp: string } | null = null
   remoteDescription: { type: string; sdp: string } | null = null
   signalingState = 'stable'
   connectionState = 'new'
-  iceGatheringState = 'complete'
+  iceGatheringState = 'gathering'
+  addedIce: RTCIceCandidateInit[] = []
   transceivers: { sender: { replaceTrack: () => Promise<void> } }[] = []
   onicecandidate: ((ev: unknown) => void) | null = null
   onconnectionstatechange: (() => void) | null = null
   ontrack: ((ev: unknown) => void) | null = null
   dc: FakeDC | null = null
-  constructor() {
+  constructor(config?: RTCConfiguration) {
+    this.config = config
     FakePC.instances.push(this)
   }
   createDataChannel() {
@@ -51,7 +54,9 @@ class FakePC {
       this.signalingState = 'stable'
     }
   }
-  async addIceCandidate() {}
+  async addIceCandidate(c: RTCIceCandidateInit) {
+    this.addedIce.push(c)
+  }
   async getStats() {
     return new Map()
   }
@@ -289,6 +294,97 @@ describe('MeshRoom', () => {
     // Only our own offer connection exists; the incoming offer was dropped.
     expect(FakePC.instances).toHaveLength(1)
     expect(FakePC.instances[0].localDescription?.type).toBe('offer')
+    await room.stop()
+  })
+
+  it('sends offers immediately with Trickle ICE and iceCandidatePoolSize without waiting for gathering', async () => {
+    const sync = vi.fn(async () =>
+      ok({
+        peers: [
+          {
+            identity: 'b-student',
+            session: 's1',
+            name: 'Sam',
+            role: 'student',
+          },
+        ],
+      }),
+    )
+    const { room } = makeRoom(sync, 'a-host')
+    room.start()
+    await flush()
+
+    const pc = FakePC.instances[0]
+    expect(pc.config?.iceCandidatePoolSize).toBe(4)
+    expect(pc.iceGatheringState).toBe('gathering')
+
+    // Emit a Trickle ICE candidate immediately after offer creation
+    pc.onicecandidate?.({
+      candidate: { toJSON: () => ({ candidate: 'candidate:1 1 UDP 1 127.0.0.1 9999 typ host' }) },
+    })
+
+    // Sent in ~15ms, NOT blocked by a 1500ms gathering wait
+    await vi.advanceTimersByTimeAsync(25)
+    const second = callArg(sync, 1)
+    expect(second.outbox.map((s) => s.kind)).toEqual(['offer', 'ice'])
+    await room.stop()
+  })
+
+  it('queues early remote ICE candidates arriving before offer and flushes them after setRemoteDescription', async () => {
+    let calls = 0
+    const sync = vi.fn(async () => {
+      calls += 1
+      return ok({
+        peers: [
+          { identity: 'a-teacher', session: 's9', name: 'Zoe', role: 'host' },
+        ],
+        inbox:
+          calls === 1
+            ? [
+                // ICE candidate arrives BEFORE the offer!
+                {
+                  id: 'ice-early',
+                  kind: 'ice' as const,
+                  from: 'a-teacher',
+                  fromSession: 's9',
+                  payload: JSON.stringify({
+                    candidate: 'candidate:early 1 UDP 1 1.2.3.4 5000 typ srflx',
+                  }),
+                },
+                {
+                  id: 'offer-1',
+                  kind: 'offer' as const,
+                  from: 'a-teacher',
+                  fromSession: 's9',
+                  payload: JSON.stringify({ type: 'offer', sdp: 'v=0' }),
+                },
+              ]
+            : [],
+      })
+    })
+    const { room } = makeRoom(sync, 'z-student')
+    room.start()
+    await flush()
+
+    const pc = FakePC.instances[0]
+    expect(pc.remoteDescription?.type).toBe('offer')
+    expect(pc.addedIce).toEqual([
+      { candidate: 'candidate:early 1 UDP 1 1.2.3.4 5000 typ srflx' },
+    ])
+    await room.stop()
+  })
+
+  it('triggers immediate sync when nudge() is called from real-time signaling listeners', async () => {
+    const sync = vi.fn(async () => ok())
+    const { room } = makeRoom(sync, 'a-host')
+    room.start()
+    await flush()
+    expect(sync).toHaveBeenCalledTimes(1)
+
+    // Without nudge(), next sync would wait SLOW_POLL_MS (4000ms)
+    room.nudge()
+    await vi.advanceTimersByTimeAsync(25)
+    expect(sync).toHaveBeenCalledTimes(2)
     await room.stop()
   })
 })

@@ -45,6 +45,7 @@ import { useClientValue } from '@/lib/use-client-value'
 import { loadHostKey } from '@/lib/host-keys'
 import { useMounted } from '@/lib/use-mounted'
 import { cn } from '@/lib/utils'
+import { ensureAuth } from '@/services/firebase'
 
 type LobbyMeeting = MeetingSummary & { youAreHost: boolean }
 
@@ -75,13 +76,14 @@ function Lobby() {
   const [loadingMeeting, setLoadingMeeting] = useState(!initialMeeting)
   const [joiningGuest, setJoiningGuest] = useState(false)
 
-  // Client-side fetch ensures meetings created in this browser or Firestore load reliably after hydration.
+  // Client-side fetch runs in parallel with Firebase Auth warmup so clicking Join is instant.
   useEffect(() => {
+    void ensureAuth().catch(() => {})
     if (initialMeeting) return
     let active = true
-    getMeeting({ data: { meetingId } })
-      .then((res) => {
-        if (active) setMeeting(res)
+    Promise.allSettled([ensureAuth(), getMeeting({ data: { meetingId } })])
+      .then(([, res]) => {
+        if (active && res.status === 'fulfilled') setMeeting(res.value)
       })
       .finally(() => {
         if (active) setLoadingMeeting(false)

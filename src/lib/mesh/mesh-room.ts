@@ -93,6 +93,7 @@ interface Link {
   session: string
   descriptionSent: boolean
   pendingIce: RTCIceCandidateInit[]
+  localIceBuffer: OutgoingSignal[]
   openedAt: number
   createdAt: number
   statsTimer: number
@@ -108,12 +109,11 @@ const SLOT_KIND: Record<Slot, 'audio' | 'video'> = {
   screenAudio: 'audio',
 }
 
-const IMMEDIATE_MS = 50
-const FAST_POLL_MS = 1000
+const IMMEDIATE_MS = 15
+const FAST_POLL_MS = 500
 const SLOW_POLL_MS = 4000
-const CONNECT_TIMEOUT_MS = 20_000
-const RETRY_AFTER_FAIL_MS = 8000
-const GATHER_WAIT_MS = 1500
+const CONNECT_TIMEOUT_MS = 15_000
+const RETRY_AFTER_FAIL_MS = 4000
 const PRESENCE_GRACE_MS = 30_000
 const SYNC_FAILS_BEFORE_RECONNECTING = 2
 const SYNC_GIVE_UP_MS = 60_000
@@ -122,22 +122,6 @@ export function newSessionId() {
   return typeof crypto !== 'undefined' && 'randomUUID' in crypto
     ? crypto.randomUUID().replace(/-/g, '').slice(0, 20)
     : Math.random().toString(36).slice(2, 14) + Date.now().toString(36)
-}
-
-function waitForGathering(pc: RTCPeerConnection, ms: number) {
-  if (pc.iceGatheringState === 'complete') return Promise.resolve()
-  return new Promise<void>((resolve) => {
-    const done = () => {
-      pc.removeEventListener('icegatheringstatechange', check)
-      window.clearTimeout(timer)
-      resolve()
-    }
-    const check = () => {
-      if (pc.iceGatheringState === 'complete') done()
-    }
-    const timer = window.setTimeout(done, ms)
-    pc.addEventListener('icegatheringstatechange', check)
-  })
 }
 
 export class MeshRoom {
@@ -166,12 +150,18 @@ export class MeshRoom {
 
   private links = new Map<string, Link>()
   private outbox: OutgoingSignal[] = []
+  /** Remote ICE candidates received before a peer's Link / remoteDescription exists. */
+  private earlyIce = new Map<
+    string,
+    { session: string; candidate: RTCIceCandidateInit }[]
+  >()
   private lastSeen = new Map<string, number>()
   private failedAt = new Map<string, number>()
   /** Sessions that said goodbye; ignored until presence shows a new one. */
   private gone = new Map<string, string>()
   private running = false
   private syncing = false
+  private syncQueued = false
   private timer = 0
   private syncFailures = 0
   private firstFailureAt = 0
@@ -310,8 +300,28 @@ export class MeshRoom {
 
   // ---- sync loop -------------------------------------------------------------
 
+  /**
+   * Immediately wakes the signaling loop (called by real-time Firestore
+   * `onSnapshot` listeners for signals or participants so handshakes finish
+   * in <150ms instead of waiting for a poll timer).
+   */
+  nudge() {
+    if (!this.running) return
+    if (this.syncing) {
+      this.syncQueued = true
+      return
+    }
+    window.clearTimeout(this.timer)
+    this.timer = window.setTimeout(() => void this.sync(), IMMEDIATE_MS)
+  }
+
   /** Runs a sync as soon as possible (used right after queueing a signal). */
   private requestSync() {
+    if (!this.running) return
+    if (this.syncing) {
+      this.syncQueued = true
+      return
+    }
     this.scheduleNext()
   }
 
@@ -322,13 +332,19 @@ export class MeshRoom {
       (p) => p.link === 'connecting',
     )
     const delay =
-      this.outbox.length > 0 ? IMMEDIATE_MS : busy ? FAST_POLL_MS : SLOW_POLL_MS
+      this.outbox.length > 0 || this.syncQueued
+        ? IMMEDIATE_MS
+        : busy
+          ? FAST_POLL_MS
+          : SLOW_POLL_MS
+    this.syncQueued = false
     this.timer = window.setTimeout(() => void this.sync(), delay)
   }
 
   private async sync() {
     if (!this.running || this.syncing) return
     this.syncing = true
+    this.syncQueued = false
     const outbox = this.outbox
     this.outbox = []
     let result: SyncResult
@@ -482,6 +498,7 @@ export class MeshRoom {
   private removePeer(id: string) {
     this.dropLink(id)
     this.peers.delete(id)
+    this.earlyIce.delete(id)
     this.lastSeen.delete(id)
     this.failedAt.delete(id)
     this.emit()
@@ -504,6 +521,7 @@ export class MeshRoom {
     const pc = new RTCPeerConnection({
       iceServers: this.opts.iceServers,
       bundlePolicy: 'max-bundle',
+      iceCandidatePoolSize: 4,
     })
     const dc = pc.createDataChannel('lectern', { negotiated: true, id: 0 })
     const link: Link = {
@@ -513,6 +531,7 @@ export class MeshRoom {
       session: peer.session,
       descriptionSent: false,
       pendingIce: [],
+      localIceBuffer: [],
       openedAt: 0,
       createdAt: Date.now(),
       statsTimer: 0,
@@ -548,13 +567,20 @@ export class MeshRoom {
 
     pc.onicecandidate = (ev) => {
       if (this.links.get(id) !== link) return
-      if (!ev.candidate || !link.descriptionSent) return
-      this.outbox.push({
+      if (!ev.candidate) return
+      const signal: OutgoingSignal = {
         kind: 'ice',
         to: id,
         toSession: link.session,
         payload: JSON.stringify(ev.candidate.toJSON()),
-      })
+      }
+      if (!link.descriptionSent) {
+        // Buffer candidates emitted during setLocalDescription so they trickle
+        // right after the offer/answer is queued.
+        link.localIceBuffer.push(signal)
+        return
+      }
+      this.outbox.push(signal)
       this.requestSync()
     }
     pc.onconnectionstatechange = () => {
@@ -644,7 +670,7 @@ export class MeshRoom {
     }
   }
 
-  /** Initiator side: build the offer with all four transceivers. */
+  /** Initiator side: build the offer with all four transceivers and emit immediately (Trickle ICE). */
   private async openLink(peer: MeshPeer, initiator: boolean) {
     this.dropLink(peer.identity)
     peer.link = 'connecting'
@@ -661,7 +687,6 @@ export class MeshRoom {
       }
       const offer = await link.pc.createOffer()
       await link.pc.setLocalDescription(offer)
-      await waitForGathering(link.pc, GATHER_WAIT_MS)
       if (this.links.get(peer.identity) !== link) return
       this.outbox.push({
         kind: 'offer',
@@ -670,21 +695,66 @@ export class MeshRoom {
         payload: JSON.stringify(link.pc.localDescription),
       })
       link.descriptionSent = true
+      if (link.localIceBuffer.length > 0) {
+        this.outbox.push(...link.localIceBuffer)
+        link.localIceBuffer = []
+      }
       this.requestSync()
     } catch {
       if (this.links.get(peer.identity) === link) this.markFailed(peer.identity)
     }
   }
 
+  private queueEarlyIce(
+    peerId: string,
+    session: string,
+    candidate: RTCIceCandidateInit,
+  ) {
+    const existing = this.earlyIce.get(peerId) ?? []
+    existing.push({ session, candidate })
+    // Cap buffer to prevent unbounded growth on stale sessions
+    if (existing.length > 64) existing.shift()
+    this.earlyIce.set(peerId, existing)
+  }
+
   private async handleSignal(signal: IncomingSignal) {
     const peer = this.peers.get(signal.from)
-    if (!peer) return
+    if (!peer) {
+      // Queue early ICE candidates even if presence list hasn't surfaced this peer yet.
+      if (signal.kind === 'ice') {
+        try {
+          const candidate = JSON.parse(signal.payload) as RTCIceCandidateInit
+          this.queueEarlyIce(signal.from, signal.fromSession, candidate)
+        } catch {
+          // ignore malformed ICE
+        }
+      }
+      return
+    }
     if (signal.kind === 'offer') {
-      if (this.isInitiator(signal.from)) return // Glare guard: we lead.
+      if (this.isInitiator(signal.from)) return // Polite/impolite glare guard: we lead.
       await this.answer(peer, signal)
       return
     }
     const link = this.links.get(signal.from)
+    if (signal.kind === 'ice') {
+      let candidate: RTCIceCandidateInit
+      try {
+        candidate = JSON.parse(signal.payload) as RTCIceCandidateInit
+      } catch {
+        return
+      }
+      if (!link || link.session !== signal.fromSession) {
+        this.queueEarlyIce(signal.from, signal.fromSession, candidate)
+        return
+      }
+      if (link.pc.remoteDescription) {
+        link.pc.addIceCandidate(candidate).catch(() => {})
+      } else {
+        link.pendingIce.push(candidate)
+      }
+      return
+    }
     if (!link || link.session !== signal.fromSession) return
     if (signal.kind === 'answer') {
       if (!link.initiator || link.pc.signalingState !== 'have-local-offer')
@@ -693,28 +763,29 @@ export class MeshRoom {
         await link.pc.setRemoteDescription(
           JSON.parse(signal.payload) as RTCSessionDescriptionInit,
         )
-        await this.flushIce(link)
+        await this.flushIce(peer.identity, link)
       } catch {
         this.markFailed(signal.from)
       }
-      return
-    }
-    // ICE candidate.
-    const candidate = JSON.parse(signal.payload) as RTCIceCandidateInit
-    if (link.pc.remoteDescription) {
-      link.pc.addIceCandidate(candidate).catch(() => {})
-    } else {
-      link.pendingIce.push(candidate)
     }
   }
 
-  private async flushIce(link: Link) {
+  private async flushIce(peerId: string, link: Link) {
+    const early = this.earlyIce.get(peerId)
+    if (early) {
+      this.earlyIce.delete(peerId)
+      for (const entry of early) {
+        if (entry.session === link.session) {
+          link.pendingIce.push(entry.candidate)
+        }
+      }
+    }
     const pending = link.pendingIce
     link.pendingIce = []
     for (const c of pending) await link.pc.addIceCandidate(c).catch(() => {})
   }
 
-  /** Answerer side: adopt the offer's transceivers and attach local tracks. */
+  /** Answerer side: adopt the offer's transceivers and emit answer immediately (Trickle ICE). */
   private async answer(peer: MeshPeer, signal: IncomingSignal) {
     if (peer.session !== signal.fromSession) {
       peer.session = signal.fromSession
@@ -728,6 +799,7 @@ export class MeshRoom {
       await link.pc.setRemoteDescription(
         JSON.parse(signal.payload) as RTCSessionDescriptionInit,
       )
+      await this.flushIce(peer.identity, link)
       const transceivers = link.pc.getTransceivers()
       SLOTS.forEach((slot, i) => {
         const t = transceivers[i]
@@ -738,7 +810,6 @@ export class MeshRoom {
       })
       const desc = await link.pc.createAnswer()
       await link.pc.setLocalDescription(desc)
-      await waitForGathering(link.pc, GATHER_WAIT_MS)
       if (this.links.get(peer.identity) !== link) return
       this.outbox.push({
         kind: 'answer',
@@ -747,7 +818,11 @@ export class MeshRoom {
         payload: JSON.stringify(link.pc.localDescription),
       })
       link.descriptionSent = true
-      await this.flushIce(link)
+      if (link.localIceBuffer.length > 0) {
+        this.outbox.push(...link.localIceBuffer)
+        link.localIceBuffer = []
+      }
+      await this.flushIce(peer.identity, link)
       this.requestSync()
     } catch {
       if (this.links.get(peer.identity) === link) this.markFailed(peer.identity)

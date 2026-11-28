@@ -5,7 +5,11 @@ import type { IceServer, MeetingSettings, Role } from '@/lib/meeting-types'
 import { MeshRoom, type MeshPeer } from '@/lib/mesh/mesh-room'
 import type { JoinPrefs } from '@/lib/prefs'
 import { leaveRoom, syncRoom } from '@/lib/signaling.functions'
-import { updateParticipantState } from '@/services/firestore-meetings'
+import {
+  subscribeMeetingParticipants,
+  subscribeMeetingSignals,
+  updateParticipantState,
+} from '@/services/firestore-meetings'
 import { useAttachStream, useLocalMedia } from '@/lib/use-local-media'
 import { useNetwork } from '@/lib/use-network'
 import { useScreenShare } from '@/lib/use-screen-share'
@@ -142,19 +146,28 @@ export function useMeshAdapter(opts: MeshAdapterOptions): RoomAdapter & {
       }),
   )
 
-  // StrictMode-safe lifecycle: only depends on [room] (tied to meetingId+identity).
-  // Never calls leaveRoom() on unmount; only leaves on explicit Leave click or beforeunload.
+  // StrictMode-safe lifecycle: only depends on [room, meetingId, identity].
+  // Real-time signal & participant listeners nudge MeshRoom immediately (<150ms)
+  // so WebRTC offers/answers/ICE candidates never wait on poll intervals.
   useEffect(() => {
     room.start()
+    const unsubSignals = subscribeMeetingSignals(meetingId, identity, () => {
+      room.nudge()
+    })
+    const unsubParticipants = subscribeMeetingParticipants(meetingId, () => {
+      room.nudge()
+    })
     const onBeforeUnload = () => {
       void room.stop('left')
     }
     window.addEventListener('beforeunload', onBeforeUnload)
     return () => {
       window.removeEventListener('beforeunload', onBeforeUnload)
+      unsubSignals()
+      unsubParticipants()
       room.pause()
     }
-  }, [room])
+  }, [room, meetingId, identity])
 
   // Publish local tracks whenever they change.
   const camTrack = media.hasVideo

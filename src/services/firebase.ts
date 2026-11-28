@@ -100,7 +100,9 @@ export function ensureAuth(): Promise<User> {
             return
           }
           signInAnonymously(auth)
-            .then((cred) => resolve(cred.user))
+            .then((cred) => {
+              resolve(cred.user)
+            })
             .catch((err) => {
               authInitPromise = null
               reject(err)
@@ -114,6 +116,11 @@ export function ensureAuth(): Promise<User> {
           reject(err)
         },
       )
+    }).finally(() => {
+      // If sign-out happened after resolving, allow next call to re-authenticate cleanly.
+      if (!auth.currentUser) {
+        authInitPromise = null
+      }
     })
   }
   return authInitPromise

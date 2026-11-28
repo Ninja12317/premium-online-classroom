@@ -25,7 +25,6 @@ import { useMeshAdapter } from '@/components/meeting/use-mesh-adapter'
 import { normalizeMeetingId } from '@/lib/meeting'
 import {
   getHostDetails,
-  getMeeting,
   joinMeeting,
   type JoinResult,
 } from '@/lib/meetings.functions'
@@ -37,22 +36,15 @@ import {
   saveParticipant,
 } from '@/lib/host-keys'
 import { loadPrefsCached, type JoinPrefs } from '@/lib/prefs'
+import { ensureAuth } from '@/services/firebase'
 import {
   subscribeMeetingDoc,
   subscribeParticipantDoc,
 } from '@/services/firestore-meetings'
 
 export const Route = createFileRoute('/meet/$meetingId')({
-  loader: async ({ params }) => {
-    const normalized = normalizeMeetingId(params.meetingId) ?? params.meetingId
-    try {
-      return await getMeeting({ data: { meetingId: normalized } })
-    } catch {
-      return null
-    }
-  },
-  head: ({ loaderData }) => ({
-    meta: loaderData ? [{ title: `${loaderData.title} · Lectern` }] : [],
+  head: ({ params }) => ({
+    meta: [{ title: `${params.meetingId} · Lectern` }],
   }),
   component: MeetPage,
 })
@@ -80,6 +72,8 @@ function MeetPage() {
       const stored = loadParticipant(meetingId)
       const hostKey = hostKeyRef.current
       try {
+        // Warm auth + run join cleanly without blocking on camera/mic hardware.
+        await ensureAuth().catch(() => {})
         const result = await joinMeeting({
           data: {
             meetingId,

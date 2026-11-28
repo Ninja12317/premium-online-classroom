@@ -58,12 +58,32 @@ export interface PresenterCameraState {
   force?: boolean
 }
 
+export interface PresenterViewportState {
+  panX: number
+  panY: number
+  zoom: number
+  cx?: number
+  cy?: number
+  by?: string
+  at?: number
+  force?: boolean
+}
+
 export interface BoardLaserState {
   id: string
   name: string
   x: number
   y: number
   at: number
+}
+
+export interface WhiteboardPresenceEntry {
+  uid: string
+  name: string
+  x: number
+  y: number
+  at: number
+  active: boolean
 }
 
 export interface MeetingSummary extends MeetingSettings {
@@ -85,10 +105,12 @@ export interface MeetingSummary extends MeetingSettings {
   whiteboardOpen?: boolean
   activeWhiteboardId?: string | null
   activeWhiteboardTitle?: string | null
+  allowParticipantAnnotate?: boolean
   muteAllAt?: number | null
   lastReaction?: MeetingReactionEvent | null
   screenAnnotations?: ScreenAnnStroke[]
   presenterCamera?: PresenterCameraState | null
+  presenterViewport?: PresenterViewportState | null
 }
 
 export interface PollOption {
