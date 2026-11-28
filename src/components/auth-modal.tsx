@@ -10,7 +10,7 @@ import {
 import { toast } from 'sonner'
 
 import { BackButton } from '@/components/back-button'
-import { useIdentity } from '@/components/identity-provider'
+import { useIdentity, type LecternUser } from '@/components/identity-provider'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -29,10 +29,14 @@ export type AuthModalMode = 'signin' | 'teacher' | 'student' | 'guest'
 
 export function AuthFormPanel({
   initialMode = 'signin',
+  notice,
+  hideGuestOption = false,
   onSuccess,
 }: {
   initialMode?: AuthModalMode
-  onSuccess?: () => void
+  notice?: string | null
+  hideGuestOption?: boolean
+  onSuccess?: (user: LecternUser) => void
 }) {
   const { signInAccount, registerAccount, signInAsGuest } = useIdentity()
   const router = useRouter()
@@ -73,7 +77,7 @@ export function AuthFormPanel({
       const account = await signInAccount(email, password)
       await router.invalidate()
       toast.success(`Signed in as ${account.name}`)
-      onSuccess?.()
+      onSuccess?.(account)
     } catch (err) {
       setError(
         describeAuthError(
@@ -115,7 +119,7 @@ export function AuthFormPanel({
           ? `Teacher account created for ${account.name}`
           : `Student account created for ${account.name}`,
       )
-      onSuccess?.()
+      onSuccess?.(account)
     } catch (err) {
       setError(
         describeAuthError(
@@ -137,7 +141,7 @@ export function AuthFormPanel({
       const guest = await signInAsGuest(guestName)
       await router.invalidate()
       toast.success(`Continuing as ${guest.name}`)
-      onSuccess?.()
+      onSuccess?.(guest)
     } catch (err) {
       setError(
         describeAuthError(
@@ -170,7 +174,15 @@ export function AuthFormPanel({
 
   return (
     <div className="space-y-4">
-      {mode === 'guest' ? (
+      {notice && (
+        <div
+          role="status"
+          className="rounded-xl border border-primary/25 bg-primary/10 px-3.5 py-2.5 text-xs font-medium text-foreground sm:text-sm"
+        >
+          {notice}
+        </div>
+      )}
+      {mode === 'guest' && !hideGuestOption ? (
         <form onSubmit={(e) => void handleGuestContinue(e)} className="space-y-4">
           <div className="flex items-center gap-2">
             <button
@@ -334,7 +346,12 @@ export function AuthFormPanel({
               </div>
 
               <form
-                onSubmit={(e) => void handleRegister(e, mode)}
+                onSubmit={(e) =>
+                  void handleRegister(
+                    e,
+                    mode === 'student' ? 'student' : 'teacher',
+                  )
+                }
                 className="space-y-3.5"
               >
                 <fieldset disabled={pending} className="space-y-3.5">
@@ -431,26 +448,35 @@ export function AuthFormPanel({
             </div>
           )}
 
-          {/* Clear "or" divider + prominent Continue as Guest option */}
-          <div className="relative py-1">
-            <div className="absolute inset-0 flex items-center" aria-hidden>
-              <span className="w-full border-t" />
-            </div>
-            <div className="relative flex justify-center text-xs uppercase">
-              <span className="bg-card px-2.5 text-muted-foreground">or</span>
-            </div>
-          </div>
+          {!hideGuestOption && (
+            <>
+              {/* Clear "or" divider + prominent Continue as Guest option */}
+              <div className="relative py-1">
+                <div
+                  className="absolute inset-0 flex items-center"
+                  aria-hidden
+                >
+                  <span className="w-full border-t" />
+                </div>
+                <div className="relative flex justify-center text-xs uppercase">
+                  <span className="bg-card px-2.5 text-muted-foreground">
+                    or
+                  </span>
+                </div>
+              </div>
 
-          <Button
-            type="button"
-            variant="outline"
-            className="w-full gap-2"
-            onClick={() => switchMode('guest')}
-            disabled={pending}
-          >
-            <UserRound className="size-4" />
-            Continue as Guest
-          </Button>
+              <Button
+                type="button"
+                variant="outline"
+                className="w-full gap-2"
+                onClick={() => switchMode('guest')}
+                disabled={pending}
+              >
+                <UserRound className="size-4" />
+                Continue as Guest
+              </Button>
+            </>
+          )}
         </>
       )}
     </div>
@@ -461,10 +487,16 @@ export function AuthModal({
   open,
   onOpenChange,
   initialMode = 'signin',
+  notice,
+  hideGuestOption = false,
+  onAuthenticated,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   initialMode?: AuthModalMode
+  notice?: string | null
+  hideGuestOption?: boolean
+  onAuthenticated?: (user: LecternUser) => void
 }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -479,16 +511,22 @@ export function AuthModal({
             <div>
               <DialogTitle>Welcome to Lectern</DialogTitle>
               <DialogDescription>
-                Sign in, create a Teacher or Student account, or continue as a
-                Guest.
+                {hideGuestOption
+                  ? 'Sign in or create a Teacher account to start or schedule classes.'
+                  : 'Sign in, create a Teacher or Student account, or continue as a Guest.'}
               </DialogDescription>
             </div>
           </div>
         </DialogHeader>
         <AuthFormPanel
-          key={`${open ? 'open' : 'closed'}-${initialMode}`}
+          key={`${open ? 'open' : 'closed'}-${initialMode}-${hideGuestOption ? 'reg' : 'any'}`}
           initialMode={initialMode}
-          onSuccess={() => onOpenChange(false)}
+          notice={notice}
+          hideGuestOption={hideGuestOption}
+          onSuccess={(account) => {
+            onOpenChange(false)
+            onAuthenticated?.(account)
+          }}
         />
       </DialogContent>
     </Dialog>

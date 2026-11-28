@@ -1,27 +1,27 @@
 import { useEffect, useRef, useState } from 'react'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import {
+  ArrowLeft,
+  Clock,
+  DoorClosed,
+  KeyRound,
   Mic,
   MicOff,
   Settings2,
+  Sparkles,
   Video,
   VideoOff,
-  KeyRound,
-  Clock,
-  Sparkles,
-  DoorClosed,
 } from 'lucide-react'
 
-import { SiteHeader } from '@/components/site-header'
+import { AvatarBubble } from '@/components/avatar-bubble'
 import { BackButton } from '@/components/back-button'
 import { DeviceSettings } from '@/components/device-settings'
-import { MediaError } from '@/components/media-error'
-import { AvatarBubble } from '@/components/avatar-bubble'
 import { displayName, useIdentity } from '@/components/identity-provider'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
+import { MediaError } from '@/components/media-error'
+import { ScheduledCountdownScreen } from '@/components/meeting/scheduled-countdown'
+import { SiteHeader } from '@/components/site-header'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import {
   Dialog,
   DialogContent,
@@ -30,22 +30,24 @@ import {
   DialogTitle,
   DialogTrigger,
 } from '@/components/ui/dialog'
-import { getMeeting } from '@/lib/meetings.functions'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { loadHostKey, saveHostKey } from '@/lib/host-keys'
 import { normalizeMeetingId } from '@/lib/meeting'
-import type { MeetingSummary } from '@/lib/meeting-types'
-import { ensureAuth } from '@/services/firebase'
-import { useAttachStream, useLocalMedia } from '@/lib/use-local-media'
-import { useSpeaking } from '@/lib/use-speaking'
 import {
-  savePrefs,
-  useJoinPrefs,
-  type JoinPrefs,
-} from '@/lib/prefs'
+  isScheduledMeetingNotStarted,
+  type MeetingSummary,
+} from '@/lib/meeting-types'
+import { getMeeting, startScheduledMeeting } from '@/lib/meetings.functions'
+import { savePrefs, useJoinPrefs, type JoinPrefs } from '@/lib/prefs'
 import { useUserProfile } from '@/lib/profile'
 import { useClientValue } from '@/lib/use-client-value'
-import { loadHostKey, saveHostKey } from '@/lib/host-keys'
+import { useAttachStream, useLocalMedia } from '@/lib/use-local-media'
 import { useMounted } from '@/lib/use-mounted'
+import { useSpeaking } from '@/lib/use-speaking'
 import { cn } from '@/lib/utils'
+import { auth, ensureAuth } from '@/services/firebase'
+import { subscribeMeetingDoc } from '@/services/firestore-meetings'
 
 type LobbyMeeting = MeetingSummary & { youAreHost: boolean }
 
@@ -62,15 +64,33 @@ function Lobby() {
   const { meetingId: rawMeetingId } = Route.useParams()
   const meetingId = normalizeMeetingId(rawMeetingId) ?? rawMeetingId
   const navigate = useNavigate()
-  const mounted = useMounted()
   const { user, authStatus, ready, signInAsGuest } = useIdentity()
 
   const [meeting, setMeeting] = useState<LobbyMeeting | null>(initialMeeting)
   const [loadingMeeting, setLoadingMeeting] = useState(!initialMeeting)
-  const [joiningGuest, setJoiningGuest] = useState(false)
+  const [autoTransitioning, setAutoTransitioning] = useState(false)
 
-  // Parallel non-blocking boot: kick off auth + room metadata fetch together
-  // while camera/mic preview warms asynchronously in useLocalMedia.
+  const stored = useJoinPrefs()
+  const profile = useUserProfile()
+  const hostKey = useClientValue(() => loadHostKey(meetingId), null)
+  const [studentNameDraft, setStudentNameDraft] = useState('')
+  const studentNameRef = useRef('')
+  const autoJoinedRef = useRef(false)
+  const wasWaitingForStartRef = useRef(false)
+
+  const isLoggedOut = ready && authStatus === 'loggedOut'
+  const resolvedDefaultName = isLoggedOut
+    ? ''
+    : profile.displayName.trim() ||
+      stored.name ||
+      (ready && user ? displayName(user) : '')
+  const effectiveStudentName = studentNameDraft || resolvedDefaultName
+  useEffect(() => {
+    studentNameRef.current = effectiveStudentName
+  }, [effectiveStudentName])
+
+  // Parallel non-blocking boot: kick off auth + room metadata fetch together.
+  // Camera/mic hardware is NOT requested until ActiveLobby mounts.
   useEffect(() => {
     if (initialMeeting) return
     let active = true
@@ -92,29 +112,88 @@ function Lobby() {
     }
   }, [meetingId, initialMeeting])
 
-  const stored = useJoinPrefs()
-  const profile = useUserProfile()
-  const hostKey = useClientValue(() => loadHostKey(meetingId), null)
-  const [edits, setEdits] = useState<Partial<JoinPrefs>>({})
-  const [passcode, setPasscode] = useState('')
-  const [blurPreview, setBlurPreview] = useState(false)
+  const currentUid = user?.id ?? auth.currentUser?.uid ?? null
+  const isHost = Boolean(
+    hostKey ||
+      meeting?.youAreHost ||
+      (currentUid && meeting?.hostId && currentUid === meeting.hostId),
+  )
 
-  const isLoggedOut = ready && authStatus === 'loggedOut'
-  const prefs: JoinPrefs = {
-    ...stored,
-    ...edits,
-    name:
-      edits.name ??
-      (isLoggedOut
-        ? ''
-        : profile.displayName.trim() ||
-          stored.name ||
-          (ready && user ? displayName(user) : '')),
-  }
-  const setPrefs = (update: (p: JoinPrefs) => JoinPrefs) => {
-    const next = update(prefs)
-    setEdits((e) => ({ ...e, ...next }))
-  }
+  const isEnded = Boolean(
+    meeting && (meeting.status === 'ended' || meeting.endedAt),
+  )
+  const notStartedForStudent = Boolean(
+    meeting && !isHost && !isEnded && isScheduledMeetingNotStarted(meeting),
+  )
+
+  useEffect(() => {
+    if (notStartedForStudent) {
+      wasWaitingForStartRef.current = true
+    }
+  }, [notStartedForStudent])
+
+  const loadedMeetingId = meeting?.meetingId ?? null
+
+  const storedRef = useRef(stored)
+  const authStateRef = useRef({ authStatus, user, signInAsGuest, navigate })
+  useEffect(() => {
+    storedRef.current = stored
+    authStateRef.current = { authStatus, user, signInAsGuest, navigate }
+  }, [stored, authStatus, user, signInAsGuest, navigate])
+
+  // Lightweight real-time Firestore listener on `meetings/{meetingId}` so
+  // students on the pre-start countdown screen automatically transition the
+  // instant the Host starts the class, and ended states reflect live.
+  useEffect(() => {
+    if (!loadedMeetingId) return
+    let active = true
+    const unsub = subscribeMeetingDoc(meetingId, (summary) => {
+      if (!active) return
+      setMeeting((prev) => ({
+        ...summary,
+        youAreHost: Boolean(
+          prev?.youAreHost ||
+            (currentUid && summary.hostId && currentUid === summary.hostId),
+        ),
+      }))
+
+      // Auto-transition non-host students the moment Host starts the class!
+      if (
+        wasWaitingForStartRef.current &&
+        !isHost &&
+        !autoJoinedRef.current &&
+        summary.status === 'live' &&
+        summary.hostStarted === true &&
+        !summary.endedAt
+      ) {
+        autoJoinedRef.current = true
+        setAutoTransitioning(true)
+        const chosenName = studentNameRef.current.trim() || 'Guest'
+        void (async () => {
+          try {
+            const {
+              authStatus: currentAuthStatus,
+              user: currentUser,
+              signInAsGuest: doGuestSignIn,
+              navigate: doNavigate,
+            } = authStateRef.current
+            if (currentAuthStatus === 'loggedOut' || !currentUser) {
+              await doGuestSignIn(chosenName)
+            }
+            savePrefs({ ...storedRef.current, name: chosenName })
+            await doNavigate({ to: '/meet/$meetingId', params: { meetingId } })
+          } catch {
+            autoJoinedRef.current = false
+            setAutoTransitioning(false)
+          }
+        })()
+      }
+    })
+    return () => {
+      active = false
+      unsub()
+    }
+  }, [loadedMeetingId, meetingId, isHost, currentUid])
 
   function handleBack() {
     if (typeof window !== 'undefined' && window.history.length > 1) {
@@ -123,17 +202,6 @@ function Lobby() {
       void navigate({ to: '/' })
     }
   }
-
-  const isHost = !!hostKey || !!meeting?.youAreHost
-  const media = useLocalMedia({
-    micOn: prefs.micOn,
-    camOn: prefs.camOn,
-    cameraId: prefs.cameraId,
-    micId: prefs.micId,
-  })
-  const { level } = useSpeaking(media.stream, prefs.micOn)
-  const videoRef = useRef<HTMLVideoElement>(null)
-  useAttachStream(videoRef, media.hasVideo ? media.stream : null)
 
   if (loadingMeeting) {
     return (
@@ -164,12 +232,115 @@ function Lobby() {
             Double-check the invite link or meeting ID with your teacher.
           </p>
           <Button asChild>
-            <Link to="/">Go home</Link>
+            <Link to="/">Back to Home</Link>
           </Button>
         </main>
       </div>
     )
   }
+
+  // Ended meeting screen (no camera/mic request, no waiting room)
+  if (isEnded) {
+    return (
+      <div className="min-h-svh bg-background">
+        <SiteHeader />
+        <main className="mx-auto flex max-w-md flex-col items-center gap-4 px-4 py-24 text-center">
+          <span className="grid size-14 place-items-center rounded-2xl bg-primary/10 text-primary">
+            <Clock className="size-7" />
+          </span>
+          <h1 className="font-display text-2xl font-semibold sm:text-3xl">
+            This class has ended
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            {meeting.title} is over. Ask your teacher for a new invite link if
+            another session is scheduled.
+          </p>
+          <Button asChild className="mt-1 gap-1.5">
+            <Link to="/">
+              <ArrowLeft className="size-4" />
+              Back to Home
+            </Link>
+          </Button>
+        </main>
+      </div>
+    )
+  }
+
+  // Scheduled meeting that Host hasn't started yet: show clean countdown screen
+  // for non-hosts WITHOUT requesting camera/mic or entering the waiting room.
+  if (notStartedForStudent || autoTransitioning) {
+    return (
+      <ScheduledCountdownScreen
+        meeting={meeting}
+        studentName={effectiveStudentName}
+        onStudentNameChange={setStudentNameDraft}
+        transitioning={autoTransitioning}
+      />
+    )
+  }
+
+  // Active pre-join lobby (Host always enters here; students enter once Host starts)
+  return (
+    <ActiveLobby
+      meeting={meeting}
+      meetingId={meetingId}
+      isHost={isHost}
+      hostKey={hostKey}
+      onBack={handleBack}
+    />
+  )
+}
+
+function ActiveLobby({
+  meeting,
+  meetingId,
+  isHost,
+  hostKey,
+  onBack,
+}: {
+  meeting: LobbyMeeting
+  meetingId: string
+  isHost: boolean
+  hostKey: string | null
+  onBack: () => void
+}) {
+  const navigate = useNavigate()
+  const mounted = useMounted()
+  const { user, authStatus, ready, signInAsGuest } = useIdentity()
+
+  const stored = useJoinPrefs()
+  const profile = useUserProfile()
+  const [edits, setEdits] = useState<Partial<JoinPrefs>>({})
+  const [passcode, setPasscode] = useState('')
+  const [blurPreview, setBlurPreview] = useState(false)
+  const [joiningGuest, setJoiningGuest] = useState(false)
+
+  const isLoggedOut = ready && authStatus === 'loggedOut'
+  const prefs: JoinPrefs = {
+    ...stored,
+    ...edits,
+    name:
+      edits.name ??
+      (isLoggedOut
+        ? ''
+        : profile.displayName.trim() ||
+          stored.name ||
+          (ready && user ? displayName(user) : '')),
+  }
+  const setPrefs = (update: (p: JoinPrefs) => JoinPrefs) => {
+    const next = update(prefs)
+    setEdits((e) => ({ ...e, ...next }))
+  }
+
+  const media = useLocalMedia({
+    micOn: prefs.micOn,
+    camOn: prefs.camOn,
+    cameraId: prefs.cameraId,
+    micId: prefs.micId,
+  })
+  const { level } = useSpeaking(media.stream, prefs.micOn)
+  const videoRef = useRef<HTMLVideoElement>(null)
+  useAttachStream(videoRef, media.hasVideo ? media.stream : null)
 
   const name = prefs.name.trim()
   const canJoin =
@@ -177,11 +348,14 @@ function Lobby() {
     name.length > 0 &&
     (!meeting.hasPasscode || isHost || passcode.trim().length > 0)
 
+  const scheduledNotStarted = isScheduledMeetingNotStarted(meeting)
+  const scheduled = meeting.scheduledAt ? new Date(meeting.scheduledAt) : null
+
   async function join() {
     if (!canJoin) return
     setJoiningGuest(true)
     try {
-      // Preserve host key if this tab just created the class while logged out.
+      // Preserve host key if this tab has one stored.
       const preservedHostKey = hostKey ?? loadHostKey(meetingId)
       // Direct meeting link opened while logged out: establish an explicit Guest session smoothly.
       if (authStatus === 'loggedOut' || !user) {
@@ -189,6 +363,14 @@ function Lobby() {
         if (preservedHostKey) {
           saveHostKey(meetingId, preservedHostKey)
         }
+      }
+      // If Host is starting a scheduled class early/on-time, immediately flip
+      // `status: "live"`, `hostStarted: true`, `startedAt: serverTimestamp()`
+      // so waiting students auto-transition in real time.
+      if (isHost && scheduledNotStarted) {
+        await startScheduledMeeting({
+          data: { meetingId, hostKey: preservedHostKey ?? undefined },
+        }).catch(() => {})
       }
       savePrefs({ ...prefs, name })
       try {
@@ -211,14 +393,11 @@ function Lobby() {
     }
   }
 
-  const ended = !!meeting.endedAt
-  const scheduled = meeting.scheduledAt ? new Date(meeting.scheduledAt) : null
-
   return (
     <div className="min-h-svh bg-background">
       <SiteHeader />
       <div className="mx-auto max-w-content px-4 pt-4 sm:px-6 lg:pt-6">
-        <BackButton onClick={handleBack} label="Back" />
+        <BackButton onClick={onBack} label="Back" />
       </div>
       <main className="mx-auto grid max-w-content gap-8 px-4 pb-10 pt-4 sm:px-6 lg:grid-cols-[1.25fr_1fr] lg:items-start lg:py-8">
         <section
@@ -281,7 +460,9 @@ function Lobby() {
                 type="button"
                 variant="secondary"
                 size="icon"
-                aria-label={blurPreview ? 'Disable video blur' : 'Enable video blur'}
+                aria-label={
+                  blurPreview ? 'Disable video blur' : 'Enable video blur'
+                }
                 aria-pressed={blurPreview}
                 onClick={() => setBlurPreview((b) => !b)}
                 className={cn(
@@ -335,11 +516,14 @@ function Lobby() {
         <section className="animate-fade-up stagger-1 motion-reduce:animate-none rounded-2xl border bg-card p-6 shadow-sm sm:p-8">
           <div className="mb-6">
             <div className="mb-2 flex flex-wrap items-center gap-2">
-              {meeting.startedAt && !ended && (
+              {meeting.hostStarted && meeting.status === 'live' && (
                 <Badge className="gap-1 bg-live text-white hover:bg-live">
                   <span className="size-1.5 rounded-full bg-white animate-pulse-dot" />{' '}
                   In progress
                 </Badge>
+              )}
+              {isHost && scheduledNotStarted && (
+                <Badge variant="outline">Scheduled · Ready to start</Badge>
               )}
               {isHost && <Badge variant="secondary">Teacher · Host</Badge>}
               {!isHost && user?.role === 'student' && (
@@ -348,7 +532,6 @@ function Lobby() {
               {!isHost && (isLoggedOut || user?.isGuest) && (
                 <Badge variant="secondary">Joining as Guest</Badge>
               )}
-              {ended && <Badge variant="outline">Ended</Badge>}
             </div>
             <h1 className="font-display text-2xl font-semibold leading-tight sm:text-3xl">
               {meeting.title}
@@ -369,72 +552,70 @@ function Lobby() {
             )}
           </div>
 
-          {ended ? (
-            <p className="rounded-xl bg-muted p-4 text-sm text-muted-foreground">
-              This class has ended. Ask your teacher for a new link.
-            </p>
-          ) : (
-            <form
-              onSubmit={(e) => {
-                e.preventDefault()
-                void join()
-              }}
-              className="space-y-4"
-            >
+          <form
+            onSubmit={(e) => {
+              e.preventDefault()
+              void join()
+            }}
+            className="space-y-4"
+          >
+            <div className="space-y-1.5">
+              <Label htmlFor="join-name">Your name</Label>
+              <Input
+                id="join-name"
+                value={prefs.name}
+                onChange={(e) =>
+                  setPrefs((p) => ({ ...p, name: e.target.value }))
+                }
+                placeholder="How others will see you"
+                maxLength={60}
+                autoComplete="name"
+                required
+              />
+            </div>
+            {meeting.hasPasscode && !isHost && (
               <div className="space-y-1.5">
-                <Label htmlFor="join-name">Your name</Label>
+                <Label
+                  htmlFor="join-passcode"
+                  className="flex items-center gap-1.5"
+                >
+                  <KeyRound className="size-3.5" /> Passcode
+                </Label>
                 <Input
-                  id="join-name"
-                  value={prefs.name}
-                  onChange={(e) =>
-                    setPrefs((p) => ({ ...p, name: e.target.value }))
-                  }
-                  placeholder="How others will see you"
-                  maxLength={60}
-                  autoComplete="name"
+                  id="join-passcode"
+                  value={passcode}
+                  onChange={(e) => setPasscode(e.target.value)}
+                  inputMode="numeric"
+                  placeholder="6-digit code from your teacher"
+                  maxLength={12}
                   required
                 />
               </div>
-              {meeting.hasPasscode && !isHost && (
-                <div className="space-y-1.5">
-                  <Label
-                    htmlFor="join-passcode"
-                    className="flex items-center gap-1.5"
-                  >
-                    <KeyRound className="size-3.5" /> Passcode
-                  </Label>
-                  <Input
-                    id="join-passcode"
-                    value={passcode}
-                    onChange={(e) => setPasscode(e.target.value)}
-                    inputMode="numeric"
-                    placeholder="6-digit code from your teacher"
-                    maxLength={12}
-                    required
-                  />
-                </div>
-              )}
-              <Button
-                type="submit"
-                size="lg"
-                className="h-12 w-full text-base"
-                disabled={!canJoin}
-              >
-                {isHost
-                  ? meeting.startedAt
+            )}
+            <Button
+              type="submit"
+              size="lg"
+              className="h-12 w-full text-base"
+              disabled={!canJoin}
+            >
+              {isHost
+                ? scheduledNotStarted
+                  ? 'Start Class Now'
+                  : meeting.startedAt
                     ? 'Rejoin class'
                     : 'Start class'
-                  : 'Join class'}
-              </Button>
-              <p className="text-center text-xs text-muted-foreground">
-                {isHost
-                  ? 'Students wait in the waiting room until you admit them.'
-                  : meeting.waitingRoom
-                    ? 'Your teacher will let you in from the waiting room.'
-                    : 'You will join as soon as you tap the button.'}
-              </p>
-            </form>
-          )}
+                : 'Join class'}
+            </Button>
+            <p className="text-center text-xs text-muted-foreground">
+              {isHost
+                ? scheduledNotStarted
+                  ? 'Students opening the invite link see a countdown until you click Start Class Now.'
+                  : 'Students wait in the waiting room until you admit them.'
+                : meeting.waitingRoom
+                  ? 'Your teacher will let you in from the waiting room.'
+                  : 'You will join as soon as you tap the button.'}
+            </p>
+          </form>
         </section>
       </main>
     </div>

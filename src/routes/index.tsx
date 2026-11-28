@@ -30,7 +30,11 @@ import {
   WhiteboardsTab,
   type DashboardMeeting,
 } from '@/components/dashboard-tabs'
-import { displayName, useIdentity } from '@/components/identity-provider'
+import {
+  displayName,
+  useIdentity,
+  type LecternUser,
+} from '@/components/identity-provider'
 import { ScheduleDialog } from '@/components/schedule-dialog'
 import {
   MobileBottomNav,
@@ -63,14 +67,21 @@ import {
   parseMeetingInput,
 } from '@/lib/meeting'
 import {
-  createMeeting,
+  HOST_AUTH_REQUIRED_NOTICE,
+  isAuthRequiredError,
+  isRegisteredUser,
+  type PendingHostAction,
+} from '@/lib/auth-gate'
+import {
   deleteMeeting,
   listMyMeetings,
+  startInstantMeeting,
 } from '@/lib/meetings.functions'
 import { isUpcomingScheduledMeeting } from '@/lib/meeting-types'
 import { useJoinPrefs } from '@/lib/prefs'
 import { useUserProfile } from '@/lib/profile'
 import { useMounted } from '@/lib/use-mounted'
+import { auth } from '@/services/firebase'
 import { subscribeUserMeetings } from '@/services/firestore-meetings'
 
 export const Route = createFileRoute('/')({
@@ -99,6 +110,10 @@ function HomeDashboard() {
   const [whiteboardFullscreen, setWhiteboardFullscreen] = useState(false)
   const [authModalOpen, setAuthModalOpen] = useState(false)
   const [authModalMode, setAuthModalMode] = useState<AuthModalMode>('signin')
+  const [authNotice, setAuthNotice] = useState<string | null>(null)
+  const [authHideGuest, setAuthHideGuest] = useState(false)
+  const [pendingReturnAction, setPendingReturnAction] =
+    useState<PendingHostAction | null>(null)
   const [clock, setClock] = useState(() => new Date())
 
   const isTeacher = authStatus === 'authenticated' && role === 'teacher'
@@ -113,10 +128,23 @@ function HomeDashboard() {
       undefined
     : undefined
 
-  const openAuthModal = useCallback((mode: AuthModalMode) => {
-    setAuthModalMode(mode)
-    setAuthModalOpen(true)
-  }, [])
+  const openAuthModal = useCallback(
+    (
+      mode: AuthModalMode,
+      opts?: {
+        notice?: string | null
+        hideGuestOption?: boolean
+        returnAction?: PendingHostAction | null
+      },
+    ) => {
+      setAuthModalMode(mode)
+      setAuthNotice(opts?.notice ?? null)
+      setAuthHideGuest(Boolean(opts?.hideGuestOption))
+      setPendingReturnAction(opts?.returnAction ?? null)
+      setAuthModalOpen(true)
+    },
+    [],
+  )
 
   const handleTabChange = useCallback(
     (next: DashboardTab) => {
@@ -207,23 +235,53 @@ function HomeDashboard() {
     }
   }, [ready, activeProfileUid])
 
-  async function startNewMeeting(mode: 'instant' | 'pmi' = 'instant') {
-    if (isStudent) {
-      toast.info('Switch to a Teacher account to host a live class.')
-      openAuthModal('teacher')
-      return
+  function requireRegisteredHost(action: PendingHostAction, overrideUser?: LecternUser | null): boolean {
+    const activeUser = overrideUser ?? user
+    if (!isRegisteredUser(activeUser) || !isRegisteredUser(auth.currentUser)) {
+      toast.info(HOST_AUTH_REQUIRED_NOTICE)
+      openAuthModal('signin', {
+        notice: HOST_AUTH_REQUIRED_NOTICE,
+        hideGuestOption: true,
+        returnAction: action,
+      })
+      return false
     }
+    if (activeUser?.role === 'student') {
+      toast.info('Switch to a Teacher account to host a live class.')
+      openAuthModal('teacher', {
+        notice: HOST_AUTH_REQUIRED_NOTICE,
+        hideGuestOption: true,
+        returnAction: action,
+      })
+      return false
+    }
+    return true
+  }
+
+  async function startNewMeeting(
+    mode: 'instant' | 'pmi' = 'instant',
+    overrideUser?: LecternUser | null,
+  ) {
+    const action: PendingHostAction =
+      mode === 'pmi' ? 'new-meeting-pmi' : 'new-meeting'
+    if (!requireRegisteredHost(action, overrideUser)) return
     if (starting) return
     setStarting(true)
     try {
-      const result = await createMeeting({
+      const effectiveUser = overrideUser ?? user
+      const hostName =
+        effectiveUser?.name ||
+        resolvedHostName ||
+        profile.displayName.trim() ||
+        undefined
+      const effectivePmi = effectiveUser?.pmi || teacherPmi
+      const result = await startInstantMeeting({
         data: {
           title: mode === 'pmi' ? 'Personal Meeting Room' : 'Live class',
-          hostName: resolvedHostName,
+          hostName,
           waitingRoom: true,
-          meetingType: 'instant',
           customMeetingId:
-            mode === 'pmi' && teacherPmi ? teacherPmi : undefined,
+            mode === 'pmi' && effectivePmi ? effectivePmi : undefined,
         },
       })
       saveHostKey(result.meetingId, result.hostKey)
@@ -231,20 +289,40 @@ function HomeDashboard() {
         to: '/join/$meetingId',
         params: { meetingId: result.meetingId },
       })
-    } catch {
-      toast.error('Could not start a class right now. Please try again.')
+    } catch (err) {
+      if (isAuthRequiredError(err)) {
+        toast.info(HOST_AUTH_REQUIRED_NOTICE)
+        openAuthModal('signin', {
+          notice: HOST_AUTH_REQUIRED_NOTICE,
+          hideGuestOption: true,
+          returnAction: action,
+        })
+      } else {
+        toast.error('Could not start a class right now. Please try again.')
+      }
       setStarting(false)
     }
   }
 
-  function handleOpenSchedule() {
-    if (isStudent) {
-      toast.info('Sign in with a Teacher account to schedule classes.')
-      openAuthModal('teacher')
-      return
-    }
+  function handleOpenSchedule(overrideUser?: LecternUser | null) {
+    if (!requireRegisteredHost('schedule', overrideUser)) return
     setEditingMeeting(null)
     setScheduleOpen(true)
+  }
+
+  function handleAuthSuccess(account: LecternUser) {
+    const action = pendingReturnAction
+    setPendingReturnAction(null)
+    setAuthNotice(null)
+    setAuthHideGuest(false)
+    if (!action || !isRegisteredUser(account)) return
+    if (action === 'schedule') {
+      handleOpenSchedule(account)
+    } else if (action === 'new-meeting') {
+      void startNewMeeting('instant', account)
+    } else if (action === 'new-meeting-pmi') {
+      void startNewMeeting('pmi', account)
+    }
   }
 
   function handleCopyPmi() {
@@ -477,7 +555,7 @@ function HomeDashboard() {
                           icon={CalendarPlus}
                           title="Schedule"
                           description="Plan a class with permanent link & passcode"
-                          onClick={handleOpenSchedule}
+                          onClick={() => handleOpenSchedule()}
                         />
                       </div>
                     ) : (
@@ -612,7 +690,7 @@ function HomeDashboard() {
                             size="xs"
                             variant="outline"
                             className="gap-1"
-                            onClick={handleOpenSchedule}
+                            onClick={() => handleOpenSchedule()}
                           >
                             <CalendarPlus className="size-3.5" /> Schedule
                           </Button>
@@ -637,7 +715,7 @@ function HomeDashboard() {
                               <button
                                 type="button"
                                 className="font-medium text-primary underline underline-offset-4"
-                                onClick={handleOpenSchedule}
+                                onClick={() => handleOpenSchedule()}
                               >
                                 Schedule
                               </button>{' '}
@@ -830,6 +908,7 @@ function HomeDashboard() {
               onDelete={(id) => void handleDeleteMeeting(id)}
               onRefresh={() => void refreshMeetings()}
               onStartWithPmi={() => void startNewMeeting('pmi')}
+              onSchedule={() => handleOpenSchedule()}
               onOpenJoin={() => {
                 setJoinError(null)
                 setJoinOpen(true)
@@ -886,13 +965,32 @@ function HomeDashboard() {
         onOpenChange={setScheduleOpen}
         editing={editingMeeting}
         onSaved={() => void refreshMeetings()}
+        onAuthRequired={() => {
+          setScheduleOpen(false)
+          toast.info(HOST_AUTH_REQUIRED_NOTICE)
+          openAuthModal('signin', {
+            notice: HOST_AUTH_REQUIRED_NOTICE,
+            hideGuestOption: true,
+            returnAction: 'schedule',
+          })
+        }}
       />
 
       {/* Unified Auth Modal (Teacher, Student & Guest) */}
       <AuthModal
         open={authModalOpen}
-        onOpenChange={setAuthModalOpen}
+        onOpenChange={(open) => {
+          setAuthModalOpen(open)
+          if (!open) {
+            setAuthNotice(null)
+            setAuthHideGuest(false)
+            setPendingReturnAction(null)
+          }
+        }}
         initialMode={authModalMode}
+        notice={authNotice}
+        hideGuestOption={authHideGuest}
+        onAuthenticated={handleAuthSuccess}
       />
 
       {/* Join Meeting Dialog */}

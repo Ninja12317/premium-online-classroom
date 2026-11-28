@@ -21,6 +21,7 @@ import {
   MeetingRoom,
   type LeaveReason,
 } from '@/components/meeting/meeting-room'
+import { ScheduledCountdownScreen } from '@/components/meeting/scheduled-countdown'
 import { useMeshAdapter } from '@/components/meeting/use-mesh-adapter'
 import { normalizeMeetingId } from '@/lib/meeting'
 import {
@@ -66,6 +67,7 @@ function MeetPage() {
   const [passcode, setPasscode] = useState('')
   const [hostPasscode, setHostPasscode] = useState<string | null>(null)
   const [joinedConfirmed, setJoinedConfirmed] = useState(false)
+  const [autoStarting, setAutoStarting] = useState(false)
   const hostKeyRef = useRef<string | null>(null)
   const joinedIdentityRef = useRef<string | null>(null)
   const prefsRef = useRef<JoinPrefs | null>(null)
@@ -160,6 +162,45 @@ function MeetPage() {
       ])
     })
   }, [meetingId, navigate, executeJoin])
+
+  // Scheduled meeting not started yet: attach lightweight Firestore listener
+  // on `meetings/{meetingId}` and auto-join the instant Host starts it.
+  const notStartedId =
+    phase.kind === 'result' && phase.result.status === 'not-started'
+      ? phase.result.meeting.meetingId
+      : null
+
+  useEffect(() => {
+    if (!notStartedId) return
+    let active = true
+    const unsub = subscribeMeetingDoc(meetingId, (summary) => {
+      if (!active) return
+      if (summary.endedAt || summary.status === 'ended') {
+        setAutoStarting(false)
+        setPhase({ kind: 'result', result: { status: 'ended', meeting: summary } })
+        return
+      }
+      if (summary.status === 'live' && summary.hostStarted === true) {
+        setAutoStarting(true)
+        if (prefsRef.current) {
+          void executeJoin(prefsRef.current)
+        }
+        return
+      }
+      setPhase((prev) =>
+        prev.kind === 'result' && prev.result.status === 'not-started'
+          ? {
+              kind: 'result',
+              result: { status: 'not-started', meeting: summary },
+            }
+          : prev,
+      )
+    })
+    return () => {
+      active = false
+      unsub()
+    }
+  }, [meetingId, notStartedId, executeJoin])
 
   // Waiting room: listen via Firestore onSnapshot (plus gentle fallback poll)
   // keyed ONLY on [meetingId, waitingIdentity].
@@ -319,6 +360,13 @@ function MeetPage() {
           </Button>
         </Screen>
       )
+    case 'not-started':
+      return (
+        <ScheduledCountdownScreen
+          meeting={result.meeting}
+          transitioning={autoStarting}
+        />
+      )
     case 'ended':
       return (
         <Screen
@@ -327,7 +375,7 @@ function MeetPage() {
           subtitle={`${result.meeting.title} is over. Thanks for joining.`}
         >
           <Button asChild>
-            <Link to="/">Go home</Link>
+            <Link to="/">Back to Home</Link>
           </Button>
         </Screen>
       )

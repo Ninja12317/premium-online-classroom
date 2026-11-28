@@ -10,6 +10,9 @@ import {
   listUserMeetings,
   listWaitingParticipants,
   moderateParticipantRecord,
+  scheduleMeetingRecord,
+  startInstantMeetingRecord,
+  startScheduledMeetingRecord,
   updateMeetingDetails,
   updateMeetingSettingsRecord,
   type CreateMeetingInput,
@@ -22,6 +25,30 @@ export type { JoinResult }
 
 export async function createMeeting({ data }: { data: CreateMeetingInput }) {
   return createMeetingRecord(data)
+}
+
+export async function startInstantMeeting({
+  data,
+}: {
+  data: Omit<CreateMeetingInput, 'meetingType' | 'scheduledAt'>
+}) {
+  return startInstantMeetingRecord(data)
+}
+
+export async function scheduleMeeting({
+  data,
+}: {
+  data: Omit<CreateMeetingInput, 'meetingType'> & { scheduledAt: string }
+}) {
+  return scheduleMeetingRecord(data)
+}
+
+export async function startScheduledMeeting({
+  data,
+}: {
+  data: { meetingId: string; hostKey?: string }
+}) {
+  return startScheduledMeetingRecord(data.meetingId, data.hostKey)
 }
 
 export async function updateMeeting({

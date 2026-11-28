@@ -24,7 +24,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { createMeeting, updateMeeting } from '@/lib/meetings.functions'
+import {
+  HOST_AUTH_REQUIRED_NOTICE,
+  isAuthRequiredError,
+  isRegisteredUser,
+} from '@/lib/auth-gate'
+import { scheduleMeeting, updateMeeting } from '@/lib/meetings.functions'
 import type { MeetingSummary } from '@/lib/meeting-types'
 import {
   buildIcs,
@@ -35,6 +40,7 @@ import {
 import { saveHostKey } from '@/lib/host-keys'
 import { useJoinPrefs } from '@/lib/prefs'
 import { useUserProfile } from '@/lib/profile'
+import { auth } from '@/services/firebase'
 
 interface Created {
   meetingId: string
@@ -60,12 +66,14 @@ export function ScheduleDialog({
   open: controlledOpen,
   onOpenChange: controlledOnOpenChange,
   onSaved,
+  onAuthRequired,
 }: {
   trigger?: ReactNode
   editing?: (MeetingSummary & { passcode?: string | null }) | null
   open?: boolean
   onOpenChange?: (open: boolean) => void
   onSaved?: () => void
+  onAuthRequired?: () => void
 }) {
   const { user } = useIdentity()
   const profile = useUserProfile()
@@ -78,8 +86,18 @@ export function ScheduleDialog({
     displayName(user) ||
     undefined
   const [internalOpen, setInternalOpen] = useState(false)
-  const open = controlledOpen !== undefined ? controlledOpen : internalOpen
+  const canHost = isRegisteredUser(user) && isRegisteredUser(auth.currentUser)
+  const open = canHost
+    ? controlledOpen !== undefined
+      ? controlledOpen
+      : internalOpen
+    : false
   const setOpen = (next: boolean) => {
+    if (next && !canHost) {
+      if (onAuthRequired) onAuthRequired()
+      else toast.info(HOST_AUTH_REQUIRED_NOTICE)
+      return
+    }
     if (controlledOnOpenChange) controlledOnOpenChange(next)
     else setInternalOpen(next)
   }
@@ -119,6 +137,12 @@ export function ScheduleDialog({
   async function submit(e: React.FormEvent) {
     e.preventDefault()
     if (pending) return
+    if (!isRegisteredUser(user) || !isRegisteredUser(auth.currentUser)) {
+      setOpen(false)
+      if (onAuthRequired) onAuthRequired()
+      else toast.info(HOST_AUTH_REQUIRED_NOTICE)
+      return
+    }
     const startsAt = new Date(`${date}T${time}`)
     if (Number.isNaN(startsAt.getTime())) {
       toast.error('Pick a valid date and time.')
@@ -145,13 +169,12 @@ export function ScheduleDialog({
         onSaved?.()
         setOpen(false)
       } else {
-        const result = await createMeeting({
+        const result = await scheduleMeeting({
           data: {
             title: title.trim() || 'Live class',
             hostName: resolvedHostName,
             passcode,
             waitingRoom,
-            meetingType: 'scheduled',
             scheduledAt: startsAt.toISOString(),
             durationMin: Number(duration),
           },
@@ -167,8 +190,14 @@ export function ScheduleDialog({
         await router.invalidate()
         onSaved?.()
       }
-    } catch {
-      toast.error('Could not save the class. Please try again.')
+    } catch (err) {
+      if (isAuthRequiredError(err)) {
+        setOpen(false)
+        if (onAuthRequired) onAuthRequired()
+        else toast.info(HOST_AUTH_REQUIRED_NOTICE)
+      } else {
+        toast.error('Could not save the class. Please try again.')
+      }
     } finally {
       setPending(false)
     }

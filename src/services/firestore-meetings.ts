@@ -8,6 +8,7 @@ import {
   getDocs,
   onSnapshot,
   query,
+  serverTimestamp,
   setDoc,
   updateDoc,
   where,
@@ -24,6 +25,7 @@ import {
   isPermissionDeniedError,
   reportFirestorePermissionError,
 } from '@/services/firebase'
+import { AuthRequiredError, isRegisteredUser } from '@/lib/auth-gate'
 import { stripUndefinedDeep } from '@/lib/firestore-sanitize'
 import { randomToken, sha256Hex } from '@/lib/hash'
 import { getIceServers } from '@/lib/ice-client'
@@ -100,6 +102,7 @@ interface MeetingDoc {
   allowPrivateChat: boolean
   status: 'scheduled' | 'live' | 'ended'
   meetingType: MeetingType
+  hostStarted: boolean
   scheduledAt: string | null
   durationMin: number
   startedAt: string | null
@@ -232,6 +235,23 @@ function getLocalParticipantsMap(meetingId: string) {
   return map
 }
 
+function toIsoTimestamp(value: unknown): string | null {
+  if (typeof value === 'string' && value.trim().length > 0) return value
+  if (
+    value &&
+    typeof value === 'object' &&
+    'toDate' in value &&
+    typeof (value as { toDate?: unknown }).toDate === 'function'
+  ) {
+    try {
+      return (value as { toDate: () => Date }).toDate().toISOString()
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
 function normalizeMeetingDoc(
   meetingId: string,
   raw: Record<string, unknown>,
@@ -239,30 +259,34 @@ function normalizeMeetingDoc(
   const waitingRoom = Boolean(raw.waitingRoom ?? raw.waitingRoomEnabled ?? true)
   const locked = Boolean(raw.locked ?? raw.isLocked ?? false)
   const title = String(raw.title ?? raw.topic ?? 'Live class')
-  const endedAt = typeof raw.endedAt === 'string' ? raw.endedAt : null
-  const startedAt = typeof raw.startedAt === 'string' ? raw.startedAt : null
-  const status =
-    raw.status === 'ended' || endedAt
-      ? 'ended'
-      : raw.status === 'live' || startedAt
-        ? 'live'
-        : 'scheduled'
-  const hostId = typeof raw.hostId === 'string' ? raw.hostId : null
-  const rawMembers = Array.isArray(raw.memberIds)
-    ? raw.memberIds.filter((v): v is string => typeof v === 'string' && v.length > 0)
-    : []
-  const memberIds =
-    hostId && !rawMembers.includes(hostId) ? [hostId, ...rawMembers] : rawMembers
-  const scheduledAt =
-    typeof raw.scheduledAt === 'string' && raw.scheduledAt.trim().length > 0
-      ? raw.scheduledAt
-      : null
+  const endedAt = toIsoTimestamp(raw.endedAt)
+  const startedAt = toIsoTimestamp(raw.startedAt)
+  const scheduledAt = toIsoTimestamp(raw.scheduledAt)
   const meetingType: MeetingType =
     raw.meetingType === 'scheduled' || raw.meetingType === 'instant'
       ? raw.meetingType
       : scheduledAt
         ? 'scheduled'
         : 'instant'
+  const isEnded = raw.status === 'ended' || Boolean(endedAt)
+  const hostStarted = isEnded
+    ? false
+    : typeof raw.hostStarted === 'boolean'
+      ? raw.hostStarted
+      : meetingType === 'instant'
+        ? true
+        : raw.status === 'live' || Boolean(startedAt)
+  const status: 'scheduled' | 'live' | 'ended' = isEnded
+    ? 'ended'
+    : raw.status === 'live' || hostStarted
+      ? 'live'
+      : 'scheduled'
+  const hostId = typeof raw.hostId === 'string' ? raw.hostId : null
+  const rawMembers = Array.isArray(raw.memberIds)
+    ? raw.memberIds.filter((v): v is string => typeof v === 'string' && v.length > 0)
+    : []
+  const memberIds =
+    hostId && !rawMembers.includes(hostId) ? [hostId, ...rawMembers] : rawMembers
   const createdAt = typeof raw.createdAt === 'number' ? raw.createdAt : Date.now()
   return {
     meetingId,
@@ -289,6 +313,7 @@ function normalizeMeetingDoc(
       raw.allowPrivateChat === undefined ? true : Boolean(raw.allowPrivateChat),
     status,
     meetingType,
+    hostStarted,
     scheduledAt,
     durationMin: typeof raw.durationMin === 'number' ? raw.durationMin : 60,
     startedAt,
@@ -347,6 +372,7 @@ export function summaryOf(row: MeetingDoc): MeetingSummary {
     endedAt: row.endedAt,
     status: row.status,
     meetingType: row.meetingType,
+    hostStarted: row.hostStarted,
     spotlightId: row.spotlightId,
     breakout: row.breakout,
     notes: row.notes,
@@ -444,8 +470,31 @@ export interface CreateMeetingInput {
   meetingType?: MeetingType
 }
 
+/**
+ * Strict service-layer auth gate for starting or scheduling a meeting.
+ * NEVER triggers anonymous auth; rejects immediately with `AuthRequiredError`
+ * (`code: "AUTH_REQUIRED"`) whenever no registered Firebase user is signed in.
+ */
+async function assertRegisteredHostAuth(): Promise<string> {
+  if (
+    typeof window !== 'undefined' &&
+    typeof auth.authStateReady === 'function'
+  ) {
+    try {
+      await auth.authStateReady()
+    } catch {
+      // Fall through to currentUser check
+    }
+  }
+  const current = auth.currentUser
+  if (!current || current.isAnonymous || !isRegisteredUser(current)) {
+    throw new AuthRequiredError()
+  }
+  return current.uid
+}
+
 export async function createMeetingRecord(input: CreateMeetingInput) {
-  const uid = await ensureClientUid()
+  const uid = await assertRegisteredHostAuth()
   const hostName = input.hostName?.trim() || 'Teacher'
   const hostKey = randomToken(18)
   const passcode = input.customPasscode
@@ -456,13 +505,15 @@ export async function createMeetingRecord(input: CreateMeetingInput) {
   const customId = input.customMeetingId
     ? normalizeMeetingId(input.customMeetingId)
     : null
-  const meetingId = customId && isValidMeetingId(customId) ? customId : generateMeetingId()
+  const meetingId =
+    customId && isValidMeetingId(customId) ? customId : generateMeetingId()
   const title = input.title?.trim() || 'Live class'
   const waitingRoom = input.waitingRoom ?? true
   const meetingType: MeetingType =
     input.meetingType ?? (input.scheduledAt ? 'scheduled' : 'instant')
   const scheduledAt =
     meetingType === 'scheduled' ? (input.scheduledAt ?? null) : null
+  const isInstant = meetingType === 'instant'
   const now = Date.now()
   const record: MeetingDoc = {
     meetingId,
@@ -482,11 +533,12 @@ export async function createMeetingRecord(input: CreateMeetingInput) {
     allowParticipantAnnotate: false,
     allowChat: true,
     allowPrivateChat: true,
-    status: meetingType === 'scheduled' ? 'scheduled' : 'live',
+    status: isInstant ? 'live' : 'scheduled',
     meetingType,
+    hostStarted: isInstant,
     scheduledAt,
     durationMin: input.durationMin ?? 60,
-    startedAt: null,
+    startedAt: isInstant ? new Date(now).toISOString() : null,
     endedAt: null,
     createdAt: now,
     updatedAt: now,
@@ -503,20 +555,87 @@ export async function createMeetingRecord(input: CreateMeetingInput) {
     presenterViewport: null,
   }
   saveLocalMeeting(record)
+  try {
+    await setDoc(
+      doc(db, 'meetings', meetingId),
+      stripUndefinedDeep({
+        ...record,
+        ...(isInstant ? { startedAt: serverTimestamp() } : {}),
+        memberIds: arrayUnion(uid),
+      }),
+    )
+  } catch (err) {
+    handleFsError(`meetings/${meetingId}`, err)
+  }
+  return { meetingId, hostKey, passcode }
+}
+
+export async function startInstantMeetingRecord(
+  input: Omit<CreateMeetingInput, 'meetingType' | 'scheduledAt'>,
+) {
+  await assertRegisteredHostAuth()
+  return createMeetingRecord({
+    ...input,
+    meetingType: 'instant',
+    scheduledAt: undefined,
+  })
+}
+
+export async function scheduleMeetingRecord(
+  input: Omit<CreateMeetingInput, 'meetingType'> & { scheduledAt: string },
+) {
+  await assertRegisteredHostAuth()
+  return createMeetingRecord({
+    ...input,
+    meetingType: 'scheduled',
+  })
+}
+
+/**
+ * Transitions a scheduled meeting into the live state when the Host starts it.
+ * Sets `status: "live"`, `hostStarted: true`, and `startedAt: serverTimestamp()`.
+ */
+export async function startScheduledMeetingRecord(
+  meetingId: string,
+  hostKey?: string,
+): Promise<MeetingSummary | null> {
+  const uid = await ensureClientUid()
+  const id = normalizeMeetingId(meetingId)
+  if (!id) return null
+  const meeting = await fetchMeetingDoc(id)
+  if (!meeting) return null
+  const byKey = !!hostKey && sha256Hex(hostKey) === meeting.hostKeyHash
+  const byAccount = !!meeting.hostId && meeting.hostId === uid
+  if (!byKey && !byAccount) {
+    throw new Error('Only the host can start this scheduled class.')
+  }
+  const now = Date.now()
+  meeting.status = 'live'
+  meeting.hostStarted = true
+  meeting.startedAt = meeting.startedAt ?? new Date(now).toISOString()
+  meeting.updatedAt = now
+  if (!meeting.memberIds.includes(uid)) {
+    meeting.memberIds = [...meeting.memberIds, uid]
+  }
+  saveLocalMeeting(meeting)
   if (await requireAuth()) {
     try {
       await setDoc(
-        doc(db, 'meetings', meetingId),
-        stripUndefinedDeep({
-          ...record,
+        doc(db, 'meetings', id),
+        {
+          status: 'live',
+          hostStarted: true,
+          startedAt: serverTimestamp(),
           memberIds: arrayUnion(uid),
-        }),
+          updatedAt: now,
+        },
+        { merge: true },
       )
     } catch (err) {
-      handleFsError(`meetings/${meetingId}`, err)
+      handleFsError(`meetings/${id}`, err)
     }
   }
-  return { meetingId, hostKey, passcode }
+  return summaryOf(meeting)
 }
 
 export async function updateMeetingDetails(
@@ -751,6 +870,7 @@ export async function getHostMeetingDetails(
 export type JoinResult =
   | { status: 'not-found' }
   | { status: 'ended'; meeting: MeetingSummary }
+  | { status: 'not-started'; meeting: MeetingSummary }
   | { status: 'locked'; meeting: MeetingSummary }
   | { status: 'passcode-required'; meeting: MeetingSummary; wrong: boolean }
   | { status: 'rejected'; meeting: MeetingSummary }
@@ -864,8 +984,9 @@ export async function joinMeetingRecord(
     getLocalParticipantsMap(meetingId).set(identity, participant)
     if (!meeting.startedAt) {
       meeting.startedAt = new Date(now).toISOString()
-      meeting.status = 'live'
     }
+    meeting.status = 'live'
+    meeting.hostStarted = true
     meeting.updatedAt = now
     if (!meeting.memberIds.includes(uid)) {
       meeting.memberIds = [...meeting.memberIds, uid]
@@ -883,8 +1004,9 @@ export async function joinMeetingRecord(
         setDoc(
           doc(db, 'meetings', meetingId),
           {
-            startedAt: meeting.startedAt,
+            startedAt: serverTimestamp(),
             status: 'live',
+            hostStarted: true,
             memberIds: arrayUnion(uid),
             updatedAt: now,
           },
@@ -896,6 +1018,12 @@ export async function joinMeetingRecord(
       void joinWhiteboardMembership(meeting.activeWhiteboardId)
     }
     return joinedPayload(meeting, participant, hostSecret)
+  }
+
+  // Non-host participant opening a scheduled meeting before the Host starts it:
+  // never place in waiting room or create a participant doc yet.
+  if (meeting.status === 'scheduled' || meeting.hostStarted !== true) {
+    return { status: 'not-started', meeting: summary }
   }
 
   // Returning participant (page refresh, lobby poll, reconnect)
@@ -1168,13 +1296,14 @@ export async function endMeetingRecord(meetingId: string, actorKey: string) {
   const endedAt = new Date(now).toISOString()
   meeting.endedAt = endedAt
   meeting.status = 'ended'
+  meeting.hostStarted = false
   meeting.updatedAt = now
   saveLocalMeeting(meeting)
   if (await requireAuth()) {
     try {
       await setDoc(
         doc(db, 'meetings', meetingId),
-        { endedAt, status: 'ended', updatedAt: now },
+        { endedAt, status: 'ended', hostStarted: false, updatedAt: now },
         { merge: true },
       )
     } catch (err) {

@@ -169,6 +169,7 @@ export function IdentityProvider({ children }: { children: ReactNode }) {
   const [clientUid, setClientUid] = useState<string>('')
   const [ready, setReady] = useState(false)
   const lastUidRef = useRef<string | null>(null)
+  const pendingGuestNameRef = useRef<string | null>(null)
 
   const resetAllProfileMemory = useCallback(() => {
     clearLocalMeetingCaches()
@@ -380,49 +381,64 @@ export function IdentityProvider({ children }: { children: ReactNode }) {
   const signInAsGuest = useCallback(
     async (displayNameInput?: string): Promise<LecternUser> => {
       const cleanName = (displayNameInput ?? '').trim() || 'Guest'
-      resetAuthInit()
-      if (auth.currentUser) {
-        try {
-          await firebaseSignOut(auth)
-        } catch {
-          // ignore
+      pendingGuestNameRef.current = cleanName
+      try {
+        const existingAnon =
+          auth.currentUser &&
+          auth.currentUser.isAnonymous &&
+          !loadGuestSession(auth.currentUser.uid)
+            ? auth.currentUser
+            : null
+
+        if (!existingAnon) {
+          resetAuthInit()
+          if (auth.currentUser) {
+            try {
+              await firebaseSignOut(auth)
+            } catch {
+              // ignore
+            }
+          }
         }
-      }
-      clearGuestSession()
-      clearScopedHostKeys(lastUidRef.current)
-      resetAllProfileMemory()
-      clearProfile()
-      clearPrefs()
-      clearCachedClientUid()
-      setActiveStorageUid(null)
+        clearGuestSession()
+        clearScopedHostKeys(lastUidRef.current)
+        resetAllProfileMemory()
+        clearProfile()
+        clearPrefs()
+        if (!existingAnon) {
+          clearCachedClientUid()
+          setActiveStorageUid(null)
+        }
 
-      const cred = await signInAnonymously(auth)
-      const fbUser = cred.user
-      lastUidRef.current = fbUser.uid
-      setActiveStorageUid(fbUser.uid)
+        const fbUser = existingAnon ?? (await signInAnonymously(auth)).user
+        lastUidRef.current = fbUser.uid
+        setActiveStorageUid(fbUser.uid)
 
-      saveGuestSession(fbUser.uid, cleanName)
-      savePrefs({ ...loadPrefs(), name: cleanName })
-      saveProfile({
-        displayName: cleanName,
-        role: 'Participant',
-        status: 'available',
-        avatarPhoto: null,
-        pmi: '',
-      })
-      const mapped: LecternUser = {
-        id: fbUser.uid,
-        name: cleanName,
-        email: null,
-        role: 'guest',
-        isGuest: true,
-        isAnonymous: true,
-        pmi: null,
+        saveGuestSession(fbUser.uid, cleanName)
+        savePrefs({ ...loadPrefs(), name: cleanName })
+        saveProfile({
+          displayName: cleanName,
+          role: 'Participant',
+          status: 'available',
+          avatarPhoto: null,
+          pmi: '',
+        })
+        const mapped: LecternUser = {
+          id: fbUser.uid,
+          name: cleanName,
+          email: null,
+          role: 'guest',
+          isGuest: true,
+          isAnonymous: true,
+          pmi: null,
+        }
+        setUser(mapped)
+        setClientUid(fbUser.uid)
+        setAuthStatus('guest')
+        return mapped
+      } finally {
+        pendingGuestNameRef.current = null
       }
-      setUser(mapped)
-      setClientUid(fbUser.uid)
-      setAuthStatus('guest')
-      return mapped
     },
     [resetAllProfileMemory],
   )
@@ -553,6 +569,7 @@ export function IdentityProvider({ children }: { children: ReactNode }) {
     const unsub = onAuthStateChanged(auth, (fbUser) => {
       if (!active) return
       if (!fbUser) {
+        if (pendingGuestNameRef.current !== null) return
         clearGuestSession()
         clearLocalMeetingCaches()
         applyLoggedOutState()
@@ -560,7 +577,12 @@ export function IdentityProvider({ children }: { children: ReactNode }) {
         return
       }
       if (fbUser.isAnonymous) {
-        const guest = loadGuestSession(fbUser.uid)
+        const pendingName = pendingGuestNameRef.current
+        const guest =
+          loadGuestSession(fbUser.uid) ??
+          (pendingName !== null
+            ? saveGuestSession(fbUser.uid, pendingName)
+            : null)
         if (guest) {
           if (lastUidRef.current && lastUidRef.current !== fbUser.uid) {
             clearLocalMeetingCaches()

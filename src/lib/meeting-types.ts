@@ -101,6 +101,7 @@ export interface MeetingSummary extends MeetingSettings {
   endedAt: string | null
   status?: 'scheduled' | 'live' | 'ended'
   meetingType?: MeetingType
+  hostStarted?: boolean
   spotlightId?: string | null
   breakout?: BreakoutState | null
   notes?: string
@@ -228,4 +229,44 @@ export function isUpcomingScheduledMeeting(
   if (m.status === 'ended' || Boolean(m.endedAt)) return false
   if (m.meetingType === 'instant') return false
   return m.meetingType === 'scheduled' || Boolean(m.scheduledAt)
+}
+
+/**
+ * Returns true when a meeting is still in its pre-start scheduled state
+ * (not ended, and either `status === "scheduled"` or `hostStarted !== true`).
+ */
+export function isScheduledMeetingNotStarted(
+  m: Pick<
+    MeetingSummary,
+    'meetingType' | 'status' | 'hostStarted' | 'scheduledAt' | 'endedAt'
+  >,
+): boolean {
+  if (m.status === 'ended' || Boolean(m.endedAt)) return false
+  return m.status === 'scheduled' || m.hostStarted !== true
+}
+
+/**
+ * Formats the remaining time until a scheduled start timestamp:
+ * - >= 24h away: "Starts in Xd Yh Zm"
+ * - < 24h away:  "Starts in Xh Ym Zs"
+ * Returns null once `nowMs >= scheduledAtMs`.
+ */
+export function formatScheduledCountdown(
+  scheduledAtMs: number,
+  nowMs: number,
+): string | null {
+  const diff = scheduledAtMs - nowMs
+  if (diff <= 0) return null
+  const totalSeconds = Math.ceil(diff / 1000)
+  const daySeconds = 24 * 60 * 60
+  if (totalSeconds >= daySeconds) {
+    const days = Math.floor(totalSeconds / daySeconds)
+    const hours = Math.floor((totalSeconds % daySeconds) / 3600)
+    const minutes = Math.floor((totalSeconds % 3600) / 60)
+    return `Starts in ${days}d ${hours}h ${minutes}m`
+  }
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  return `Starts in ${hours}h ${minutes}m ${seconds}s`
 }

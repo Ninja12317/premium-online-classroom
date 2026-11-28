@@ -97,6 +97,7 @@ export function MeetingsTab({
   onDelete,
   onRefresh,
   onStartWithPmi,
+  onSchedule,
   onOpenJoin,
   onOpenAuth,
 }: {
@@ -106,6 +107,7 @@ export function MeetingsTab({
   onDelete: (meetingId: string) => void
   onRefresh: () => void
   onStartWithPmi?: () => void
+  onSchedule?: () => void
   onOpenJoin?: () => void
   onOpenAuth?: (mode: AuthModalMode) => void
 }) {
@@ -328,22 +330,40 @@ export function MeetingsTab({
             />
           </div>
           {isTeacher ? (
-            <ScheduleDialog
-              onSaved={onRefresh}
-              trigger={
-                <Button size="sm" className="gap-1.5">
+            onSchedule ? (
+              <Button size="sm" className="gap-1.5" onClick={onSchedule}>
+                <CalendarPlus className="size-4" /> Schedule a class
+              </Button>
+            ) : (
+              <ScheduleDialog
+                onSaved={onRefresh}
+                trigger={
+                  <Button size="sm" className="gap-1.5">
+                    <CalendarPlus className="size-4" /> Schedule a class
+                  </Button>
+                }
+              />
+            )
+          ) : (
+            <div className="flex flex-wrap items-center gap-2">
+              {onSchedule && role !== 'student' && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="gap-1.5"
+                  onClick={onSchedule}
+                >
                   <CalendarPlus className="size-4" /> Schedule a class
                 </Button>
-              }
-            />
-          ) : (
-            <Button
-              size="sm"
-              className="gap-1.5"
-              onClick={() => onOpenJoin?.()}
-            >
-              <PlusSquare className="size-4" /> Join a class
-            </Button>
+              )}
+              <Button
+                size="sm"
+                className="gap-1.5"
+                onClick={() => onOpenJoin?.()}
+              >
+                <PlusSquare className="size-4" /> Join a class
+              </Button>
+            </div>
           )}
         </div>
       </div>
