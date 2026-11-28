@@ -19,8 +19,8 @@ const siteName = 'Lectern — Live Classroom & Meetings'
 const siteDescription =
   'Lectern is a live video classroom for teachers: start a class in one click, students join from a link, teach with video, screen share, whiteboard and chat.'
 
-// Applies the saved theme before first paint so the page never flashes.
-const themeScript = `(function(){try{var t=localStorage.getItem('lectern-theme');var d=t?t==='dark':window.matchMedia('(prefers-color-scheme: dark)').matches;if(d){document.documentElement.classList.add('dark')}}catch(e){}})();`
+// Applies the saved theme before first paint and captures early PWA install prompts before hydration.
+const themeScript = `(function(){try{var t=localStorage.getItem('lectern-theme');var d=t?t==='dark':window.matchMedia('(prefers-color-scheme: dark)').matches;if(d){document.documentElement.classList.add('dark')}}catch(e){}try{window.addEventListener('beforeinstallprompt',function(e){e.preventDefault();window.__lecternDeferredInstallPrompt=e;});}catch(e){}})();`
 
 export const Route = createRootRoute({
   head: () => ({

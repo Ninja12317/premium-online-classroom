@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  getInstallGuidance,
   isIOSDevice,
   isIOSSafari,
   isStandaloneDisplay,
@@ -67,5 +68,46 @@ describe('PWA install detection helpers', () => {
         matchMedia: () => ({ matches: false }),
       }),
     ).toBe(false)
+  })
+
+  it('returns accurate platform guidance when beforeinstallprompt is unavailable', () => {
+    expect(
+      getInstallGuidance({
+        userAgent: 'Mozilla/5.0 Chrome/126.0.0.0 Safari/537.36',
+        isInIframe: true,
+      }),
+    ).toBe('iframe')
+
+    expect(
+      getInstallGuidance({
+        userAgent:
+          'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 Version/17.4 Mobile/15E148 Safari/604.1',
+        maxTouchPoints: 5,
+      }),
+    ).toBe('ios-safari')
+
+    expect(
+      getInstallGuidance({
+        userAgent:
+          'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36',
+        maxTouchPoints: 5,
+      }),
+    ).toBe('android')
+
+    expect(
+      getInstallGuidance({
+        userAgent:
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36',
+        maxTouchPoints: 0,
+      }),
+    ).toBe('desktop-chromium')
+
+    expect(
+      getInstallGuidance({
+        userAgent:
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 Version/17.5 Safari/605.1.15',
+        maxTouchPoints: 0,
+      }),
+    ).toBe('desktop-safari')
   })
 })

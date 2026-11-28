@@ -24,6 +24,7 @@ import { AuthModal, type AuthModalMode } from '@/components/auth-modal'
 import { AvatarBubble } from '@/components/avatar-bubble'
 import { BackButton } from '@/components/back-button'
 import { useIdentity } from '@/components/identity-provider'
+import { InstallAppDialog } from '@/components/install-app-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -54,30 +55,42 @@ import { useTheme } from '@/lib/theme'
 import { usePWAInstall } from '@/lib/use-pwa-install'
 import { cn } from '@/lib/utils'
 
-function InstallAppMenuSection({ onTriggered }: { onTriggered?: () => void }) {
-  const { isInstallable, showIOSHint, promptInstall } = usePWAInstall()
+function InstallAppMenuSection({
+  onTriggered,
+  onOpenGuide,
+}: {
+  onTriggered?: () => void
+  onOpenGuide: () => void
+}) {
+  const { isInstallable, showInstallOption, showIOSHint, promptInstall } =
+    usePWAInstall()
 
-  if (!isInstallable && !showIOSHint) return null
+  if (!showInstallOption) return null
+
+  async function handleClick() {
+    onTriggered?.()
+    if (isInstallable) {
+      const outcome = await promptInstall()
+      if (outcome !== 'unavailable') return
+    }
+    onOpenGuide()
+  }
 
   return (
     <>
       <Separator />
       <div className="p-2">
-        {isInstallable ? (
-          <button
-            type="button"
-            onClick={() => {
-              onTriggered?.()
-              void promptInstall()
-            }}
-            className="flex w-full items-center gap-2 rounded-xl px-2.5 py-2 text-left text-xs font-medium text-primary transition-colors hover:bg-primary/10"
-          >
-            <Download className="size-4 shrink-0" />
-            Install App
-          </button>
-        ) : (
-          <p className="flex items-center gap-2 px-2.5 py-1.5 text-[11px] leading-snug text-muted-foreground">
-            <Share className="size-3.5 shrink-0 text-primary" />
+        <button
+          type="button"
+          onClick={() => void handleClick()}
+          className="flex w-full items-center gap-2 rounded-xl px-2.5 py-2 text-left text-xs font-medium text-primary transition-colors hover:bg-primary/10"
+        >
+          <Download className="size-4 shrink-0" />
+          <span>Install App</span>
+        </button>
+        {showIOSHint && (
+          <p className="mt-0.5 flex items-center gap-2 px-2.5 pb-1 text-[11px] leading-snug text-muted-foreground">
+            <Share className="size-3 shrink-0 text-primary" />
             <span>Tap Share → Add to Home Screen</span>
           </p>
         )}
@@ -154,6 +167,8 @@ export function ProfileMenu({
   const [authModalOpen, setAuthModalOpen] = useState(false)
   const [authModalMode, setAuthModalMode] = useState<AuthModalMode>('signin')
   const [editOpen, setEditOpen] = useState(false)
+  const [installDialogOpen, setInstallDialogOpen] = useState(false)
+  const { isInstallable, guidance, promptInstall } = usePWAInstall()
 
   // Quick guest rename state
   const [renamingGuest, setRenamingGuest] = useState(false)
@@ -248,7 +263,10 @@ export function ProfileMenu({
             <div className="px-4 py-3">
               <AppearanceRow />
             </div>
-            <InstallAppMenuSection onTriggered={() => setOpen(false)} />
+            <InstallAppMenuSection
+              onTriggered={() => setOpen(false)}
+              onOpenGuide={() => setInstallDialogOpen(true)}
+            />
           </PopoverContent>
         </Popover>
 
@@ -256,6 +274,13 @@ export function ProfileMenu({
           open={authModalOpen}
           onOpenChange={setAuthModalOpen}
           initialMode={authModalMode}
+        />
+        <InstallAppDialog
+          open={installDialogOpen}
+          onOpenChange={setInstallDialogOpen}
+          isInstallable={isInstallable}
+          guidance={guidance}
+          onInstallNow={promptInstall}
         />
       </>
     )
@@ -375,7 +400,10 @@ export function ProfileMenu({
               <AppearanceRow />
             </div>
 
-            <InstallAppMenuSection onTriggered={() => setOpen(false)} />
+            <InstallAppMenuSection
+              onTriggered={() => setOpen(false)}
+              onOpenGuide={() => setInstallDialogOpen(true)}
+            />
 
             <Separator />
 
@@ -404,6 +432,13 @@ export function ProfileMenu({
           open={authModalOpen}
           onOpenChange={setAuthModalOpen}
           initialMode={authModalMode}
+        />
+        <InstallAppDialog
+          open={installDialogOpen}
+          onOpenChange={setInstallDialogOpen}
+          isInstallable={isInstallable}
+          guidance={guidance}
+          onInstallNow={promptInstall}
         />
       </>
     )
@@ -647,7 +682,10 @@ export function ProfileMenu({
             </div>
           </div>
 
-          <InstallAppMenuSection onTriggered={() => setOpen(false)} />
+          <InstallAppMenuSection
+            onTriggered={() => setOpen(false)}
+            onOpenGuide={() => setInstallDialogOpen(true)}
+          />
 
           <Separator />
 
@@ -815,6 +853,14 @@ export function ProfileMenu({
           </form>
         </DialogContent>
       </Dialog>
+
+      <InstallAppDialog
+        open={installDialogOpen}
+        onOpenChange={setInstallDialogOpen}
+        isInstallable={isInstallable}
+        guidance={guidance}
+        onInstallNow={promptInstall}
+      />
     </>
   )
 }

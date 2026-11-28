@@ -15,6 +15,16 @@ declare global {
   }
 }
 
+export type InstallPlatformGuidance =
+  | 'iframe'
+  | 'ios-safari'
+  | 'ios-other'
+  | 'android'
+  | 'desktop-chromium'
+  | 'desktop-safari'
+  | 'desktop-firefox'
+  | 'generic'
+
 /**
  * Pure helper: detects iPhone, iPad (including iPadOS desktop-class UA), and iPod.
  */
@@ -23,7 +33,6 @@ export function isIOSDevice(
   maxTouchPoints = 0,
 ): boolean {
   if (/iPhone|iPad|iPod/i.test(userAgent)) return true
-  // iPadOS 13+ reports Macintosh with multi-touch support
   if (/Macintosh/i.test(userAgent) && maxTouchPoints > 1) return true
   return false
 }
@@ -36,7 +45,6 @@ export function isIOSSafari(
   maxTouchPoints = 0,
 ): boolean {
   if (!isIOSDevice(userAgent, maxTouchPoints)) return false
-  // Exclude third-party iOS browsers that do not expose Safari's Share -> Add to Home Screen flow in the same way
   if (/CriOS|FxiOS|EdgiOS|OPiOS/i.test(userAgent)) return false
   return /Safari/i.test(userAgent)
 }
@@ -60,6 +68,27 @@ export function isStandaloneDisplay(
     // ignore environments without matchMedia
   }
   return false
+}
+
+/**
+ * Pure helper: returns the most accurate manual install instructions for the
+ * current browser/environment when native `beforeinstallprompt` is unavailable.
+ */
+export function getInstallGuidance(env: {
+  userAgent: string
+  maxTouchPoints?: number
+  isInIframe?: boolean
+}): InstallPlatformGuidance {
+  if (env.isInIframe) return 'iframe'
+  const ua = env.userAgent || ''
+  const touch = env.maxTouchPoints ?? 0
+  if (isIOSSafari(ua, touch)) return 'ios-safari'
+  if (isIOSDevice(ua, touch)) return 'ios-other'
+  if (/Android/i.test(ua)) return 'android'
+  if (/Firefox|FxiOS/i.test(ua)) return 'desktop-firefox'
+  if (/Chrome|Chromium|Edg|Brave|OPR/i.test(ua)) return 'desktop-chromium'
+  if (/Safari/i.test(ua)) return 'desktop-safari'
+  return 'generic'
 }
 
 // External store for PWA installability so multiple consumers stay in sync
@@ -116,29 +145,50 @@ function getInstalledSnapshot(): boolean {
   return installedOverride || isStandaloneDisplay(window)
 }
 
-function getIOSSafariSnapshot(): boolean {
-  if (typeof window === 'undefined') return false
-  return isIOSSafari(
-    window.navigator.userAgent || '',
-    window.navigator.maxTouchPoints || 0,
-  )
+function getHydratedClientSnapshot(): boolean {
+  return true
+}
+
+function getGuidanceSnapshot(): InstallPlatformGuidance {
+  if (typeof window === 'undefined') return 'generic'
+  let inIframe: boolean
+  try {
+    inIframe = window.self !== window.top
+  } catch {
+    inIframe = true
+  }
+  return getInstallGuidance({
+    userAgent: window.navigator.userAgent || '',
+    maxTouchPoints: window.navigator.maxTouchPoints || 0,
+    isInIframe: inIframe,
+  })
 }
 
 const getServerNull = () => null
 const getServerFalse = () => false
+const getServerGeneric = (): InstallPlatformGuidance => 'generic'
 
 export interface PWAInstallState {
   /** True when the browser fired `beforeinstallprompt` and the app is not yet installed. */
   isInstallable: boolean
   /** True when already running in standalone / installed PWA mode. */
   isInstalled: boolean
-  /** True on iOS Safari when not yet installed (show one-line Share -> Add to Home Screen hint). */
+  /** True on the client when not yet running as an installed PWA (controls Install button visibility). */
+  showInstallOption: boolean
+  /** True on iOS Safari when not yet installed. */
   showIOSHint: boolean
+  /** Platform-specific install guidance when native `beforeinstallprompt` is not available. */
+  guidance: InstallPlatformGuidance
   /** Triggers the native browser install prompt when available. */
   promptInstall: () => Promise<'accepted' | 'dismissed' | 'unavailable'>
 }
 
 export function usePWAInstall(): PWAInstallState {
+  const hydrated = useSyncExternalStore(
+    subscribe,
+    getHydratedClientSnapshot,
+    getServerFalse,
+  )
   const deferredPrompt = useSyncExternalStore(
     subscribe,
     getDeferredPromptSnapshot,
@@ -149,10 +199,10 @@ export function usePWAInstall(): PWAInstallState {
     getInstalledSnapshot,
     getServerFalse,
   )
-  const iosSafari = useSyncExternalStore(
+  const guidance = useSyncExternalStore(
     subscribe,
-    getIOSSafariSnapshot,
-    getServerFalse,
+    getGuidanceSnapshot,
+    getServerGeneric,
   )
 
   const promptInstall = useCallback(async () => {
@@ -179,7 +229,9 @@ export function usePWAInstall(): PWAInstallState {
   return {
     isInstallable: !isInstalled && deferredPrompt !== null,
     isInstalled,
-    showIOSHint: !isInstalled && deferredPrompt === null && iosSafari,
+    showInstallOption: hydrated && !isInstalled,
+    showIOSHint: hydrated && !isInstalled && deferredPrompt === null && guidance === 'ios-safari',
+    guidance,
     promptInstall,
   }
 }

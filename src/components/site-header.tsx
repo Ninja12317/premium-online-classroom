@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import {
   Calendar,
   Download,
@@ -10,6 +11,7 @@ import {
 
 import { Brand } from '@/components/brand'
 import { useIdentity } from '@/components/identity-provider'
+import { InstallAppDialog } from '@/components/install-app-dialog'
 import { ProfileMenu } from '@/components/profile-menu'
 import { ThemeToggle } from '@/components/theme-toggle'
 import { Button } from '@/components/ui/button'
@@ -45,69 +47,92 @@ export function SiteHeader({
   onTabChange?: (tab: DashboardTab) => void
 }) {
   const { ready } = useIdentity()
-  const { isInstallable, promptInstall } = usePWAInstall()
+  const { isInstallable, showInstallOption, guidance, promptInstall } =
+    usePWAInstall()
+  const [installDialogOpen, setInstallDialogOpen] = useState(false)
+
+  async function handleInstallClick() {
+    if (isInstallable) {
+      const result = await promptInstall()
+      if (result !== 'unavailable') return
+    }
+    setInstallDialogOpen(true)
+  }
 
   return (
-    <header className="safe-top sticky top-0 z-30 border-b border-border/60 bg-background/85 backdrop-blur supports-[backdrop-filter]:bg-background/70">
-      <div className="mx-auto flex h-14 max-w-content items-center justify-between gap-2 px-4 sm:px-6">
-        <Brand />
+    <>
+      <header className="safe-top sticky top-0 z-30 border-b border-border/60 bg-background/85 backdrop-blur supports-[backdrop-filter]:bg-background/70">
+        <div className="mx-auto flex h-14 max-w-content items-center justify-between gap-2 px-4 sm:px-6">
+          <Brand />
 
-        {/* Desktop & tablet navigation bar (hidden on mobile < 768px) */}
-        {onTabChange && (
-          <nav
-            aria-label="Primary navigation"
-            className="no-scrollbar hidden min-w-0 items-center gap-0.5 overflow-x-auto rounded-xl bg-muted/70 p-1 md:flex"
-          >
-            {DASHBOARD_NAV_ITEMS.map((item) => {
-              const active = activeTab === item.id
-              return (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => onTabChange(item.id)}
-                  aria-current={active ? 'page' : undefined}
-                  className={cn(
-                    'flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-2 py-1.5 text-xs font-medium transition-colors motion-reduce:transition-none lg:px-3 lg:text-sm',
-                    active
-                      ? 'bg-card text-foreground shadow-xs'
-                      : 'text-muted-foreground hover:text-foreground',
-                  )}
-                >
-                  <item.icon className="hidden size-4 shrink-0 lg:block" />
-                  <span>{item.label}</span>
-                </button>
-              )
-            })}
-          </nav>
-        )}
-
-        <nav className="flex shrink-0 items-center gap-1" aria-label="Account">
-          {isInstallable && (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              aria-label="Install App"
-              onClick={() => void promptInstall()}
-              className="hidden h-9 gap-1.5 rounded-full border-primary/30 bg-primary/8 px-2.5 text-xs font-medium text-primary hover:bg-primary/14 sm:inline-flex xl:px-3"
+          {/* Desktop & tablet navigation bar (hidden on mobile < 768px) */}
+          {onTabChange && (
+            <nav
+              aria-label="Primary navigation"
+              className="no-scrollbar hidden min-w-0 items-center gap-0.5 overflow-x-auto rounded-xl bg-muted/70 p-1 md:flex"
             >
-              <Download className="size-3.5 shrink-0" />
-              <span className="sm:inline md:hidden xl:inline">Install App</span>
-            </Button>
+              {DASHBOARD_NAV_ITEMS.map((item) => {
+                const active = activeTab === item.id
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => onTabChange(item.id)}
+                    aria-current={active ? 'page' : undefined}
+                    className={cn(
+                      'flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-2 py-1.5 text-xs font-medium transition-colors motion-reduce:transition-none lg:px-3 lg:text-sm',
+                      active
+                        ? 'bg-card text-foreground shadow-xs'
+                        : 'text-muted-foreground hover:text-foreground',
+                    )}
+                  >
+                    <item.icon className="hidden size-4 shrink-0 lg:block" />
+                    <span>{item.label}</span>
+                  </button>
+                )
+              })}
+            </nav>
           )}
-          <ThemeToggle />
-          {!ready ? (
-            <span className="ml-1 h-9 w-9 animate-pulse rounded-full bg-muted sm:w-24" />
-          ) : (
-            <ProfileMenu
-              onOpenSettings={
-                onTabChange ? () => onTabChange('settings') : undefined
-              }
-            />
-          )}
-        </nav>
-      </div>
-    </header>
+
+          <nav className="flex shrink-0 items-center gap-1" aria-label="Account">
+            {showInstallOption && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                aria-label="Install App"
+                title="Install Lectern app"
+                onClick={() => void handleInstallClick()}
+                className="inline-flex h-9 gap-1.5 rounded-full border-primary/30 bg-primary/8 px-2.5 text-xs font-medium text-primary hover:bg-primary/14 xl:px-3"
+              >
+                <Download className="size-3.5 shrink-0" />
+                <span className="hidden sm:inline md:hidden xl:inline">
+                  Install App
+                </span>
+              </Button>
+            )}
+            <ThemeToggle />
+            {!ready ? (
+              <span className="ml-1 h-9 w-9 animate-pulse rounded-full bg-muted sm:w-24" />
+            ) : (
+              <ProfileMenu
+                onOpenSettings={
+                  onTabChange ? () => onTabChange('settings') : undefined
+                }
+              />
+            )}
+          </nav>
+        </div>
+      </header>
+
+      <InstallAppDialog
+        open={installDialogOpen}
+        onOpenChange={setInstallDialogOpen}
+        isInstallable={isInstallable}
+        guidance={guidance}
+        onInstallNow={promptInstall}
+      />
+    </>
   )
 }
 
